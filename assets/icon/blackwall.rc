@@ -1,0 +1,2 @@
+// Windows exe icon (Explorer, taskbar before the window sets its own).
+1 ICON "blackwall.ico"

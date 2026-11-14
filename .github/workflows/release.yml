@@ -1,0 +1,150 @@
+name: Release
+
+# One app, one codebase, three languages. A v<version> tag (or "Run workflow", which then creates
+# the tag) builds every language for every platform and publishes three GitHub releases:
+#   v<version>-en  "BLACKWALL <version>"            notes: docs/releases/<version>/en.md  (marked Latest)
+#   v<version>-ru  "BLACKWALL <version> — Русский"  notes: docs/releases/<version>/ru.md
+#   v<version>-zh  "BLACKWALL <version> — 中文"      notes: docs/releases/<version>/zh.md
+# The version is in build.zig.zon. Every language needs its own notes file, or nothing is published.
+# Platforms: macOS (arm64), Windows (x86_64), Linux (x86_64). Android comes later (needs the NDK
+# for SDL) — add it to the build matrix below once `zig build package` supports it.
+# Auto-update (docs/updates.md): with the secret BLACKWALL_UPDATE_KEY and the variable
+# BLACKWALL_UPDATE_PUBKEY set, the apps are built with the updater and every file gets a
+# "<file>.sig". Without them the release is still built and published, without auto-update.
+
+on:
+  push:
+    # Only plain versions: the per-language tags created below must not start another run.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.17.1
+  # both halves of the update key pair, or neither: the updater is on only when both are set
+  UPDATE_PUBKEY: ${{ vars.BLACKWALL_UPDATE_PUBKEY }}
+  HAS_UPDATE_KEY: ${{ secrets.BLACKWALL_UPDATE_KEY != '' }}
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        run: |
+          version=$(sed -n 's/^ *\.version = "\(.*\)",.*/\1/p' build.zig.zon)
+          test -n "$version" || { echo "::error::no version in build.zig.zon"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but build.zig.zon has version $version"
+            exit 1
+          fi
+          for lang in en ru zh; do
+            test -f "docs/releases/$version/$lang.md" || { echo "::error::missing docs/releases/$version/$lang.md"; exit 1; }
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Tests (${{ matrix.os }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test
+
+  # Every language × platform. Windows and Linux are cross-built on Linux (Zig ships the libcs);
+  # macOS needs a Mac for codesign and ditto. Explicit targets keep the CPU baseline portable.
+  build:
+    name: Build ${{ matrix.lang }} ${{ matrix.platform.name }}
+    needs: [version, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [en, ru, zh]
+        platform:
+          - { name: macos, runner: macos-latest, target: aarch64-macos }
+          - { name: windows, runner: ubuntu-latest, target: x86_64-windows }
+          - { name: linux, runner: ubuntu-latest, target: x86_64-linux-gnu }
+          # - { name: android, runner: ubuntu-latest, target: aarch64-linux-android }
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Package
+        shell: bash
+        run: |
+          update=()
+          if [ -n "$UPDATE_PUBKEY" ] && [ "$HAS_UPDATE_KEY" = true ]; then
+            update=("-Dupdate-repo=$GITHUB_REPOSITORY" "-Dupdate-pubkey=$UPDATE_PUBKEY")
+          else
+            echo "::warning::BLACKWALL_UPDATE_KEY / BLACKWALL_UPDATE_PUBKEY not set: built without auto-update"
+          fi
+          zig build package -Dlang=${{ matrix.lang }} -Dtarget=${{ matrix.platform.target }} -Doptimize=ReleaseSafe "${update[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pkg-${{ matrix.lang }}-${{ matrix.platform.name }}
+          path: zig-out/package/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish ${{ matrix.lang }}
+    needs: [version, build]
+    strategy:
+      # one release after another, so "Latest" ends up on the English one
+      max-parallel: 1
+      matrix:
+        include:
+          - { lang: zh, title: "BLACKWALL ${{ needs.version.outputs.version }} — 中文", latest: false }
+          - { lang: ru, title: "BLACKWALL ${{ needs.version.outputs.version }} — Русский", latest: false }
+          - { lang: en, title: "BLACKWALL ${{ needs.version.outputs.version }}", latest: true }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-${{ matrix.lang }}-*
+          path: dist
+          merge-multiple: true
+      - uses: mlugg/setup-zig@v2
+        if: env.UPDATE_PUBKEY != '' && env.HAS_UPDATE_KEY == 'true'
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Sign for the updater
+        if: env.UPDATE_PUBKEY != '' && env.HAS_UPDATE_KEY == 'true'
+        env:
+          BLACKWALL_UPDATE_KEY: ${{ secrets.BLACKWALL_UPDATE_KEY }}
+          BLACKWALL_UPDATE_PUBKEY: ${{ vars.BLACKWALL_UPDATE_PUBKEY }}
+        run: |
+          zig build sign -Doptimize=ReleaseSafe
+          files=(dist/BLACKWALL-*)
+          zig-out/bin/blackwall-sign sign "${files[@]}"
+          # the secret and the variable must be one key pair, or clients would reject the release
+          zig-out/bin/blackwall-sign verify "${files[@]}"
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          (cd dist && sha256sum BLACKWALL-* > SHA256SUMS.txt)
+          gh release create "v$VERSION-${{ matrix.lang }}" dist/* \
+            --title "${{ matrix.title }}" \
+            --notes-file "docs/releases/$VERSION/${{ matrix.lang }}.md" \
+            --target "$GITHUB_SHA" \
+            --latest=${{ matrix.latest }}
