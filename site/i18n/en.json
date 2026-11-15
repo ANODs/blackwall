@@ -1,6 +1,7 @@
 {
-  "title": "BLACKWALL — a VPN client that routes every app its own way",
-  "description": "A small, fast VPN client that routes every application its own way. Written in Zig. No Electron, no bundled proxy core, no telemetry.",
+  "title": "BLACKWALL — open-source VPN client with a route for every app",
+  "description": "Open-source VPN client for VLESS with REALITY, Trojan, Shadowsocks and VMess. A route for every app, kill switch, no telemetry. Written in Zig for macOS, Windows and Linux.",
+  "og_alt": "BLACKWALL: every app, its own route",
   "lang_label": "Language",
   "nav_download": "Download",
   "eyebrow": "Open source · MIT · Written in Zig",
@@ -18,7 +19,6 @@
   "st_off": "Disconnected",
   "st_connecting": "Connecting",
   "st_on": "Mixed routes",
-
   "dl_title": "Get BLACKWALL",
   "dl_sub": "One file per system. Signed updates arrive on their own.",
   "dl_count": "downloads",
@@ -31,7 +31,6 @@
   "dl_first_mac": "macOS: right-click the app and choose Open. The first connection in TUN mode asks for the administrator password once.",
   "dl_first_win": "Windows: SmartScreen, More info, Run anyway.",
   "dl_older": "All releases on GitHub",
-
   "stats_title": "BLACKWALL — site statistics",
   "stats_h": "Statistics",
   "stats_days": "days",

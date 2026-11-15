@@ -8,13 +8,15 @@
 <meta name="theme-color" content="#0B0B0D">
 <meta name="color-scheme" content="dark">
 <link rel="icon" href="{{@root}}assets/icon.svg" type="image/svg+xml">
+<link rel="icon" href="{{@root}}assets/icon-32.png" type="image/png" sizes="32x32">
+<link rel="apple-touch-icon" href="{{@root}}assets/icon-180.png">
 <style>{{@inc:styles.css}}{{@inc:stats.css}}</style>
 </head>
 <body>
 
 <header class="nav scrolled" id="nav">
   <a class="brand" href="{{@site_home}}" aria-label="BLACKWALL">
-    <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#1C1C20"/><path d="M3 24.5 29 8.5" stroke="#F2F2F3" stroke-width="2.4"/></svg>
+    <span class="mark">{{@inc:mark.svg}}</span>
     <span>BLACKWALL</span>
   </a>
   <div class="nav-r">

@@ -39,6 +39,7 @@ OUT = ROOT / "_site"
 
 LANGS = ["en", "ru", "zh"]
 PAGES = {"index.html": "", "stats.html": "stats/"}
+LOCALES = {"en": "en_US", "ru": "ru_RU", "zh": "zh_CN"}
 SYSTEMS = {"mac": "macos-arm64.zip", "win": "windows-x86_64.exe", "linux": "linux-x86_64.tar.gz"}
 
 # The first visit to "/" goes to the visitor's language: a saved or explicit choice,
@@ -150,6 +151,65 @@ def render(template: str, strings: dict, ctx: dict) -> str:
     return re.sub(r"\{\{(@?\w+)\}\}", value, text)
 
 
+def jsonld(cfg: dict, strings: dict, lang: str, url: str, base: str, releases: dict) -> str:
+    """What search engines read about the program: schema.org SoftwareApplication."""
+    repo = "https://github.com/" + cfg["repo"]
+    data = {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "BLACKWALL",
+        "description": strings["description"],
+        "url": url,
+        "image": f"{base}assets/icon-512.png",
+        "screenshot": f"{base}assets/og-{lang}.png",
+        "applicationCategory": "SecurityApplication",
+        "applicationSubCategory": "VPN client",
+        "operatingSystem": "macOS, Windows, Linux",
+        "softwareVersion": releases["version"],
+        "downloadUrl": f"{repo}/releases",
+        "license": "https://opensource.org/license/mit",
+        "isAccessibleForFree": True,
+        "inLanguage": ["en", "ru", "zh"],
+        "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+        "codeRepository": repo,
+        "programmingLanguage": "Zig",
+    }
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+
+
+def write_sitemap(base: str) -> None:
+    """Only the landing page; the statistics pages are noindex."""
+    def loc(l: str) -> str:
+        return base + ("" if l == "en" else l + "/")
+
+    links = "".join(f'<xhtml:link rel="alternate" hreflang="{l}" href="{loc(l)}"/>' for l in LANGS)
+    links += f'<xhtml:link rel="alternate" hreflang="x-default" href="{base}"/>'
+    urls = "".join(f"<url><loc>{loc(l)}</loc>{links}</url>" for l in LANGS)
+    (OUT / "sitemap.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">'
+        f"{urls}</urlset>\n"
+    )
+
+
+def write_manifest(strings: dict) -> None:
+    manifest = {
+        "name": "BLACKWALL",
+        "short_name": "BLACKWALL",
+        "description": strings["description"],
+        "start_url": "../",
+        "display": "browser",
+        "background_color": "#0B0B0D",
+        "theme_color": "#0B0B0D",
+        "icons": [
+            {"src": "icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"},
+            {"src": "icon.svg", "sizes": "any", "type": "image/svg+xml"},
+        ],
+    }
+    (OUT / "assets" / "site.webmanifest").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+
+
 def build(offline: bool = False, releases: dict | None = None) -> dict:
     cfg = json.loads((SITE / "site.json").read_text())
     strings = load_strings()
@@ -159,7 +219,9 @@ def build(offline: bool = False, releases: dict | None = None) -> dict:
     if OUT.exists():
         shutil.rmtree(OUT)
     shutil.copytree(SITE / "static", OUT / "assets")
-    shutil.copy(ROOT / "docs" / "screens" / "2-connect-on.png", OUT / "assets" / "og.png")
+    shutil.copy(SRC / "mark.svg", OUT / "assets" / "icon.svg")
+    if not (SITE / "static" / "og-en.png").exists():
+        fail("no icons and previews: run tools/site_images.py")
 
     fonts = sorted((SITE / "static" / "fonts").glob("Geist-Regular.woff*"))
     if not fonts:
@@ -184,7 +246,12 @@ def build(offline: bool = False, releases: dict | None = None) -> dict:
                 "lang": lang,
                 "root": root,
                 "url": base + path,
-                "og": base + "assets/og.png",
+                "og": f"{base}assets/og-{lang}.png",
+                "og_locale": LOCALES[lang],
+                "og_locales": "\n".join(
+                    f'<meta property="og:locale:alternate" content="{LOCALES[l]}">' for l in LANGS if l != lang
+                ),
+                "jsonld": jsonld(cfg, strings[lang], lang, base + path, base, releases),
                 "repo_url": "https://github.com/" + cfg["repo"],
                 "version": releases["version"],
                 "font_ext": font_ext,
@@ -207,6 +274,11 @@ def build(offline: bool = False, releases: dict | None = None) -> dict:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(render(template, strings[lang], ctx))
 
+    write_sitemap(base)
+    host = base.split('/')[2]
+    if not host.endswith('.github.io'):
+        (OUT / 'CNAME').write_text(host + '\n')  # the custom domain of GitHub Pages
+    write_manifest(strings["en"])
     size = (OUT / "index.html").stat().st_size
     print(f"site: built {len(PAGES) * len(LANGS)} pages, v{releases['version']}, index.html {size / 1024:.1f} KB")
     return releases

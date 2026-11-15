@@ -107,12 +107,20 @@ if ('IntersectionObserver' in window) {
 const nav = $('#nav');
 const stage = $('#stage');
 function onScroll() {
-  nav.classList.toggle('scrolled', scrollY > 24);
+  // the bar folds into the dock once the page has moved, and unfolds only back at the very top
+  if (scrollY > 140) nav.classList.add('dock'); else if (scrollY < 40) nav.classList.remove('dock');
   if (stage && !reduce) {
     const vh = innerHeight, top = stage.getBoundingClientRect().top;
     stage.style.setProperty('--p', clamp((vh * 0.96 - top) / (vh * 0.56), 0, 1).toFixed(4));
   }
 }
+// half the width of the dock: the mark, the language switch, the button and what is between them
+function dockWidth() {
+  const w = 13 + 26 + 6 + $('.seg', nav).offsetWidth + 12 + $('.btn', nav).offsetWidth + 9 + 2;
+  nav.style.setProperty('--dw', Math.ceil(w / 2) + 'px');
+}
+dockWidth();
+addEventListener('resize', dockWidth);
 addEventListener('scroll', onScroll, { passive: true });
 addEventListener('resize', onScroll);
 onScroll();
@@ -254,7 +262,7 @@ function pulse(st, first) {
 }
 function buildStreams(small) {
   streams = [];
-  const n = clamp(Math.round(W / 40), 12, 36), nv = Math.round(n * 0.56), nd = Math.round(n * 0.28);
+  const n = clamp(Math.round(W / 17), 22, 84), nv = Math.round(n * 0.56), nd = Math.round(n * 0.28);
   const wl = offset(demo)[0], wr = wl + demo.offsetWidth;
   const start = () => {
     const side = !small && Math.random() < 0.34, left = Math.random() < 0.5;
@@ -282,28 +290,33 @@ function buildStreams(small) {
     measure(st); st.wall = st.L;
     streams.push(st);
   }
-  for (const st of streams) st.pulses = reduce ? [] : Array.from({ length: st.type === 'vpn' ? 2 : 1 }, () => pulse(st, true));
+  for (const st of streams) st.pulses = reduce ? [] : [pulse(st, true)];
 }
-// the part of a stream between two distances, lit from tail (dark) to head (bright)
-function lit(st, from, to, rgb, alpha, width) {
-  const pts = st.pts, len = st.len;
+// the point of a stream at a distance from its start, and the index of the next sample
+function at(st, dist) {
+  const len = st.len;
   let i = 1;
-  while (i < len.length && len[i] < from) i++;
-  c.lineWidth = width;
-  for (; i < len.length && len[i - 1] < to; i++) {
-    const a0 = Math.max(from, len[i - 1]), a1 = Math.min(to, len[i]), seg = len[i] - len[i - 1] || 1;
-    const k = ((a0 + a1) / 2 - from) / (to - from || 1);
-    const p = pts[i - 1], q = pts[i], f0 = (a0 - len[i - 1]) / seg, f1 = (a1 - len[i - 1]) / seg;
-    const y = p[1] + (q[1] - p[1]) * f1;
-    let a = alpha * k * k * clamp((y + 10) / 190, 0.12, 1);
-    if (st.type === 'direct' && y > wallY) a *= clamp(1 - (y - wallY) / ((H - wallY) * 0.8), 0, 1);
-    if (a < 0.012) continue;
-    c.strokeStyle = 'rgba(' + rgb + ',' + a.toFixed(3) + ')';
-    c.beginPath();
-    c.moveTo(p[0] + (q[0] - p[0]) * f0, p[1] + (q[1] - p[1]) * f0);
-    c.lineTo(q[0] + (p[0] - q[0]) * (1 - f1), y);
-    c.stroke();
-  }
+  while (i < len.length - 1 && len[i] < dist) i++;
+  const f = clamp((dist - len[i - 1]) / (len[i] - len[i - 1] || 1), 0, 1), p = st.pts[i - 1], q = st.pts[i];
+  return [p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f, i];
+}
+// the part of a stream between two distances, lit from tail (dark) to head (bright):
+// one stroke with one gradient, so the light is a smooth streak and never a row of beads
+function lit(st, from, to, rgb, alpha, width) {
+  if (to - from < 2) return;
+  const a = at(st, from), b = at(st, to);
+  let k = alpha * clamp((b[1] + 10) / 190, 0.12, 1);
+  if (st.type === 'direct' && b[1] > wallY) k *= clamp(1 - (b[1] - wallY) / ((H - wallY) * 0.8), 0, 1);
+  if (k < 0.012) return;
+  const gr = c.createLinearGradient(a[0], a[1], b[0], b[1]);
+  gr.addColorStop(0, 'rgba(' + rgb + ',0)');
+  gr.addColorStop(0.55, 'rgba(' + rgb + ',' + (k * 0.3).toFixed(3) + ')');
+  gr.addColorStop(1, 'rgba(' + rgb + ',' + k.toFixed(3) + ')');
+  c.strokeStyle = gr; c.lineWidth = width;
+  c.beginPath(); c.moveTo(a[0], a[1]);
+  for (let i = a[2]; i < b[2]; i++) c.lineTo(st.pts[i][0], st.pts[i][1]);
+  c.lineTo(b[0], b[1]);
+  c.stroke();
 }
 
 function drawWall(now, dt) {
@@ -342,7 +355,7 @@ function drawWall(now, dt) {
   c.globalAlpha = 1;
   const shown = reduce ? 1 : ease(clamp((t - 0.5) / 1.2, 0, 1));
   if (shown <= 0) return;
-  c.lineCap = 'round';
+  c.lineCap = 'butt'; c.lineJoin = 'round';
 
   // the lines themselves, faint
   const fade = rgb => {
