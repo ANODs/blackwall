@@ -39,5 +39,6 @@
   "stats_country": "Countries",
   "stats_os": "Systems",
   "stats_ref": "Referrers",
-  "stats_empty": "No data yet"
+  "stats_empty": "No data yet",
+  "foot_by": "Made by"
 }

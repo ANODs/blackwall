@@ -99,7 +99,8 @@ const cta = $('#cta');
 if (cta) cta.addEventListener('click', () => { if (cta.dataset.dl) beacon({ t: 'dl', l: BW.lang, o: cta.dataset.dl }); });
 $$('.plat').forEach(el => el.classList.toggle('me', el.dataset.os === OS));
 applyReleases(BW.releases);
-if (BW.worker) {
+// a page that came through the worker already carries the current releases and statistics
+if (BW.worker && !BW.fresh) {
   fetch(BW.worker + '/releases').then(r => r.ok ? r.json() : null).then(applyReleases).catch(() => {});
 }
 
@@ -220,7 +221,7 @@ if (BW.worker) {
   } else seen = true;
   let rz = 0, lastW = innerWidth;
   addEventListener('resize', () => { if (innerWidth === lastW) return; lastW = innerWidth; clearTimeout(rz); rz = setTimeout(() => draw(false), 150); });
-  load(true);
+  if (BW.stats) { data = BW.stats; sec.hidden = false; draw(true); } else load(true);
 })();
 
 /* ---------- reveal on scroll ---------- */

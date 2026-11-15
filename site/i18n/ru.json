@@ -39,5 +39,6 @@
   "stats_country": "Страны",
   "stats_os": "Системы",
   "stats_ref": "Источники",
-  "stats_empty": "Данных пока нет"
+  "stats_empty": "Данных пока нет",
+  "foot_by": "Сделал"
 }

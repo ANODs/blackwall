@@ -211,6 +211,15 @@ details p{margin:10px 0 0 16px;color:var(--text3);line-height:1.55}
 .vh{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 @keyframes grow{from{transform:scaleX(0)}}
 
+/* footer; the space under it is for the dock */
+.foot{padding:36px var(--pad) 112px;border-top:1px solid var(--hairline)}
+.foot .wrap{display:flex;justify-content:space-between;align-items:center;gap:20px 32px;flex-wrap:wrap}
+.foot-r{display:flex;align-items:center;gap:8px 26px;flex-wrap:wrap;font-size:13px;color:var(--text3)}
+.foot-r a{color:var(--text2);transition:color var(--fast) var(--e)}
+.foot-r a:hover{color:var(--text)}
+.foot-r span a{color:var(--text);border-bottom:1px solid var(--border)}
+.foot-r span a:hover{border-color:var(--text3)}
+
 /* narrow screens */
 @media (max-width:860px){
   .sx-lists{grid-template-columns:1fr}

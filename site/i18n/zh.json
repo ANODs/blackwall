@@ -39,5 +39,6 @@
   "stats_country": "国家和地区",
   "stats_os": "系统",
   "stats_ref": "来源",
-  "stats_empty": "暂无数据"
+  "stats_empty": "暂无数据",
+  "foot_by": "作者"
 }

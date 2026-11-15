@@ -103,7 +103,8 @@ function normalize(releases) {
   return { version: best, files, downloads };
 }
 
-async function releases(req, env, ctx) {
+// the normalized releases as JSON text, from the cache or from GitHub; null when GitHub has none
+async function releasesBody(req, env, ctx) {
   const cacheKey = new Request(new URL('/releases', req.url).toString());
   const cache = caches.default;
   let body = await cache.match(cacheKey).then(r => r && r.text());
@@ -112,16 +113,19 @@ async function releases(req, env, ctx) {
     if (env.GITHUB_TOKEN) headers.Authorization = 'Bearer ' + env.GITHUB_TOKEN;
     const r = await fetch(`https://api.github.com/repos/${env.REPO}/releases?per_page=100`, { headers });
     const data = r.ok ? normalize(await r.json()) : null;
-    if (!data) return json({ error: 'no releases' }, 502, cors(req, env));
+    if (!data) return null;
     body = JSON.stringify(data);
     ctx.waitUntil(cache.put(cacheKey, new Response(body, { headers: { 'Cache-Control': 'public, max-age=300' } })));
   }
+  return body;
+}
+async function releases(req, env, ctx) {
+  const body = await releasesBody(req, env, ctx);
+  if (!body) return json({ error: 'no releases' }, 502, cors(req, env));
   return new Response(body, { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=300', ...cors(req, env) } });
 }
 
-async function stats(req, env) {
-  if (env.STATS_KEY && req.headers.get('Authorization') !== 'Bearer ' + env.STATS_KEY) return json({ error: 'key' }, 401, cors(req, env));
-  const n = Math.min(365, Math.max(1, parseInt(new URL(req.url).searchParams.get('days'), 10) || 30));
+async function statsData(env, n) {
   const from = day(n - 1);
   const [dailyRows, topRows] = await env.DB.batch([
     env.DB.prepare("SELECT day, dim, SUM(n) AS n FROM counts WHERE day >= ? AND dim IN ('views', 'uniques', 'dls') GROUP BY day, dim").bind(from),
@@ -134,16 +138,33 @@ async function stats(req, env) {
   const top = Object.fromEntries(TOP.map(d => [d, []]));
   for (const r of topRows.results) if (top[r.dim].length < 12) top[r.dim].push([r.key, r.n]);
   const sum = k => daily.reduce((a, d) => a + d[k], 0);
-  return json({ days: n, daily, top, totals: { views: sum('views'), uniques: sum('uniques'), dl: sum('dl') } }, 200, { 'Cache-Control': env.STATS_KEY ? 'no-store' : 'public, max-age=120', ...cors(req, env) });
+  return { days: n, daily, top, totals: { views: sum('views'), uniques: sum('uniques'), dl: sum('dl') } };
+}
+async function stats(req, env) {
+  if (env.STATS_KEY && req.headers.get('Authorization') !== 'Bearer ' + env.STATS_KEY) return json({ error: 'key' }, 401, cors(req, env));
+  const n = Math.min(365, Math.max(1, parseInt(new URL(req.url).searchParams.get('days'), 10) || 30));
+  return json(await statsData(env, n), 200, { 'Cache-Control': env.STATS_KEY ? 'no-store' : 'public, max-age=120', ...cors(req, env) });
 }
 
 // The site is built and published by GitHub Pages; this hands it out under the site's own
 // domain. Redirects GitHub answers with (a missing trailing slash) are pointed back here.
-async function pages(req, env, url) {
+//
+// Pages are regenerated here, at most once in PAGE_TTL seconds: the static HTML gets the
+// current release, download count and statistics written into it (the numbers themselves,
+// the page's data and the schema.org description), so a crawler that runs no scripts reads
+// the same figures a visitor sees. Everything else passes through untouched.
+const PAGE_TTL = 300;
+async function pages(req, env, url, ctx) {
   if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('method not allowed', { status: 405 });
   const origin = env.PAGES_ORIGIN.replace(/\/$/, ''), prefix = new URL(origin).pathname;
+  const isPage = req.method === 'GET' && url.pathname.endsWith('/');
+  const pageKey = new Request(url.origin + url.pathname);
+  if (isPage) {
+    const cached = await caches.default.match(pageKey);
+    if (cached) return cached;
+  }
   const headers = {};
-  for (const k of ['Accept', 'Accept-Language', 'If-None-Match', 'If-Modified-Since', 'Range', 'User-Agent']) {
+  for (const k of isPage ? ['Accept', 'User-Agent'] : ['Accept', 'Accept-Language', 'If-None-Match', 'If-Modified-Since', 'Range', 'User-Agent']) {
     const v = req.headers.get(k);
     if (v) headers[k] = v;
   }
@@ -151,7 +172,58 @@ async function pages(req, env, url) {
   const out = new Headers(r.headers);
   const loc = out.get('Location');
   if (loc) out.set('Location', loc.startsWith(origin) ? url.origin + loc.slice(origin.length) : loc.startsWith(prefix + '/') ? loc.slice(prefix.length) : loc);
-  return new Response(r.body, { status: r.status, headers: out });
+  if (!isPage || r.status !== 200 || !(out.get('Content-Type') || '').includes('text/html')) {
+    return new Response(r.body, { status: r.status, headers: out });
+  }
+  for (const k of ['ETag', 'Last-Modified', 'Content-Length', 'Age', 'Expires']) out.delete(k);
+  out.set('Cache-Control', `public, max-age=${PAGE_TTL}`);
+  const page = new Response(await (await regenerate(r, req, env, ctx)).arrayBuffer(), { status: 200, headers: out });
+  ctx.waitUntil(caches.default.put(pageKey, page.clone()));
+  return page;
+}
+
+async function regenerate(r, req, env, ctx) {
+  const [relBody, st] = await Promise.all([
+    releasesBody(req, env, ctx).catch(() => null),
+    env.STATS_KEY ? null : statsData(env, 30).catch(() => null),
+  ]);
+  const rel = relBody ? JSON.parse(relBody) : null;
+  if (!rel && !st) return r;
+  let nf = new Intl.NumberFormat('en');
+  // a script's text arrives in pieces: collect them, then write the changed JSON once
+  const jsonScript = change => {
+    let buf = '';
+    return {
+      text(t) {
+        buf += t.text;
+        if (!t.lastInTextNode) return t.remove();
+        let text = buf;
+        try { const d = JSON.parse(buf); change(d); text = JSON.stringify(d).replace(/</g, '\\u003c'); } catch (e) {}
+        buf = '';
+        t.replace(text, { html: true });
+      },
+    };
+  };
+  const number = n => ({ element(e) { e.setInnerContent(nf.format(n)); } });
+  const show = { element(e) { e.removeAttribute('hidden'); } };
+  let rw = new HTMLRewriter()
+    .on('html', { element(e) { try { nf = new Intl.NumberFormat(e.getAttribute('lang') || 'en'); } catch (err) {} } })
+    .on('script#bw', jsonScript(d => { if (rel) d.releases = rel; if (st) d.stats = st; d.fresh = true; }))
+    .on('script[type="application/ld+json"]', jsonScript(d => {
+      if (!rel) return;
+      d.softwareVersion = rel.version;
+      if (rel.downloads.total > 0) {
+        d.interactionStatistic = { '@type': 'InteractionCounter', interactionType: 'https://schema.org/DownloadAction', userInteractionCount: rel.downloads.total };
+      }
+    }));
+  if (rel) {
+    rw = rw.on('[data-ver]', { element(e) { e.setInnerContent('v' + rel.version); } });
+    if (rel.downloads.total > 0) rw = rw.on('#count', show).on('#count-n', number(rel.downloads.total));
+  }
+  if (st) {
+    rw = rw.on('#stats', show).on('#sx-views', number(st.totals.views)).on('#sx-uniques', number(st.totals.uniques)).on('#sx-dl', number(st.totals.dl));
+  }
+  return rw.transform(r);
 }
 
 export default {
@@ -161,7 +233,7 @@ export default {
     try {
       // on the site's own domain the API lives under /api, everything else is the site itself
       if (pathname.startsWith('/api/')) pathname = pathname.slice(4);
-      else if (env.PAGES_ORIGIN) return await pages(req, env, url);
+      else if (env.PAGES_ORIGIN) return await pages(req, env, url, ctx);
       if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors(req, env), 'Access-Control-Max-Age': '86400' } });
       if (pathname === '/hit' && req.method === 'POST') return await hit(req, env);
       if (pathname === '/releases' && req.method === 'GET') return await releases(req, env, ctx);
