@@ -125,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - if: env.HAS_KEYSTORE != 'true'
-        run: echo "::warning::BLACKWALL_ANDROID_KEYSTORE not set: this release has no Android package"
+        run: echo '::warning::BLACKWALL_ANDROID_KEYSTORE is not set, so this release has no Android package'
       - uses: mlugg/setup-zig@v2
         if: env.HAS_KEYSTORE == 'true'
         with:
