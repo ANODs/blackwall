@@ -20,7 +20,8 @@ pub const dvui_app: dvui.App = .{
         .size = .{ .w = 940, .h = 620 },
         .min_size = .{ .w = 760, .h = 520 },
         .title = "BLACKWALL",
-        .icon = @embedFile("icon_png"),
+        // macOS takes the bundle icon; setting one at runtime would replace it in the Dock
+        .icon = if (@import("builtin").os.tag == .macos) null else @embedFile("icon_png"),
         .app = "blackwall",
         .org = "dev.blackwall",
         .window_init_options = .{ .keybinds_zoom = true, .theme = th.theme },

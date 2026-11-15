@@ -240,7 +240,8 @@ fn package(
                 \\  <key>CFBundleDisplayName</key><string>BLACKWALL</string>
                 \\  <key>CFBundleIdentifier</key><string>dev.blackwall</string>
                 \\  <key>CFBundleExecutable</key><string>blackwall</string>
-                \\  <key>CFBundleIconFile</key><string>blackwall</string>
+                \\  <key>CFBundleIconFile</key><string>AppIcon</string>
+                \\  <key>CFBundleIconName</key><string>AppIcon</string>
                 \\  <key>CFBundlePackageType</key><string>APPL</string>
                 \\  <key>CFBundleShortVersionString</key><string>{s}</string>
                 \\  <key>CFBundleVersion</key><string>{s}</string>
@@ -255,7 +256,10 @@ fn package(
             const macos_dir: std.Build.InstallDir = .{ .custom = app_dir ++ "/Contents/MacOS" };
             const bin = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = macos_dir } });
             const info = b.addInstallFileWithDir(plist, .{ .custom = app_dir ++ "/Contents" }, "Info.plist");
-            const icns = b.addInstallFileWithDir(b.path("assets/icon/blackwall.icns"), .{ .custom = app_dir ++ "/Contents/Resources" }, "blackwall.icns");
+            // macOS 26 icon (Assets.car, from assets/icon/AppIcon.icon) + .icns for older systems
+            const resources: std.Build.InstallDir = .{ .custom = app_dir ++ "/Contents/Resources" };
+            const car = b.addInstallFileWithDir(b.path("assets/icon/Assets.car"), resources, "Assets.car");
+            const icns = b.addInstallFileWithDir(b.path("assets/icon/AppIcon.icns"), resources, "AppIcon.icns");
             // Ad-hoc signature: Apple Silicon refuses to run unsigned binaries.
             // The service and the helper are signed first, then the bundle seals them.
             const sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-", "--identifier", "dev.blackwall" });
@@ -264,6 +268,7 @@ fn package(
             sign.step.dependOn(&bin.step);
             sign.step.dependOn(&info.step);
             sign.step.dependOn(&icns.step);
+            sign.step.dependOn(&car.step);
             for ([_]?*std.Build.Step.Compile{ service, helper }) |maybe| {
                 const part = maybe orelse continue;
                 const installed = b.addInstallArtifact(part, .{ .dest_dir = .{ .override = macos_dir } });
