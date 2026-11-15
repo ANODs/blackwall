@@ -4,11 +4,25 @@ const d = document, html = d.documentElement;
 const $ = (s, p) => (p || d).querySelector(s);
 const $$ = (s, p) => Array.from((p || d).querySelectorAll(s));
 const BW = JSON.parse($('#bw').textContent);
+
+/* ---------- the dock: a copy of the bar, made before anything is wired to its links ---------- */
+const nav = $('#nav');
+const dock = nav.cloneNode(true);
+dock.id = 'dock'; dock.classList.add('dockbar'); nav.classList.add('top');
+d.body.append(dock);
+let docked = false;
+function setDock(on) {
+  docked = on;
+  html.classList.toggle('docked', on);
+  dock.inert = !on; nav.inert = on;   // whichever of the two is out of sight is also out of reach
+}
+setDock(false);
 const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const ease = t => 1 - Math.pow(1 - t, 3);
 
 /* ---------- language: a manual choice always wins on the next visit ---------- */
+
 $$('[data-lang]').forEach(a => a.addEventListener('click', () => {
   try { localStorage.setItem('bw-lang', a.dataset.lang); } catch (e) {}
 }));
@@ -104,23 +118,15 @@ if ('IntersectionObserver' in window) {
 }
 
 /* ---------- navigation ---------- */
-const nav = $('#nav');
 const stage = $('#stage');
 function onScroll() {
   // the bar folds into the dock once the page has moved, and unfolds only back at the very top
-  if (scrollY > 140) nav.classList.add('dock'); else if (scrollY < 40) nav.classList.remove('dock');
+  if (scrollY > 140 && !docked) setDock(true); else if (scrollY < 40 && docked) setDock(false);
   if (stage && !reduce) {
     const vh = innerHeight, top = stage.getBoundingClientRect().top;
     stage.style.setProperty('--p', clamp((vh * 0.96 - top) / (vh * 0.56), 0, 1).toFixed(4));
   }
 }
-// half the width of the dock: the mark, the language switch, the button and what is between them
-function dockWidth() {
-  const w = 13 + 26 + 6 + $('.seg', nav).offsetWidth + 12 + $('.btn', nav).offsetWidth + 9 + 2;
-  nav.style.setProperty('--dw', Math.ceil(w / 2) + 'px');
-}
-dockWidth();
-addEventListener('resize', dockWidth);
 addEventListener('scroll', onScroll, { passive: true });
 addEventListener('resize', onScroll);
 onScroll();

@@ -34,19 +34,19 @@ svg{display:block;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:sq
 .btn-s:hover{background:#fff}
 
 /* navigation */
-/* At the top the bar is a bar. Once the page moves it folds into a small dock and settles at the
-   bottom edge, under the thumb and out of the way of what is being read. */
-.nav{--t:.9s;position:fixed;z-index:10;top:0;left:0;right:0;height:60px;padding:0 var(--pad);display:flex;align-items:center;justify-content:space-between;border:1px solid transparent;border-radius:0;transition:top var(--t) var(--e),left var(--t) var(--e),right var(--t) var(--e),height var(--t) var(--e),padding var(--t) var(--e),border-radius var(--t) var(--e),background var(--mid) var(--e),border-color var(--mid) var(--e),box-shadow var(--mid) var(--e)}
-.nav.dock{top:calc(100vh - 78px);top:calc(100dvh - 78px - env(safe-area-inset-bottom,0px));left:calc(50% - var(--dw,150px));right:calc(50% - var(--dw,150px));height:54px;padding:0 9px 0 13px;border-radius:19px;background:rgba(21,21,24,.82);-webkit-backdrop-filter:saturate(1.4) blur(20px);backdrop-filter:saturate(1.4) blur(20px);border-color:var(--border);box-shadow:0 18px 50px rgba(0,0,0,.65),0 1px 0 rgba(255,255,255,.05) inset}
-.brand,.nav-r{transition:gap var(--t) var(--e)}
-.brand span:last-child,.nav-link{max-width:170px;overflow:hidden;white-space:nowrap;transition:max-width var(--t) var(--e),opacity var(--mid) var(--e),color var(--fast) var(--e)}
-.nav.dock .brand,.nav.dock .nav-r{gap:6px}
-.nav.dock .brand span:last-child,.nav.dock .nav-link{max-width:0;opacity:0}
+/* At the top the bar is a bar. Once the page moves it leaves upwards and, in the same movement,
+   a small copy of it rises from the bottom edge: under the thumb, out of the way of the reading. */
+.nav{--t:.7s;position:fixed;z-index:10;top:0;left:0;right:0;height:60px;padding:0 var(--pad);display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid transparent;transition:transform var(--t) var(--e),background var(--mid) var(--e),border-color var(--mid) var(--e)}
+.docked .nav.top{transform:translateY(-100%)}
+.nav.dockbar{top:auto;bottom:calc(22px + env(safe-area-inset-bottom,0px));left:50%;right:auto;width:max-content;height:54px;padding:0 9px 0 13px;gap:12px;border:1px solid var(--border);border-radius:19px;background:rgba(21,21,24,.82);-webkit-backdrop-filter:saturate(1.4) blur(20px);backdrop-filter:saturate(1.4) blur(20px);box-shadow:0 18px 50px rgba(0,0,0,.65),0 1px 0 rgba(255,255,255,.05) inset;transform:translate(-50%,calc(100% + 60px))}
+.docked .nav.dockbar{transform:translate(-50%,0)}
+.dockbar .brand span:last-child,.dockbar .nav-link{display:none}
+.dockbar .nav-r{gap:6px}
 .nav.scrolled{background:rgba(11,11,13,.72);-webkit-backdrop-filter:saturate(1.4) blur(18px);backdrop-filter:saturate(1.4) blur(18px);border-bottom-color:var(--hairline)}
 .brand{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:600;letter-spacing:.16em}
 .mark,.mark svg{display:block;width:26px;height:26px}
 .nav-r{display:flex;align-items:center;gap:18px}
-.nav-link{font-size:13px;font-weight:500;color:var(--text2)}
+.nav-link{font-size:13px;font-weight:500;color:var(--text2);transition:color var(--fast) var(--e)}
 .nav-link:hover{color:var(--text)}
 .seg{display:flex;padding:3px;border-radius:10px;background:var(--panel)}
 .seg a,.seg button{padding:4px 10px;border-radius:7px;font:500 12px/18px var(--sans);color:var(--text2);background:none;border:0;cursor:pointer;transition:color var(--fast) var(--e),background var(--fast) var(--e)}
