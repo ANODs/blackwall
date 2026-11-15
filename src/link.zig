@@ -45,6 +45,9 @@ pub const Request = union(enum) {
     restart: Options,
     stop,
     reload,
+    /// tell the helper whether to hold traffic from boot until the service
+    /// is there (see `helper_ipc`); nothing happens without a helper
+    hold: bool,
 };
 
 pub const Failure = enum {
@@ -202,6 +205,11 @@ pub const Link = struct {
                     l.start(o);
                 },
                 .stop => l.stop("stop", true),
+                .hold => |on| if (tun_supported) {
+                    var buf: [64]u8 = undefined;
+                    const line = std.fmt.bufPrint(&buf, "{{\"cmd\":\"hold\",\"hold\":{}}}\n", .{on}) catch unreachable;
+                    if (ipc.request(l.gpa, l.io, helper.socket_path, line, 3000)) |answer| l.gpa.free(answer) else |_| {}
+                },
                 .reload => if (l.running) {
                     const line = ipc.call(l.gpa, l.io, l.socketPath(), "reload", 15_000) catch null;
                     if (line) |s| l.gpa.free(s);

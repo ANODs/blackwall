@@ -35,6 +35,12 @@ const log = std.log.scoped(.helper);
 
 const state_dir = "/Library/Application Support/BLACKWALL";
 const state_path = state_dir ++ "/helper.state";
+/// Exists while the user wants traffic held from boot (the "hold" command).
+const hold_path = state_dir ++ "/hold";
+/// How long after someone logged in a hold without a service is kept: the
+/// app starts within seconds; if it never comes, the Mac must not stay
+/// without network.
+const hold_patience_ms = 120_000;
 
 const Route = struct { dst: net.Addr, prefix: u8 };
 
@@ -77,6 +83,11 @@ const Helper = struct {
     /// the process that holds the utun (the service), watched for its exit
     owner_pid: c.pid_t = 0,
     kq: c_int = -1,
+    /// Holding from boot: wanted and not yet taken over by a service (or
+    /// given up). While set, the serve loop wakes every two seconds.
+    boot_hold: bool = false,
+    /// when a logged-in user was first seen during the hold (awake ms)
+    login_seen_ms: i64 = 0,
 
     /// Undo whatever a crashed instance left behind.
     fn recover(h: *Helper) void {
@@ -101,7 +112,11 @@ const Helper = struct {
         if (std.mem.eql(u8, req.cmd, "up")) {
             h.up(conn, a, req);
         } else if (std.mem.eql(u8, req.cmd, "down")) {
+            h.boot_hold = false;
             h.down();
+            h.reply(conn, a, .{ .ok = true }, null);
+        } else if (std.mem.eql(u8, req.cmd, "hold")) {
+            setHold(h.io, req.hold);
             h.reply(conn, a, .{ .ok = true }, null);
         } else if (std.mem.eql(u8, req.cmd, "servers")) {
             h.setServers(a, req) catch |err| return h.reply(conn, a, .{ .@"error" = @errorName(err) }, null);
@@ -211,7 +226,34 @@ const Helper = struct {
         };
     }
 
+    /// One step of the hold from boot: capture as soon as there is a
+    /// network to capture, then wait for the service; let go when nobody
+    /// came for a while after login.
+    fn holdStep(h: *Helper) void {
+        if (!h.boot_hold) return;
+        const now = Io.Clock.awake.now(h.io).toMilliseconds();
+        if (h.utun == null) {
+            var arena: std.heap.ArenaAllocator = .init(h.gpa);
+            defer arena.deinit();
+            // fails until the network is up, and while another VPN is in the way
+            h.bringUp(arena.allocator(), .{ .cmd = "up", .killswitch = "selective", .ipv6 = "block" }) catch {
+                // only what a half-finished attempt left behind is undone
+                if (h.utun != null or h.installed.items.len > 0) h.down();
+                return;
+            };
+            log.info("holding traffic from boot until the service takes over", .{});
+        }
+        if (!someoneLoggedIn()) return;
+        if (h.login_seen_ms == 0) h.login_seen_ms = now;
+        if (now - h.login_seen_ms < hold_patience_ms) return;
+        log.warn("no service came within {d} s of login: traffic is released", .{hold_patience_ms / 1000});
+        h.boot_hold = false;
+        h.down();
+    }
+
     fn up(h: *Helper, conn: c.fd_t, a: std.mem.Allocator, req: proto.Request) void {
+        // a service is here: the hold from boot has done its job
+        h.boot_hold = false;
         if (h.utun != null) {
             // a new service takes over (restart, update): same utun, new settings
             h.reconfigure(req) catch |err| {
@@ -540,8 +582,12 @@ fn serve(h: *Helper) !void {
     var events: [8]c.Kevent = undefined;
     if (c.kevent(h.kq, &listen, 1, &events, 0, null) != 0) return error.KqueueFailed;
     log.info("ready, serving uid {d}", .{h.allow_uid});
+    h.boot_hold = holdWanted(h.io);
     while (true) {
-        const n = c.kevent(h.kq, &listen, 0, &events, events.len, null);
+        h.holdStep();
+        // while holding from boot, look again every two seconds
+        const tick: c.timespec = .{ .sec = 2, .nsec = 0 };
+        const n = c.kevent(h.kq, &listen, 0, &events, events.len, if (h.boot_hold) &tick else null);
         if (n < 0) {
             if (c.errno(n) == .INTR) continue;
             return error.KqueueFailed;
@@ -561,6 +607,28 @@ fn serve(h: *Helper) !void {
         if (uid != h.allow_uid and uid != 0) continue;
         h.handle(fd);
     }
+}
+
+/// Remember (across reboots) whether traffic is held from boot.
+fn setHold(io: Io, on: bool) void {
+    const cwd = std.Io.Dir.cwd();
+    if (on) {
+        cwd.createDirPath(io, state_dir) catch {};
+        cwd.writeFile(io, .{ .sub_path = hold_path, .data = "" }) catch |err| log.warn("hold flag: {t}", .{err});
+    } else cwd.deleteFile(io, hold_path) catch {};
+}
+
+fn holdWanted(io: Io) bool {
+    std.Io.Dir.cwd().access(io, hold_path, .{}) catch return false;
+    return true;
+}
+
+/// Whether a user sits at the Mac: the console device belongs to whoever
+/// is logged in at the screen, and to root before that.
+fn someoneLoggedIn() bool {
+    var s: c.Stat = undefined;
+    if (c.fstatat(c.AT.FDCWD, "/dev/console", &s, 0) != 0) return true;
+    return s.uid != 0;
 }
 
 // ---------------------------------------------------------------- install
@@ -614,7 +682,7 @@ fn uninstall(gpa: std.mem.Allocator, io: Io) !void {
     if (out) |o| gpa.free(o.text);
     var h: Helper = .{ .gpa = gpa, .io = io, .allow_uid = 0 };
     h.recover();
-    for ([_][]const u8{ proto.plist_path, proto.install_path, proto.socket_path, state_path }) |p|
+    for ([_][]const u8{ proto.plist_path, proto.install_path, proto.socket_path, state_path, hold_path }) |p|
         std.Io.Dir.cwd().deleteFile(io, p) catch {};
     std.debug.print("uninstalled\n", .{});
 }

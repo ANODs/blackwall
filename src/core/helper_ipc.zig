@@ -14,6 +14,9 @@
 //!                                   up=false and nothing changes. On an error nothing
 //!                                   changes either)
 //!   {"cmd":"down"}               -> Reply   (routes, DNS and kill switch removed, utun closed)
+//!   {"cmd":"hold","hold":true} -> Reply   (from the next boot on, capture everything as soon
+//!                                   as the network is there and hold it until a service
+//!                                   takes over: nothing leaves between login and the VPN)
 //!   {"cmd":"status"}             -> Reply
 //!   {"cmd":"conflicts"}          -> Reply   (owners: the processes holding other VPNs'
 //!                                   tunnels that capture traffic; pid 0 when unknown)
@@ -30,7 +33,7 @@
 
 /// Bumped whenever requests or replies change incompatibly; the window
 /// reinstalls a helper that reports another one.
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 
 pub const socket_path = "/var/run/dev.blackwall.helper.sock";
 pub const label = "dev.blackwall.helper";
@@ -60,6 +63,8 @@ pub const Request = struct {
     path: []const u8 = "",
     /// "stop": SIGKILL instead of asking it to quit
     kill: bool = false,
+    /// "hold": whether traffic is held from boot until a service takes over
+    hold: bool = false,
 };
 
 /// A process holding another VPN's tunnel.

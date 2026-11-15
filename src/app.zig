@@ -123,6 +123,7 @@ pub fn init(w: *dvui.Window) !void {
     if (persist and state.settings.launch_at_login) autostart.apply(gpa, io, env_paths, true);
     // an update restarted the window while its proxy was on
     const resumed = takeReconnectMark();
+    syncBootHold();
     if (state.settings.auto_connect or resumed) connect();
     // otherwise the link reports what it found (a running service, or
     // nothing: see `.idle`), and the guard starts from there
@@ -172,8 +173,30 @@ fn writeConfig() bool {
     return true;
 }
 
+/// Whether the helper should hold all traffic from boot until the service
+/// is up. Only when this app is sure to come and take over: it starts at
+/// login, in TUN mode, and then either connects or guards.
+fn bootHoldWanted() bool {
+    const s = &state.settings;
+    if (state.demo or !persist or !link_mod.tun_supported) return false;
+    if (!s.launch_at_login or s.tunnel_mode != .tun or s.kill_switch == .off) return false;
+    return s.auto_connect or (s.protect_when_off and state.hasProtectedApps());
+}
+
+var boot_hold_sent: ?bool = null;
+
+/// Keep the helper's hold-from-boot flag in step with the settings.
+fn syncBootHold() void {
+    const want = bootHoldWanted();
+    if (boot_hold_sent == want) return;
+    const l = link orelse return;
+    boot_hold_sent = want;
+    l.post(.{ .hold = want });
+}
+
 pub fn save() void {
     if (!writeConfig()) return;
+    syncBootHold();
     // the running service follows: routes by reloading, the TUN's own
     // settings (mode, kill switch, IPv6, LAN, MTU) by restarting
     const l = link orelse return;
@@ -779,6 +802,10 @@ fn onLink(ev: link_mod.Event) void {
     switch (ev) {
         .up => |u| {
             awaiting_up = false;
+            // the helper is the current one now (it may just have been
+            // installed): tell it again what to do at boot
+            boot_hold_sent = null;
+            syncBootHold();
             // a start the user cancelled meanwhile: the stop behind it follows
             if (!want_on and !u.startup) return;
             // a service from before this window: the VPN is on
