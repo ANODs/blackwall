@@ -701,10 +701,13 @@ test "resolver forwards to a real server and caches the answer" {
         }
     };
     const th = try std.Thread.spawn(.{}, T.serve, .{srv});
-    var r: Resolver = .{ .gpa = std.testing.allocator, .io = std.testing.io, .servers = &.{.{ .addr = lo, .port = port }}, .fallback = &.{}, .timeout_ms = 40 };
+    var r: Resolver = .{ .gpa = std.testing.allocator, .io = std.testing.io, .servers = &.{.{ .addr = lo, .port = port }}, .fallback = &.{}, .timeout_ms = 3000 };
     defer r.deinit();
     const got = try r.resolve("example.org");
     th.join();
+    // from here on nobody answers: do not wait long for it (asking a dead
+    // server still costs two rounds of this)
+    r.timeout_ms = 200;
     try std.testing.expectEqualSlices(u8, &.{ 10, 1, 2, 3 }, got[12..16]);
     // the server answered once and is gone: the second lookup is served from the cache
     try std.testing.expectEqualSlices(u8, &got, &(try r.resolve("example.org")));
@@ -717,7 +720,8 @@ test "resolver forwards to a real server and caches the answer" {
     try std.testing.expect(e.known and !e.asking and e.retry_ns > 0);
     const before = Io.Clock.awake.now(r.io).toMilliseconds();
     try std.testing.expectEqualSlices(u8, &got, &(try r.resolve("example.org")));
-    try std.testing.expect(Io.Clock.awake.now(r.io).toMilliseconds() - before < 30);
+    // answered without asking: far below the 400 ms that asking would take
+    try std.testing.expect(Io.Clock.awake.now(r.io).toMilliseconds() - before < 300);
     // a name never seen has nothing to fall back to
     try std.testing.expectError(error.NoAnswer, r.resolve("unknown.example"));
     try std.testing.expectError(error.NoAnswer, r.resolve("unknown.example"));
@@ -742,19 +746,25 @@ test "resolver: a silent first server, the next one answers; lookups of one name
     }
     const T = struct {
         var queries: std.atomic.Value(u32) = .init(0);
+        var stop: std.atomic.Value(bool) = .init(false);
+        /// Answers every query until told to stop, so a slow machine that
+        /// makes the resolver ask twice still gets its answer.
         fn serve(fd: c.fd_t) void {
             var buf: [512]u8 = undefined;
-            var from: c.sockaddr.in = undefined;
-            var flen: c.socklen_t = @sizeOf(c.sockaddr.in);
-            const n = c.recvfrom(fd, &buf, buf.len, 0, @ptrCast(&from), &flen);
-            if (n <= 0) return;
-            _ = queries.fetchAdd(1, .monotonic);
-            // slow enough for the other lookups to arrive meanwhile
-            std.Io.sleep(std.testing.io, .fromMilliseconds(60), .awake) catch {};
-            const q = parseQuery(buf[0..@intCast(n)]).?;
-            var out: [512]u8 = undefined;
-            const m = respond(&out, buf[0..@intCast(n)], &q, 0, &.{.{ .rtype = type_a, .ttl = 60, .data = &.{ 10, 9, 8, 7 } }});
-            _ = c.sendto(fd, &out, m, 0, @ptrCast(&from), flen);
+            while (!stop.load(.acquire)) {
+                if (!sys.waitFd(fd, false, 50)) continue;
+                var from: c.sockaddr.in = undefined;
+                var flen: c.socklen_t = @sizeOf(c.sockaddr.in);
+                const n = c.recvfrom(fd, &buf, buf.len, 0, @ptrCast(&from), &flen);
+                if (n <= 0) return;
+                _ = queries.fetchAdd(1, .monotonic);
+                // slow enough for the other lookups to arrive meanwhile
+                std.Io.sleep(std.testing.io, .fromMilliseconds(40), .awake) catch {};
+                const q = parseQuery(buf[0..@intCast(n)]).?;
+                var out: [512]u8 = undefined;
+                const m = respond(&out, buf[0..@intCast(n)], &q, 0, &.{.{ .rtype = type_a, .ttl = 60, .data = &.{ 10, 9, 8, 7 } }});
+                _ = c.sendto(fd, &out, m, 0, @ptrCast(&from), flen);
+            }
         }
         fn lookup(r: *Resolver, ok: *std.atomic.Value(u32)) void {
             const a = r.resolve("shared.example") catch return;
@@ -767,13 +777,16 @@ test "resolver: a silent first server, the next one answers; lookups of one name
         .io = std.testing.io,
         .servers = &.{.{ .addr = lo, .port = ports[0] }},
         .fallback = &.{.{ .addr = lo, .port = ports[1] }},
-        .timeout_ms = 150,
+        // generous: the silent server costs one of these, and the answering
+        // one must fit inside it on the slowest machine
+        .timeout_ms = 1500,
     };
     defer r.deinit();
     var ok: std.atomic.Value(u32) = .init(0);
     var threads: [6]std.Thread = undefined;
     for (&threads) |*t| t.* = try std.Thread.spawn(.{}, T.lookup, .{ &r, &ok });
     for (threads) |t| t.join();
+    T.stop.store(true, .release);
     th.join();
     try std.testing.expectEqual(6, ok.load(.monotonic));
     try std.testing.expectEqual(1, T.queries.load(.monotonic));
