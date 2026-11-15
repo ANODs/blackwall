@@ -1,10 +1,15 @@
 //! BLACKWALL background service: the data plane without the window.
 //!
-//!   blackwall-service [--config DIR] [--tun helper | --tun linux:NAME | --tun fd:N]
+//!   blackwall-service [--config DIR] [--tun helper | --tun auto | --tun linux:NAME | --tun fd:N]
 //!                     [--bind IFNAME] [--dns IP[:PORT]]... [--mtu N] [--socks PORT]
 //!
 //! --tun helper (macOS): the root helper creates the utun, routes and DNS,
 //! applies the kill switch from the settings and hands the utun over.
+//!
+//! --tun auto (Linux): the service sets the device, the routes and the
+//! capture of the resolvers up by itself (linux.zig); it needs
+//! CAP_NET_ADMIN on its executable and nothing else. `--release` removes a
+//! device a service that is gone left behind.
 //!
 //! Reads the configuration the app writes (config.json in DIR), carries the
 //! traffic of applications routed into the TUN and/or the SOCKS port, and
@@ -92,7 +97,7 @@ const Args = struct {
     mtu: u16 = 1500,
     socks: ?u16 = null,
 
-    const Tun = union(enum) { helper, linux: []const u8, fd: c.fd_t };
+    const Tun = union(enum) { helper, auto, linux: []const u8, fd: c.fd_t };
 };
 
 const Service = struct {
@@ -110,6 +115,8 @@ const Service = struct {
     server_ips: std.ArrayList([]const u8) = .empty,
     tun_fd: ?c.fd_t = null,
     via_helper: bool = false,
+    /// the device is ours to set up and take down (Linux, `--tun auto`)
+    own_device: bool = false,
     /// "suspend": leave the helper's capture in place (the kill switch decides)
     keep_capture: bool = false,
     searcher: if (builtin.os.tag.isDarwin()) darwin.process.Searcher else void = undefined,
@@ -184,6 +191,23 @@ const Service = struct {
             const fd: c.fd_t = switch (tun) {
                 .fd => |f| f,
                 .linux => |name| if (builtin.os.tag == .linux) try linux.openTun(name) else return error.Unsupported,
+                .auto => if (builtin.os.tag == .linux) blk: {
+                    const lease = linux.up(s.io, s.gpa, .{
+                        .mtu = s.args.mtu,
+                        // the device that stays behind a dead service is the kill switch
+                        .hold = s.killSwitch() != .off,
+                        .ipv6 = s.settings.ipv6 != .system,
+                    }) catch |err| {
+                        s.writeError(err);
+                        return err;
+                    };
+                    s.own_device = true;
+                    bind = .interface(lease.bindName());
+                    for (lease.dns[0..lease.dns_len], 0..) |ip, k| dns_buf[k] = .{ .addr = packet.v4(ip), .port = 53 };
+                    if (lease.dns_len > 0) dns_servers = dns_buf[0..lease.dns_len];
+                    log.info("device {s}, own traffic on {s}, {d} resolvers captured", .{ linux.device, lease.bindName(), lease.dns_len });
+                    break :blk lease.fd;
+                } else return error.Unsupported,
                 .helper => if (builtin.os.tag.isDarwin()) blk: {
                     const lease = darwin.helper.up(s.gpa, s.io, .{
                         .cmd = "up",
@@ -253,8 +277,14 @@ const Service = struct {
             s.device.deinit();
             s.t = null;
         }
-        if (s.tun_fd) |fd| _ = c.close(fd);
+        if (s.tun_fd) |fd| {
+            // a clean stop lets the traffic go; "suspend" (and a crash,
+            // which never gets here) leaves the device holding it
+            if (s.own_device and !s.keep_capture) linux.release(fd);
+            _ = c.close(fd);
+        }
         s.tun_fd = null;
+        s.own_device = false;
         if (builtin.os.tag.isDarwin()) {
             if (s.via_helper) {
                 if (!s.keep_capture) darwin.helper.down(s.gpa, s.io);
@@ -459,12 +489,18 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--tun")) {
             if (std.mem.eql(u8, val, "helper")) {
                 args.tun = .helper;
+            } else if (std.mem.eql(u8, val, "auto")) {
+                args.tun = .auto;
             } else if (std.mem.startsWith(u8, val, "linux:")) {
                 args.tun = .{ .linux = val[6..] };
             } else if (std.mem.startsWith(u8, val, "fd:")) {
                 args.tun = .{ .fd = try std.fmt.parseInt(c.fd_t, val[3..], 10) };
             } else return usage();
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--release")) {
+            // let go of what a service that is gone still holds
+            linux.remove();
+            return;
         } else if (std.mem.eql(u8, arg, "--bind")) {
             args.bind = val;
             i += 1;
@@ -528,7 +564,7 @@ fn raiseFileLimit() void {
 
 fn usage() error{Usage} {
     std.debug.print(
-        \\usage: blackwall-service [--config DIR] [--tun helper | --tun linux:NAME | --tun fd:N]
+        \\usage: blackwall-service [--config DIR] [--tun helper | --tun auto | --tun linux:NAME | --tun fd:N]
         \\                         [--bind IFNAME] [--dns IP[:PORT]]... [--mtu N] [--socks PORT]
         \\
     , .{});
@@ -537,5 +573,6 @@ fn usage() error{Usage} {
 
 test {
     _ = routes;
+    _ = linux;
     if (builtin.os.tag.isDarwin()) _ = darwin.process;
 }
