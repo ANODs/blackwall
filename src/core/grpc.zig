@@ -982,6 +982,7 @@ const Peer = struct {
 };
 
 test "a reading and a writing thread against a gRPC server, both modes" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sockets and pipes
     const io = testing.io;
     for ([_]Mode{ .gun, .multi }) |mode| {
         const c2s = try pipe();

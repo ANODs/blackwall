@@ -1,12 +1,13 @@
 //! Local parsing of subscription bodies and single connection links.
 //! Nothing here touches the network or runs anything: text in, servers out.
 //!
-//! Supported link schemes: vless, trojan, ss, hysteria2 / hy2, tuic,
+//! Supported link schemes: vless, trojan, ss, vmess, hysteria2 / hy2, tuic,
 //! wireguard / wg. A body may be a plain list of links or the same list
 //! wrapped in base64 (standard or URL-safe alphabet).
 
 const std = @import("std");
 const model = @import("model.zig");
+const vmess = @import("vmess.zig");
 
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
@@ -171,6 +172,8 @@ fn xrayServer(a: std.mem.Allocator, cfg: std.json.Value) LinkError!model.State.N
             .trojan
         else if (std.mem.eql(u8, proto, "shadowsocks"))
             .shadowsocks
+        else if (std.mem.eql(u8, proto, "vmess"))
+            .vmess
         else {
             // freedom / blackhole / dns are plumbing, anything else is a
             // proxy protocol this client does not know
@@ -202,21 +205,22 @@ fn xrayServer(a: std.mem.Allocator, cfg: std.json.Value) LinkError!model.State.N
         var link: std.Io.Writer.Allocating = .init(a);
         const w = &link.writer;
         const secret = switch (protocol) {
-            .vless => str(field(user, "id")),
+            .vless, .vmess => str(field(user, "id")),
             else => str(field(user, "password")),
         };
         if (secret.len == 0) return error.Malformed;
         const scheme = switch (protocol) {
             .vless => "vless",
+            .vmess => "vmess",
             .trojan => "trojan",
             else => "ss",
         };
         (blk: {
-            if (protocol == .shadowsocks) {
-                w.print("{s}://{s}:{s}@", .{ scheme, str(field(user, "method")), secret }) catch break :blk error.OutOfMemory;
-            } else {
-                w.print("{s}://{s}@", .{ scheme, secret }) catch break :blk error.OutOfMemory;
-            }
+            w.print("{s}://", .{scheme}) catch break :blk error.OutOfMemory;
+            if (protocol == .shadowsocks) w.print("{s}:", .{str(field(user, "method"))}) catch break :blk error.OutOfMemory;
+            // a password may hold what a link gives a meaning to ('@', '/', '#')
+            std.Uri.Component.percentEncode(w, secret, isUnreserved) catch break :blk error.OutOfMemory;
+            w.writeByte('@') catch break :blk error.OutOfMemory;
             if (std.mem.indexOfScalar(u8, host, ':') != null) {
                 w.print("[{s}]:{d}", .{ host, port }) catch break :blk error.OutOfMemory;
             } else {
@@ -224,6 +228,10 @@ fn xrayServer(a: std.mem.Allocator, cfg: std.json.Value) LinkError!model.State.N
             }
             w.print("?type={s}&security={s}", .{ network, if (sec.len == 0) "none" else sec }) catch break :blk error.OutOfMemory;
             param(w, "flow", str(field(user, "flow"))) catch break :blk error.OutOfMemory;
+            // VMess names its cipher where VLESS names its encryption;
+            // "none" is what a link without the parameter means
+            const enc = str(field(user, if (protocol == .vmess) "security" else "encryption"));
+            if (!std.mem.eql(u8, enc, "none")) param(w, "encryption", enc) catch break :blk error.OutOfMemory;
             const reality = field(stream, "realitySettings");
             const tls = field(stream, "tlsSettings");
             const sni = if (str(field(reality, "serverName")).len > 0) str(field(reality, "serverName")) else str(field(tls, "serverName"));
@@ -240,8 +248,15 @@ fn xrayServer(a: std.mem.Allocator, cfg: std.json.Value) LinkError!model.State.N
             param(w, "path", str(field(transport, "path"))) catch break :blk error.OutOfMemory;
             const th_host = if (str(field(transport, "host")).len > 0) str(field(transport, "host")) else str(field(field(transport, "headers"), "Host"));
             param(w, "host", th_host) catch break :blk error.OutOfMemory;
-            param(w, "mode", str(field(transport, "mode"))) catch break :blk error.OutOfMemory;
+            const multi = if (field(transport, "multiMode")) |m| m == .bool and m.bool else false;
+            param(w, "mode", if (multi) "multi" else str(field(transport, "mode"))) catch break :blk error.OutOfMemory;
             param(w, "serviceName", str(field(transport, "serviceName"))) catch break :blk error.OutOfMemory;
+            param(w, "authority", str(field(transport, "authority"))) catch break :blk error.OutOfMemory;
+            // XHTTP's further settings travel as JSON, as in Xray's own links
+            if (field(transport, "extra")) |extra| if (extra == .object) {
+                const text = std.json.Stringify.valueAlloc(a, extra, .{}) catch break :blk error.OutOfMemory;
+                param(w, "extra", text) catch break :blk error.OutOfMemory;
+            };
             break :blk {};
         }) catch return error.OutOfMemory;
 
@@ -285,6 +300,7 @@ pub fn parseLink(a: std.mem.Allocator, link: []const u8) LinkError!model.State.N
             .{ "ss", .shadowsocks },      .{ "hysteria2", .hysteria2 },
             .{ "hy2", .hysteria2 },       .{ "tuic", .tuic },
             .{ "wireguard", .wireguard }, .{ "wg", .wireguard },
+            .{ "vmess", .vmess },
         };
         for (map) |m| if (std.ascii.eqlIgnoreCase(scheme, m[0])) break :blk m[1];
         for (scheme) |c| if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return error.Malformed;
@@ -301,15 +317,31 @@ pub fn parseLink(a: std.mem.Allocator, link: []const u8) LinkError!model.State.N
         query = rest[i + 1 ..];
         rest = rest[0..i];
     }
-    if (std.mem.indexOfScalar(u8, rest, '/')) |i| rest = rest[0..i];
 
-    // Shadowsocks may wrap the whole "method:pass@host:port" in base64.
+    // VMess as v2rayN writes it: base64 of a JSON object that names the
+    // server; the other form reads like every other link.
+    if (protocol == .vmess and std.mem.indexOfScalar(u8, rest, '@') == null) {
+        const sum = vmess.linkSummary(link, try a.alloc(u8, 2 * link.len)) orelse return error.Malformed;
+        return named(a, sum.name, .{
+            .name = "",
+            .host = try a.dupe(u8, sum.host),
+            .port = sum.port,
+            .protocol = protocol,
+            .security = if (sum.tls) .tls else .none,
+            .link = try a.dupe(u8, link),
+        });
+    }
+    // Shadowsocks may wrap the whole "method:pass@host:port" in base64
+    // (whose standard alphabet has a '/').
     if (protocol == .shadowsocks and std.mem.indexOfScalar(u8, rest, '@') == null) {
-        rest = (try decodeBase64(a, rest)) orelse return error.Malformed;
+        rest = (try decodeBase64(a, std.mem.trimEnd(u8, rest, "/"))) orelse return error.Malformed;
     }
 
     const at = std.mem.lastIndexOfScalar(u8, rest, '@') orelse return error.Malformed;
-    const hostport = rest[at + 1 ..];
+    // a path after the address means nothing here; a '/' before the '@' is
+    // part of a password (a base64 key, say) and stays
+    var hostport = rest[at + 1 ..];
+    if (std.mem.indexOfScalar(u8, hostport, '/')) |i| hostport = hostport[0..i];
     if (at == 0 or hostport.len == 0) return error.Malformed;
 
     var host: []const u8 = undefined;
@@ -348,27 +380,30 @@ pub fn parseLink(a: std.mem.Allocator, link: []const u8) LinkError!model.State.N
         }
     }
 
-    const decoded = try percentDecode(a, fragment);
-    const country = detectCountry(decoded);
-    var name = try cleanName(a, decoded);
+    return named(a, try percentDecode(a, fragment), .{
+        .name = "",
+        .host = try a.dupe(u8, host),
+        .port = port,
+        .protocol = protocol,
+        .security = security,
+        .link = try a.dupe(u8, link),
+    });
+}
+
+/// `sv` with its name and country taken from the remark a link carries.
+fn named(a: std.mem.Allocator, remark: []const u8, sv: model.State.NewServer) LinkError!model.State.NewServer {
+    var out = sv;
+    out.country = detectCountry(remark);
+    var name = try cleanName(a, remark);
     // "DE Frankfurt" -> "Frankfurt": the code is already shown as a tag
-    if (name.len > 3 and country[0] != '?' and std.ascii.eqlIgnoreCase(name[0..2], &country) and
+    if (name.len > 3 and out.country[0] != '?' and std.ascii.eqlIgnoreCase(name[0..2], &out.country) and
         (name[2] == ' ' or name[2] == '-' or name[2] == '_' or name[2] == '|'))
     {
         const rest_name = std.mem.trim(u8, name[3..], " -_|");
         if (rest_name.len > 0 and !std.ascii.isDigit(rest_name[0])) name = try a.dupe(u8, rest_name);
     }
-    if (name.len == 0) name = try a.dupe(u8, host);
-
-    return .{
-        .name = name,
-        .host = try a.dupe(u8, host),
-        .port = port,
-        .protocol = protocol,
-        .security = security,
-        .country = country,
-        .link = try a.dupe(u8, link),
-    };
+    out.name = if (name.len == 0) out.host else name;
+    return out;
 }
 
 fn percentDecode(a: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -540,6 +575,7 @@ test "body: base64 list, unsupported and malformed lines are counted" {
         \\trojan://secret@fi.example.net:443?sni=fi.example.net#Finland
         \\hy2://auth@jp.example.net:8443#JP-01
         \\vmess://eyJ2IjoiMiJ9
+        \\socks://dXNlcjpwYXNz@ru.example.net:1080#RU
         \\not a link
         \\tuic://uuid:pw@sg.example.net:443#Singapore
         \\wg://key@ch.example.net#CH
@@ -550,16 +586,100 @@ test "body: base64 list, unsupported and malformed lines are counted" {
     defer p.deinit();
     try std.testing.expectEqual(4, p.servers.len);
     try std.testing.expectEqual(1, p.unsupported);
-    try std.testing.expectEqual(1, p.malformed);
+    // "not a link", and the vmess body that names no server
+    try std.testing.expectEqual(2, p.malformed);
     try std.testing.expectEqualStrings("FI", &p.servers[0].country);
     try std.testing.expectEqual(model.Security.tls, p.servers[0].security);
     try std.testing.expectEqualStrings("JP", &p.servers[1].country);
     try std.testing.expectEqual(51820, p.servers[3].port);
 }
 
+test "vmess: v2rayN's base64 JSON and the URL form" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json =
+        \\{"v":"2","ps":"\ud83c\uddf3\ud83c\uddf1 Amsterdam 3","add":"nl.example.net","port":"8443","id":"11111111-2222-3333-4444-555555555555","aid":"0","scy":"auto","net":"ws","host":"cdn.example","path":"/v","tls":"tls"}
+    ;
+    var buf: [512]u8 = undefined;
+    var link_buf: [600]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "vmess://{s}", .{std.base64.standard.Encoder.encode(&buf, json)});
+    const sv = try parseLink(a, link);
+    try std.testing.expectEqual(model.Protocol.vmess, sv.protocol);
+    try std.testing.expectEqualStrings("nl.example.net", sv.host);
+    try std.testing.expectEqual(8443, sv.port);
+    try std.testing.expectEqual(model.Security.tls, sv.security);
+    try std.testing.expectEqualStrings("NL", &sv.country);
+    try std.testing.expectEqualStrings("Amsterdam 3", sv.name);
+    try std.testing.expectEqualStrings(link, sv.link);
+
+    const url = try parseLink(a, "vmess://11111111-2222-3333-4444-555555555555@de.example.net:443?type=grpc&security=tls#DE%20Berlin");
+    try std.testing.expectEqual(model.Protocol.vmess, url.protocol);
+    try std.testing.expectEqualStrings("de.example.net", url.host);
+    try std.testing.expectEqual(model.Security.tls, url.security);
+    try std.testing.expectEqualStrings("Berlin", url.name);
+}
+
+test "a '/' in a password is not the end of the address" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a 2022 key in standard base64, unescaped
+    const ss = try parseLink(a, "ss://2022-blake3-aes-128-gcm:ab/cd+ef/0123456789AAAA==@1.2.3.4:8388/?x=1#k");
+    try std.testing.expectEqualStrings("1.2.3.4", ss.host);
+    try std.testing.expectEqual(8388, ss.port);
+    const tj = try parseLink(a, "trojan://pa/ss@tj.example.net:8443/path?sni=x#t");
+    try std.testing.expectEqualStrings("tj.example.net", tj.host);
+    try std.testing.expectEqual(8443, tj.port);
+    // the legacy form: all of it in standard base64 (this one has a '/')
+    var buf: [128]u8 = undefined;
+    var link_buf: [160]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&buf, "aes-256-gcm:pw?w@9.8.7.6:443");
+    try std.testing.expect(std.mem.indexOfScalar(u8, b64, '/') != null);
+    const legacy = try parseLink(a, try std.fmt.bufPrint(&link_buf, "ss://{s}#old", .{b64}));
+    try std.testing.expectEqualStrings("9.8.7.6", legacy.host);
+    try std.testing.expectEqual(443, legacy.port);
+}
+
 test "empty body is an error, not an empty success" {
     try std.testing.expectError(error.Empty, parseBody(std.testing.allocator, "   \n"));
     try std.testing.expectError(error.Empty, parseBody(std.testing.allocator, "<html>502</html>"));
+}
+
+test "xray json subscription: vmess, trojan over grpc, a password that needs escaping" {
+    const body =
+        \\[
+        \\ {"remarks":"VM","outbounds":[
+        \\   {"protocol":"vmess","settings":{"vnext":[{"address":"vm.example.net","port":443,
+        \\      "users":[{"id":"11111111-2222-3333-4444-555555555555","alterId":0,"security":"chacha20-poly1305"}]}]},
+        \\    "streamSettings":{"network":"httpupgrade","security":"tls","tlsSettings":{"serverName":"vm.example.net"},
+        \\      "httpupgradeSettings":{"path":"/hu","host":"vm.example.net"}}}]},
+        \\ {"remarks":"TJ","outbounds":[
+        \\   {"protocol":"trojan","settings":{"servers":[{"address":"tj.example.net","port":443,"password":"p@ss/w#rd"}]},
+        \\    "streamSettings":{"network":"grpc","security":"tls","grpcSettings":{"serviceName":"tun","multiMode":true,"authority":"a.example"}}}]},
+        \\ {"remarks":"XH","outbounds":[
+        \\   {"protocol":"vless","settings":{"vnext":[{"address":"xh.example.net","port":443,"users":[{"id":"11111111-2222-3333-4444-555555555555","encryption":"none"}]}]},
+        \\    "streamSettings":{"network":"xhttp","security":"reality","realitySettings":{"serverName":"s.example","publicKey":"K"},
+        \\      "xhttpSettings":{"path":"/x","mode":"stream-one","extra":{"xPaddingBytes":"100-200"}}}}]}
+        \\]
+    ;
+    var p = try parseBody(std.testing.allocator, body);
+    defer p.deinit();
+    try std.testing.expectEqual(3, p.servers.len);
+    try std.testing.expectEqual(model.Protocol.vmess, p.servers[0].protocol);
+    try std.testing.expectEqualStrings(
+        "vmess://11111111-2222-3333-4444-555555555555@vm.example.net:443?type=httpupgrade&security=tls&encryption=chacha20-poly1305&sni=vm.example.net&path=%2Fhu&host=vm.example.net",
+        p.servers[0].link,
+    );
+    try std.testing.expectEqualStrings(
+        "trojan://p%40ss%2Fw%23rd@tj.example.net:443?type=grpc&security=tls&mode=multi&serviceName=tun&authority=a.example",
+        p.servers[1].link,
+    );
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const again = try parseLink(arena.allocator(), p.servers[1].link);
+    try std.testing.expectEqualStrings("tj.example.net", again.host);
+    try std.testing.expect(std.mem.endsWith(u8, p.servers[2].link, "&path=%2Fx&mode=stream-one&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%7D"));
 }
 
 test "xray json subscription: reality tcp, xhttp, ws+tls, unknown protocol" {

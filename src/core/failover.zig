@@ -159,7 +159,7 @@ pub const Group = struct {
                 gr.busy.store(false, .release);
             }
         }.f;
-        const th = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{g}) catch {
+        const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(256 * 1024) }, run, .{g}) catch {
             g.busy.store(false, .release);
             return;
         };
@@ -188,7 +188,7 @@ pub const Group = struct {
         // 1. the same server once more, from scratch
         const cur = g.member(active) orelse return;
         const cur_ob = cur.get();
-        if (cur_ob == .vless) if (g.dialer.resolver) |r| r.forget(cur_ob.vless.host);
+        if (cur_ob.host()) |h| if (g.dialer.resolver) |r| r.forget(h);
         if (g.probe(g, &cur_ob)) {
             log.info("{s} answers again after a fresh connection", .{name(&cur_ob)});
             g.rounds = 0;
@@ -234,7 +234,7 @@ pub const Group = struct {
         if (!on_reserve) return g.back_ms.store(0, .monotonic);
         const main = g.member(0) orelse return;
         const ob = main.get();
-        if (ob == .vless) if (g.dialer.resolver) |r| r.forget(ob.vless.host);
+        if (ob.host()) |h| if (g.dialer.resolver) |r| r.forget(h);
         if (g.probe(g, &ob)) return g.switchTo(0, &ob);
         g.back_ms.store(g.nowMs() + back_every_ms, .monotonic);
     }
@@ -277,7 +277,7 @@ pub const Group = struct {
         var threads: [max_members]?std.Thread = @splat(null);
         for (0..n) |i| {
             jobs[i] = .{ .g = g, .ob = g.member(i) orelse continue, .out = &times[i] };
-            threads[i] = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, Job.run, .{&jobs[i]}) catch blk: {
+            threads[i] = std.Thread.spawn(.{ .stack_size = sys.stackSize(128 * 1024) }, Job.run, .{&jobs[i]}) catch blk: {
                 jobs[i].run();
                 break :blk null;
             };
@@ -287,18 +287,12 @@ pub const Group = struct {
 };
 
 fn name(ob: *const proxy.Outbound) []const u8 {
-    return switch (ob.*) {
-        .vless => |v| v.host,
-        else => @tagName(ob.*),
-    };
+    return ob.host() orelse @tagName(ob.*);
 }
 
 /// The same server: address, port and account.
 fn same(a: *const proxy.Outbound, b: *const proxy.Outbound) bool {
-    if (a.* != .vless or b.* != .vless) return std.meta.activeTag(a.*) == std.meta.activeTag(b.*);
-    return a.vless.port == b.vless.port and
-        std.mem.eql(u8, a.vless.host, b.vless.host) and
-        std.mem.eql(u8, &a.vless.uuid, &b.vless.uuid);
+    return a.sameServer(b);
 }
 
 /// The two checks the recovery uses, for one server: how fast it accepts a
@@ -317,11 +311,11 @@ const check_request = "GET /generate_204 HTTP/1.1\r\nHost: " ++ check_host ++ "\
 
 /// Milliseconds to connect to the server, or null when it does not accept.
 fn realPing(g: *Group, ob: *const proxy.Outbound) ?u32 {
-    if (ob.* != .vless) return null;
+    const v = ob.via() orelse return null;
     var d = g.dialer;
     d.timeout_ms = ping_timeout_ms;
     const start = g.nowMs();
-    const s = d.connect(g.io, ob.vless.host, ob.vless.port) catch return null;
+    const s = d.connect(g.io, v.host, v.port) catch return null;
     s.close(g.io);
     return @intCast(@max(1, g.nowMs() - start));
 }
@@ -330,7 +324,7 @@ fn realPing(g: *Group, ob: *const proxy.Outbound) ?u32 {
 /// address for a page and see an HTTP answer come back.
 fn realProbe(g: *Group, ob: *const proxy.Outbound) bool {
     if (comptime !sys.supported) return false;
-    if (ob.* != .vless) return false;
+    if (ob.via() == null) return false;
     var fds: [2]c.fd_t = undefined;
     if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return false;
     defer _ = c.close(fds[1]);
@@ -360,7 +354,7 @@ fn realProbe(g: *Group, ob: *const proxy.Outbound) bool {
     };
     var runner: Runner = .{ .io = g.io, .dialer = g.dialer, .ob = ob, .fd = fds[0] };
     runner.dialer.timeout_ms = 5000;
-    const th = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Runner.run, .{&runner}) catch {
+    const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(512 * 1024) }, Runner.run, .{&runner}) catch {
         _ = c.close(fds[0]);
         return false;
     };

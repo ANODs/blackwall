@@ -1,12 +1,17 @@
 //! Outbounds, and the local SOCKS5 inbound.
 //!
 //! A flow has a local side (an application on the SOCKS port, or a TCP
-//! connection terminated by the TUN stack) and goes out direct, blocked,
-//! or over VLESS: on raw TCP (optionally REALITY and the Vision flow), or
-//! inside WebSocket, both optionally inside TLS. With Vision, once the inner
-//! connection is TLS 1.3 both directions switch to raw TCP, so bulk traffic
-//! is encrypted only once.
-//! Not yet: XHTTP / gRPC transports.
+//! connection terminated by the TUN stack) and goes out direct, blocked, or
+//! through a server: VLESS, Trojan, VMess or Shadowsocks. The connection to
+//! a server is built in layers, TCP -> TLS or REALITY (or neither) -> a
+//! transport (none, WebSocket, HTTPUpgrade, gRPC, XHTTP) -> the protocol,
+//! and every protocol takes every layer it allows (Shadowsocks: plain TCP
+//! only; Trojan: never without TLS).
+//!
+//! VLESS on raw TCP may use the Vision flow: once the inner connection is
+//! TLS 1.3 both directions switch to raw TCP, so bulk traffic is encrypted
+//! only once. That path works on the TLS records themselves and is the one
+//! case that puts nothing between them and the protocol.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,6 +19,12 @@ const Io = std.Io;
 const net = Io.net;
 const tls13 = @import("tls13.zig");
 const ws = @import("ws.zig");
+const httpupgrade = @import("httpupgrade.zig");
+const grpc = @import("grpc.zig");
+const xhttp = @import("xhttp.zig");
+const trojan = @import("trojan.zig");
+const shadowsocks = @import("shadowsocks.zig");
+const vmess = @import("vmess.zig");
 const vision = @import("vision.zig");
 const sys = @import("sys.zig");
 const packet = @import("ipstack/packet.zig");
@@ -39,7 +50,7 @@ pub fn Text(comptime cap: usize) type {
         }
 
         /// Percent-decoded (as link parameters are); false if it does not fit.
-        fn setDecoded(t: *Self, raw: []const u8) bool {
+        pub fn setDecoded(t: *Self, raw: []const u8) bool {
             var n: usize = 0;
             var i: usize = 0;
             while (i < raw.len) : (n += 1) {
@@ -66,15 +77,44 @@ pub const Tls = struct {
     alpn: tls13.Alpn = .h2_http11,
 };
 
+/// An HTTP/1.1 upgrade: WebSocket and HTTPUpgrade ask for the same things.
+pub const Http = struct {
+    path: Text(512) = .{},
+    /// Host header; a CDN routes by it
+    host: Text(255) = .{},
+};
+
+pub const Grpc = struct {
+    service_name: Text(255) = .{},
+    /// :authority, when the link names one
+    authority: Text(255) = .{},
+    /// mode=multi (TunMulti), else "gun"
+    multi: bool = false,
+};
+
+pub const Xhttp = struct {
+    path: Text(512) = .{},
+    /// :authority; a CDN routes by it
+    host: Text(255) = .{},
+    /// empty, auto, stream-one, stream-up or packet-up, as the link has it
+    mode: Text(16) = .{},
+    /// The link's `extra`, decoded: a JSON object of more settings. Kept by
+    /// value like the rest, so one that does not fit is not carried.
+    extra: Text(1024) = .{},
+};
+
+/// What the (TLS) stream carries: the protocol itself, or a transport with
+/// the protocol inside. The same for every protocol.
 pub const Transport = union(enum) {
-    /// VLESS straight on the (TLS) stream
     raw,
-    /// VLESS in WebSocket binary frames
-    ws: struct {
-        path: Text(512) = .{},
-        /// Host header; a CDN routes by it
-        host: Text(255) = .{},
-    },
+    /// WebSocket binary frames
+    ws: Http,
+    /// WebSocket's upgrade without its framing
+    httpupgrade: Http,
+    /// one gRPC call over HTTP/2
+    grpc: Grpc,
+    /// one HTTP/2 POST, the bodies being the two directions (stream-one)
+    xhttp: Xhttp,
 };
 
 pub const Vless = struct {
@@ -88,26 +128,161 @@ pub const Vless = struct {
     transport: Transport = .raw,
 };
 
+const raw_transport: Transport = .raw;
+
+/// How the connection to a server is built, whatever protocol speaks on it.
+pub const Via = struct {
+    host: []const u8,
+    port: u16,
+    reality: ?Reality = null,
+    tls: ?*const Tls = null,
+    transport: *const Transport = &raw_transport,
+};
+
 pub const Outbound = union(enum) {
     direct,
     block,
     vless: Vless,
+    trojan: trojan.Trojan,
+    shadowsocks: shadowsocks.Shadowsocks,
+    vmess: vmess.Vmess,
+
+    /// Null for the outbounds that use no server.
+    pub fn via(o: *const Outbound) ?Via {
+        return switch (o.*) {
+            .direct, .block => null,
+            .shadowsocks => |*s| .{ .host = s.host, .port = s.port },
+            inline .vless, .trojan, .vmess => |*s| .{
+                .host = s.host,
+                .port = s.port,
+                .reality = s.reality,
+                .tls = if (s.tls) |*t| t else null,
+                .transport = &s.transport,
+            },
+        };
+    }
+
+    /// The server's address, for the outbounds that have one.
+    pub fn host(o: *const Outbound) ?[]const u8 {
+        return if (o.via()) |v| v.host else null;
+    }
+
+    /// The same server: address, port and account (not how it is reached).
+    pub fn sameServer(a: *const Outbound, b: *const Outbound) bool {
+        if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+        const va = a.via() orelse return true;
+        const vb = b.via().?;
+        if (va.port != vb.port or !std.mem.eql(u8, va.host, vb.host)) return false;
+        return switch (a.*) {
+            .direct, .block => true,
+            .vless => |*v| std.mem.eql(u8, &v.uuid, &b.vless.uuid),
+            .trojan => |*t| std.mem.eql(u8, &t.key, &b.trojan.key),
+            .shadowsocks => |*s| s.method == b.shadowsocks.method and std.mem.eql(u8, &s.key, &b.shadowsocks.key),
+            .vmess => |*v| std.mem.eql(u8, &v.user.cmd_key, &b.vmess.user.cmd_key),
+        };
+    }
+
+    /// The strings an outbound points to rather than holds.
+    fn strings(o: *Outbound) ?struct { host: *[]const u8, sni: ?*[]const u8 } {
+        switch (o.*) {
+            .direct, .block => return null,
+            inline else => |*s| {
+                const has_reality = comptime @hasField(@TypeOf(s.*), "reality");
+                return .{
+                    .host = &s.host,
+                    .sni = if (has_reality) (if (s.reality) |*re| &re.server_name else null) else null,
+                };
+            },
+        }
+    }
+
+    /// A copy whose strings are allocated from `a`.
+    pub fn dupe(o: Outbound, a: std.mem.Allocator) std.mem.Allocator.Error!Outbound {
+        var out = o;
+        if (out.strings()) |s| {
+            s.host.* = try a.dupe(u8, s.host.*);
+            if (s.sni) |sni| sni.* = try a.dupe(u8, sni.*);
+        }
+        return out;
+    }
 };
 
 pub const LinkError = error{
-    NotVless,
+    /// not a link of a protocol this build speaks
+    UnsupportedProtocol,
+    /// the link does not parse (a vmess:// body, an ss:// userinfo)
+    BadLink,
+    /// VLESS, VMess: the id is no UUID
     BadUuid,
+    /// Trojan, Shadowsocks: no password, or a 2022 key of the wrong length
+    BadPassword,
+    /// Shadowsocks: a cipher that is not carried
+    UnsupportedMethod,
+    /// Shadowsocks: SIP003 plugins are separate programs
+    UnsupportedPlugin,
     UnsupportedTransport,
     UnsupportedSecurity,
     UnsupportedFlow,
     BadRealityKey,
 };
 
-/// What of a `vless://` link this build can actually carry. Slices in the
-/// result point into `link` and `host`.
+/// What of a share link this build can actually carry: vless://, trojan://,
+/// ss:// or vmess://. `host` and `port` are the server's, already taken from
+/// the link (sublink.zig); slices in the result point into `link` and `host`.
+pub fn outboundFromLink(link: []const u8, host: []const u8, port: u16) LinkError!Outbound {
+    const scheme = link[0 .. std.mem.indexOf(u8, link, "://") orelse return error.UnsupportedProtocol];
+    const is = std.ascii.eqlIgnoreCase;
+    const ob: Outbound = if (is(scheme, "vless"))
+        .{ .vless = try vlessFromLink(link, host, port) }
+    else if (is(scheme, "trojan"))
+        .{ .trojan = trojan.fromLink(link, host, port) catch |err| return switch (err) {
+            error.NotTrojan => error.UnsupportedProtocol,
+            else => |e| e,
+        } }
+    else if (is(scheme, "ss"))
+        .{ .shadowsocks = shadowsocks.fromLink(link, host, port) catch |err| return switch (err) {
+            error.NotShadowsocks => error.UnsupportedProtocol,
+            error.BadUserInfo => error.BadLink,
+            else => |e| e,
+        } }
+    else if (is(scheme, "vmess"))
+        .{ .vmess = vmess.fromLink(link, host, port) catch |err| return switch (err) {
+            error.NotVmess => error.UnsupportedProtocol,
+            error.BadId => error.BadUuid,
+            else => |e| e,
+        } }
+    else
+        return error.UnsupportedProtocol;
+
+    // XHTTP: only what Xray's own client would send as stream-one (so "auto"
+    // only inside REALITY), and settings in `extra` it would itself take
+    const v = ob.via().?;
+    switch (v.transport.*) {
+        .xhttp => |*x| xhttp.check(xhttpOptions(x, &v)) catch return error.UnsupportedTransport,
+        else => {},
+    }
+    return ob;
+}
+
+fn xhttpOptions(x: *const Xhttp, v: *const Via) xhttp.Options {
+    return .{
+        .path = x.path.slice(),
+        .host = x.host.slice(),
+        .mode = x.mode.slice(),
+        .extra = x.extra.slice(),
+        .reality = v.reality != null,
+    };
+}
+
+/// What of a `vless://` link this build can carry. Parameters as Xray's
+/// share links write them: security (none, tls, reality) with sni, alpn, pbk
+/// and sid; type (tcp, ws, httpupgrade, grpc, xhttp) with path, host,
+/// serviceName, authority, mode and extra; flow. fp is ignored (the
+/// ClientHello is always Chrome's), so is allowInsecure: certificates are
+/// always checked.
 pub fn vlessFromLink(link: []const u8, host: []const u8, port: u16) LinkError!Vless {
     const prefix = "vless://";
-    if (!std.ascii.startsWithIgnoreCase(link, prefix)) return error.NotVless;
+    if (!std.ascii.startsWithIgnoreCase(link, prefix)) return error.UnsupportedProtocol;
     const rest = link[prefix.len..];
     const at = std.mem.indexOfScalar(u8, rest, '@') orelse return error.BadUuid;
     const uuid = parseUuid(rest[0..at]) orelse return error.BadUuid;
@@ -117,68 +292,97 @@ pub fn vlessFromLink(link: []const u8, host: []const u8, port: u16) LinkError!Vl
         const end = std.mem.indexOfScalarPos(u8, rest, q, '#') orelse rest.len;
         query = rest[q + 1 .. end];
     }
-    var security: []const u8 = "";
-    var transport: []const u8 = "";
-    var flow: []const u8 = "";
-    var sni: []const u8 = "";
-    var pbk: []const u8 = "";
-    var sid: []const u8 = "";
-    var path: []const u8 = "";
-    var host_header: []const u8 = "";
-    var alpn: []const u8 = "";
+    var p: struct {
+        security: []const u8 = "",
+        encryption: []const u8 = "",
+        type: []const u8 = "",
+        header_type: []const u8 = "",
+        flow: []const u8 = "",
+        sni: []const u8 = "",
+        pbk: []const u8 = "",
+        sid: []const u8 = "",
+        path: []const u8 = "",
+        host: []const u8 = "",
+        alpn: []const u8 = "",
+        service_name: []const u8 = "",
+        authority: []const u8 = "",
+        mode: []const u8 = "",
+        extra: []const u8 = "",
+    } = .{};
     var it = std.mem.tokenizeScalar(u8, query, '&');
     while (it.next()) |kv| {
         const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
-        const k = kv[0..eq];
-        const v = kv[eq + 1 ..];
-        if (std.mem.eql(u8, k, "security")) security = v;
-        if (std.mem.eql(u8, k, "type")) transport = v;
-        if (std.mem.eql(u8, k, "flow")) flow = v;
-        if (std.mem.eql(u8, k, "sni")) sni = v;
-        if (std.mem.eql(u8, k, "pbk")) pbk = v;
-        if (std.mem.eql(u8, k, "sid")) sid = v;
-        if (std.mem.eql(u8, k, "path")) path = v;
-        if (std.mem.eql(u8, k, "host")) host_header = v;
-        if (std.mem.eql(u8, k, "alpn")) alpn = v;
+        const fields = .{
+            .{ "security", &p.security },      .{ "encryption", &p.encryption }, .{ "type", &p.type },
+            .{ "headerType", &p.header_type }, .{ "flow", &p.flow },             .{ "sni", &p.sni },
+            .{ "pbk", &p.pbk },                .{ "sid", &p.sid },               .{ "path", &p.path },
+            .{ "host", &p.host },              .{ "alpn", &p.alpn },             .{ "serviceName", &p.service_name },
+            .{ "authority", &p.authority },    .{ "mode", &p.mode },             .{ "extra", &p.extra },
+        };
+        inline for (fields) |f| if (std.mem.eql(u8, kv[0..eq], f[0])) {
+            f[1].* = kv[eq + 1 ..];
+        };
     }
+    const is = std.ascii.eqlIgnoreCase;
+
+    // VLESS's own encryption layer (ML-KEM) is not spoken
+    if (p.encryption.len > 0 and !is(p.encryption, "none")) return error.UnsupportedSecurity;
 
     var out: Vless = .{ .host = host, .port = port, .uuid = uuid };
-    if (transport.len == 0 or std.mem.eql(u8, transport, "tcp") or std.mem.eql(u8, transport, "raw")) {
-        out.transport = .raw;
-    } else if (std.mem.eql(u8, transport, "ws")) {
-        out.transport = .{ .ws = .{} };
-        const w = &out.transport.ws;
-        if (!w.path.setDecoded(if (path.len > 0) path else "/")) return error.UnsupportedTransport;
-        if (w.path.len == 0 or w.path.buf[0] != '/') return error.UnsupportedTransport;
-        const h = if (host_header.len > 0) host_header else if (sni.len > 0) sni else host;
-        if (!w.host.setDecoded(h)) return error.UnsupportedTransport;
+    // the Host a CDN routes by: as the link says, else its sni, else the address
+    const route_host = if (p.host.len > 0) p.host else if (p.sni.len > 0) p.sni else host;
+    if (p.type.len == 0 or is(p.type, "tcp") or is(p.type, "raw")) {
+        // the HTTP/1.1 disguise of raw TCP is not carried
+        if (p.header_type.len > 0 and !is(p.header_type, "none")) return error.UnsupportedTransport;
+    } else if (is(p.type, "ws") or is(p.type, "httpupgrade")) {
+        var h: Http = .{};
+        if (!h.path.setDecoded(if (p.path.len > 0) p.path else "/")) return error.UnsupportedTransport;
+        if (h.path.len == 0 or h.path.buf[0] != '/') return error.UnsupportedTransport;
+        if (!h.host.setDecoded(route_host)) return error.UnsupportedTransport;
+        out.transport = if (is(p.type, "ws")) .{ .ws = h } else .{ .httpupgrade = h };
+    } else if (is(p.type, "grpc")) {
+        var g: Grpc = .{};
+        if (!g.service_name.setDecoded(p.service_name) or !g.authority.setDecoded(p.authority)) return error.UnsupportedTransport;
+        if (p.mode.len > 0 and !is(p.mode, "gun") and !is(p.mode, "multi")) return error.UnsupportedTransport;
+        g.multi = is(p.mode, "multi");
+        out.transport = .{ .grpc = g };
+    } else if (is(p.type, "xhttp") or is(p.type, "splithttp")) {
+        var x: Xhttp = .{};
+        if (!x.path.setDecoded(p.path) or !x.mode.setDecoded(p.mode) or !x.extra.setDecoded(p.extra)) return error.UnsupportedTransport;
+        if (!x.host.setDecoded(route_host)) return error.UnsupportedTransport;
+        out.transport = .{ .xhttp = x };
     } else return error.UnsupportedTransport;
 
-    if (flow.len > 0) {
-        if (!std.mem.startsWith(u8, flow, "xtls-rprx-vision")) return error.UnsupportedFlow;
-        // Vision splices raw TCP; it has no place inside WebSocket
+    if (p.flow.len > 0) {
+        if (!std.mem.startsWith(u8, p.flow, "xtls-rprx-vision")) return error.UnsupportedFlow;
+        // Vision splices raw TCP; it has no place inside a transport
         if (out.transport != .raw) return error.UnsupportedFlow;
         out.vision = true;
     }
-    if (security.len == 0 or std.mem.eql(u8, security, "none")) {
+    if (p.security.len == 0 or is(p.security, "none")) {
         if (out.vision) return error.UnsupportedFlow; // Vision rides on an outer TLS layer
-    } else if (std.mem.eql(u8, security, "reality")) {
+    } else if (is(p.security, "reality")) {
         out.reality = .{
-            .server_name = if (sni.len > 0) sni else host,
-            .public_key = decodeKey(pbk) orelse return error.BadRealityKey,
-            .short_id = decodeShortId(sid) orelse return error.BadRealityKey,
+            .server_name = if (p.sni.len > 0) p.sni else host,
+            .public_key = decodeKey(p.pbk) orelse return error.BadRealityKey,
+            .short_id = decodeShortId(p.sid) orelse return error.BadRealityKey,
         };
-    } else if (std.mem.eql(u8, security, "tls")) {
+    } else if (is(p.security, "tls")) {
         if (out.vision) return error.UnsupportedFlow; // Vision over plain TLS: not carried
         var t: Tls = .{};
         // the certificate is checked against this name: sni, else the Host
         // the CDN routes by, else the address
-        const name = if (sni.len > 0) sni else if (host_header.len > 0) host_header else host;
+        const name = if (p.sni.len > 0) p.sni else if (p.host.len > 0) p.host else host;
         if (!t.server_name.setDecoded(name)) return error.UnsupportedSecurity;
-        // WebSocket needs HTTP/1.1; a link may narrow the offer further
-        const has_h2 = std.mem.indexOf(u8, alpn, "h2") != null;
-        const has_h11 = std.mem.indexOf(u8, alpn, "http") != null;
-        t.alpn = if (out.transport == .ws or (has_h11 and !has_h2)) .http11 else if (has_h2 and !has_h11) .h2 else .h2_http11;
+        const has_h2 = std.mem.indexOf(u8, p.alpn, "h2") != null;
+        const has_h11 = std.mem.indexOf(u8, p.alpn, "http") != null;
+        t.alpn = switch (out.transport) {
+            // WebSocket and HTTPUpgrade need HTTP/1.1; gRPC and XHTTP run on HTTP/2
+            .ws, .httpupgrade => .http11,
+            .grpc, .xhttp => .h2,
+            // a link may narrow the offer
+            .raw => if (has_h11 and !has_h2) .http11 else if (has_h2 and !has_h11) .h2 else .h2_http11,
+        };
         out.tls = t;
     } else return error.UnsupportedSecurity;
     return out;
@@ -329,6 +533,12 @@ fn noteDialFailure(io: Io, host: []const u8, err: anyerror, http_status: ?u16) v
 /// handshakes within this time, or the dial fails.
 pub const handshake_timeout_ms = 10_000;
 
+/// Stack of a thread that dials a server. The TLS handshake (its ML-KEM key
+/// pair above all) goes about 175 KiB deep in a release build and 260 KiB
+/// in a debug one, under the thread's own buffers. Only pages that are
+/// touched cost memory.
+pub const dial_stack_size = 512 * 1024;
+
 /// How outbound connections are made.
 pub const Dialer = struct {
     /// keep our own sockets off the TUN
@@ -365,9 +575,10 @@ pub const Dialer = struct {
     }
 };
 
-/// A connection to a VLESS server, dialed and (with REALITY) through the
-/// TLS handshake, ready for a request header. It holds its own buffers, so
-/// it must stay at one address once `dialVless` has filled it.
+/// A connection to a server, dialed, through its TLS or REALITY handshake
+/// and with its transport open: ready for the protocol's request. It holds
+/// the buffers of the socket and of the TLS records, so it must stay at one
+/// address once `Flow.dial` has filled it.
 pub const Upstream = struct {
     stream: net.Stream,
     ur: if (sys.supported) sys.SockReader else net.Stream.Reader,
@@ -377,39 +588,323 @@ pub const Upstream = struct {
     tls: bool,
     urb: [tls13.min_read_buffer]u8,
     uwb: [4096]u8,
-    /// a transport inside the stream (WebSocket); its buffers live on the heap
+    /// What runs inside the stream: a transport, a protocol's own cipher,
+    /// or only the TLS records as a byte stream. On the heap with its
+    /// buffers; VLESS on the raw stream has none.
     layer: ?*Layer = null,
-    /// HTTP status of a transport upgrade the server refused, for the log
+    /// HTTP status of a transport request the server refused, for the log
     layer_status: u16 = 0,
+
+    /// The download ended badly while the upload may still be running:
+    /// make sure the upload notices. Over HTTP/2 it may be waiting for
+    /// flow-control credit that only the download thread could have
+    /// delivered, and would wait forever.
+    fn abandon(u: *Upstream, io: Io) void {
+        if (u.layer) |l| l.goodbye();
+        u.stream.shutdown(io, .both) catch {};
+    }
+
+    /// How long the server may stay silent after the upload ended.
+    fn lingerMs(u: *const Upstream) u32 {
+        const l = u.layer orelse return linger_ms;
+        return if (l.transport == .ws) linger_unsignalled_ms else linger_ms;
+    }
 
     pub fn close(u: *Upstream, io: Io) void {
         if (u.layer) |l| {
-            l.ws.close();
-            std.heap.c_allocator.destroy(l);
+            l.goodbye();
+            l.destroy();
             u.layer = null;
         }
         u.stream.close(io);
     }
 
-    /// Where VLESS bytes go and come from: the transport if there is one,
-    /// else the TLS records or the socket (the caller handles those).
-    fn transportReader(u: *Upstream) ?*Io.Reader {
-        return if (u.layer) |l| &l.ws.reader else null;
+    /// Where the protocol's bytes come from and go to when something sits
+    /// between it and the TLS records or the socket; the caller handles
+    /// those itself otherwise.
+    pub fn transportReader(u: *Upstream) ?*Io.Reader {
+        return if (u.layer) |l| l.r else null;
     }
-    fn transportWriter(u: *Upstream) ?*Io.Writer {
-        return if (u.layer) |l| &l.ws.writer else null;
+    pub fn transportWriter(u: *Upstream) ?*Io.Writer {
+        return if (u.layer) |l| l.w else null;
+    }
+
+    /// The application's data, once `attach` put the protocol's cipher (if
+    /// it has one) on the stream.
+    fn reader(u: *Upstream) *Io.Reader {
+        const l = u.layer.?;
+        return switch (l.cipher) {
+            .none => l.r,
+            inline else => |c| &c.reader,
+        };
+    }
+    fn writer(u: *Upstream) *Io.Writer {
+        const l = u.layer.?;
+        return switch (l.cipher) {
+            .none => l.w,
+            inline else => |c| &c.writer,
+        };
+    }
+
+    /// VMess and Shadowsocks seal the stream themselves: put their cipher
+    /// on it, with the request for `target` (which leaves with the first
+    /// flush). No I/O. The other protocols need nothing here.
+    fn attach(u: *Upstream, io: Io, ob: *const Outbound, target: *const Target) !void {
+        const l = u.layer orelse return;
+        const p = Plan.of(ob, &ob.via().?, u.tls).?;
+        switch (ob.*) {
+            .vmess => |*v| {
+                const c = l.make(vmess.Conn);
+                c.* = .init(io, v.user, v.security, l.r, l.w, l.take(p.cr), l.take(p.cw));
+                l.cipher = .{ .vmess = c };
+                try c.writeRequest(.{
+                    .address = switch (target.kind) {
+                        .ip4 => .{ .ip4 = target.bytes[0..4].* },
+                        .ip6 => .{ .ip6 = target.bytes[0..16].* },
+                        .domain => .{ .domain = target.addr() },
+                    },
+                    .port = target.port,
+                });
+            },
+            .shadowsocks => |*s| {
+                const c = l.make(shadowsocks.Conn);
+                c.* = .init(io, s, target, l.r, l.w, l.take(p.cr), l.take(p.cw));
+                l.cipher = .{ .shadowsocks = c };
+            },
+            else => {},
+        }
+    }
+
+    /// The application finished sending: tell the server so, leaving the
+    /// download open, where the layers have a way to say it.
+    fn endUpload(u: *Upstream, io: Io) void {
+        if (u.layer) |l| {
+            switch (l.cipher) {
+                // the empty chunk that ends our direction
+                .vmess => |c| c.end() catch {},
+                .none, .shadowsocks => {},
+            }
+            switch (l.transport) {
+                // WebSocket has no half-close, and Xray takes a TCP one for
+                // an abnormal end and drops the download with it: say
+                // nothing, the server's own timers end the flow
+                .ws => return,
+                // END_STREAM; the connection itself has to stay, it still
+                // answers the server's PINGs and returns flow-control credit
+                .grpc => |c| return c.closeWrite() catch {},
+                .xhttp => |c| return c.closeWrite() catch {},
+                // a byte stream on the records: only this thread writes them
+                .none, .httpupgrade => if (u.tls) u.rw.closeNotify() catch {},
+            }
+        }
+        u.stream.shutdown(io, .send) catch {};
+    }
+
+    /// Why the server turned the connection down, when that shows only
+    /// after the dial: gRPC and XHTTP send their request without waiting
+    /// for the answer, as do WebSocket and HTTPUpgrade with early data, and
+    /// a cipher's key is first tested by the server's first bytes. Null
+    /// when nothing of the kind happened: a destination the server could
+    /// not reach is not its fault. For the thread that reads the
+    /// connection, once it has ended.
+    fn refusal(u: *Upstream) ?anyerror {
+        const l = u.layer orelse return null;
+        switch (l.transport) {
+            .none => {},
+            .ws => |c| if (c.err) |e| switch (e) {
+                error.WsUpgradeRefused, error.WsBadHandshake => {
+                    u.layer_status = c.status;
+                    return e;
+                },
+                else => {},
+            },
+            .httpupgrade => |c| if (c.err) |e| {
+                u.layer_status = c.status;
+                return e;
+            },
+            .grpc => |c| if (c.read_err) |e| switch (e) {
+                error.GrpcRefused, error.GrpcNotGrpc => {
+                    u.layer_status = c.status;
+                    return e;
+                },
+                // 12, unimplemented: a wrong service name or mode
+                error.GrpcStatus => if (c.grpc_status == 12) return e,
+                else => {},
+            },
+            .xhttp => |c| if (c.read_err) |e| if (e == error.XhttpRejected) {
+                u.layer_status = c.status;
+                return e;
+            },
+        }
+        switch (l.cipher) {
+            .none => {},
+            // (no answer at all is also what an unreachable destination gives)
+            .vmess => |c| if (c.err) |e| if (e == error.VmessBadResponse) return e,
+            .shadowsocks => |c| if (c.err) |e| switch (e) {
+                error.SsAuthFailed, error.SsBadResponse, error.SsClockSkew => return e,
+                else => {},
+            },
+        }
+        return null;
     }
 };
 
-/// A WebSocket inside TLS (or on the socket).
+/// Buffer sizes of a connection's layer. What a buffer is for decides its
+/// size: one a copy loop reads from holds a TLS record's worth, one that
+/// only passes bytes on to a buffer above it stays small.
+const Plan = struct {
+    /// TLS records as a byte stream
+    sr: usize = 0,
+    sw: usize = 0,
+    /// the transport
+    tr: usize = 0,
+    tw: usize = 0,
+    /// the protocol's cipher
+    cr: usize = 0,
+    cw: usize = 0,
+    /// the transport's and the cipher's own state
+    state: usize = 0,
+
+    /// Room for a `T` wherever in the block it comes: buffers of any
+    /// length may lie before it, so it may have to move up to be aligned.
+    fn room(comptime T: type) usize {
+        return @sizeOf(T) + Layer.block_align;
+    }
+
+    /// Null: nothing sits between the protocol and the stream.
+    fn of(ob: *const Outbound, v: *const Via, tls: bool) ?Plan {
+        var p: Plan = .{};
+        switch (ob.*) {
+            .vmess => {
+                p.cr = vmess.read_buffer_len;
+                p.cw = vmess.write_buffer_len;
+                p.state = room(vmess.Conn);
+            },
+            .shadowsocks => |*s| {
+                p.cr = shadowsocks.readBufferLen(s.method);
+                p.cw = shadowsocks.write_buffer_len;
+                p.state = room(shadowsocks.Conn);
+            },
+            else => {},
+        }
+        const cipher = p.cr != 0;
+        // a cipher opens chunks in its own buffer: below it nothing is copied from
+        const top: usize = if (cipher) 512 else 16 * 1024;
+        switch (v.transport.*) {
+            .raw => {
+                // VLESS works on the records (Vision) or the socket itself
+                if (ob.* == .vless) return null;
+                if (tls) p.sr = top;
+            },
+            .ws => {
+                if (tls) {
+                    p.sr = 16 * 1024;
+                    p.sw = 4096;
+                }
+                p.tr = top;
+                // a frame is at most one TLS record
+                p.tw = 16 * 1024;
+                p.state += room(ws.Conn);
+            },
+            .httpupgrade => {
+                // the answer is read from here line by line, then data passes through
+                if (tls) p.sr = 4096;
+                p.tr = top;
+                p.state += room(httpupgrade.Conn);
+            },
+            .grpc => {
+                // HTTP/2 takes frame headers from here; payload goes past it
+                if (tls) p.sr = 64;
+                p.tr = top;
+                // a message, its DATA frame and that frame's TLS record: one each
+                p.tw = 16 * 1024 - 18;
+                p.state += room(grpc.Conn);
+            },
+            .xhttp => {
+                if (tls) p.sr = 64;
+                p.tr = top;
+                // room for a request header to leave with the first data
+                p.tw = 4096;
+                p.state += room(xhttp.Conn);
+            },
+        }
+        return p;
+    }
+
+    /// The buffers alone.
+    fn buffers(p: Plan) usize {
+        return p.sr + p.sw + p.tr + p.tw + p.cr + p.cw;
+    }
+
+    fn total(p: Plan) usize {
+        return p.buffers() + p.state;
+    }
+};
+
+/// What a connection carries inside its stream, from the bottom up: the
+/// TLS records as a byte stream, a transport, a protocol's cipher. One
+/// allocation: this, then the state of those that are there and their
+/// buffers (see `Plan`), so a connection pays for what it uses only.
 const Layer = struct {
-    sr: tls13.StreamReader,
-    sw: tls13.StreamWriter,
-    ws: ws.Conn,
-    srb: [16 * 1024]u8,
-    swb: [4096]u8,
-    rb: [16 * 1024]u8,
-    wb: [16 * 1024]u8,
+    block: []align(block_align) u8,
+    used: usize,
+    sr: tls13.StreamReader = undefined,
+    sw: tls13.StreamWriter = undefined,
+    transport: union(enum) {
+        none,
+        ws: *ws.Conn,
+        httpupgrade: *httpupgrade.Conn,
+        grpc: *grpc.Conn,
+        xhttp: *xhttp.Conn,
+    } = .none,
+    cipher: union(enum) {
+        none,
+        vmess: *vmess.Conn,
+        shadowsocks: *shadowsocks.Conn,
+    } = .none,
+    /// the protocol's bytes: the transport, else the TLS stream, else the socket
+    r: *Io.Reader = undefined,
+    w: *Io.Writer = undefined,
+
+    const block_align = 16;
+
+    fn create(p: Plan) !*Layer {
+        const head = @sizeOf(Layer);
+        const block = try std.heap.c_allocator.alignedAlloc(u8, .fromByteUnits(block_align), head + p.total());
+        const l: *Layer = @ptrCast(block.ptr);
+        l.* = .{ .block = block, .used = head };
+        return l;
+    }
+
+    fn destroy(l: *Layer) void {
+        std.heap.c_allocator.free(l.block);
+    }
+
+    fn take(l: *Layer, n: usize) []u8 {
+        // the plan and what is taken by it are written in two places: a
+        // mismatch must never become a write past the block
+        if (n > l.block.len - l.used) @panic("connection layer: plan too small");
+        const s = l.block[l.used..][0..n];
+        l.used += n;
+        return s;
+    }
+
+    /// Room for a `T`, not initialized.
+    fn make(l: *Layer, comptime T: type) *T {
+        comptime std.debug.assert(@alignOf(T) <= block_align);
+        const at = std.mem.alignForward(usize, l.used, block_align);
+        _ = l.take(at - l.used);
+        return @ptrCast(@alignCast(l.take(@sizeOf(T)).ptr));
+    }
+
+    /// Tell the server the connection is over, where the transport has a
+    /// word for it; not waited for. Twice does no harm.
+    fn goodbye(l: *Layer) void {
+        switch (l.transport) {
+            .none, .httpupgrade => {},
+            inline else => |c| c.close(),
+        }
+    }
 };
 
 /// The application's side of a flow.
@@ -521,7 +1016,8 @@ pub const Flow = struct {
                 try local.ready();
                 try f.relayPlain(local, upstream);
             },
-            .vless => |v| try f.runVless(v, local, target),
+            .vless => try f.runVless(ob, local, target),
+            .trojan, .shadowsocks, .vmess => try f.runStream(ob, local, target),
         }
     }
 
@@ -531,10 +1027,10 @@ pub const Flow = struct {
         var ur = upstream.reader(f.io, &urb);
         var uw = upstream.writer(f.io, &uwb);
         var bk: Back = .{};
-        const back = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, relayBack, .{ f, &ur.interface, local, &bk });
+        const back = try std.Thread.spawn(.{ .stack_size = sys.stackSize(64 * 1024) }, relayBack, .{ f, &ur.interface, local, &bk });
         if (f.pumpCounted(local.r, &uw.interface, .up)) {
             upstream.shutdown(f.io, .send) catch {};
-            f.linger(&bk, upstream);
+            f.linger(&bk, upstream, linger_ms);
         } else |_| {
             upstream.shutdown(f.io, .both) catch {};
         }
@@ -567,7 +1063,7 @@ pub const Flow = struct {
     /// a shutdown would wait for them): once nothing has come for
     /// `linger_ms`, or the owner of the flows is stopping, the connection
     /// is closed, which ends the thread reading it.
-    fn linger(f: *const Flow, bk: *Back, upstream: net.Stream) void {
+    fn linger(f: *const Flow, bk: *Back, upstream: net.Stream, limit_ms: u32) void {
         var seen = bk.chunks.load(.monotonic);
         var quiet_ms: u32 = 0;
         bk.mutex.lockUncancelable(f.io);
@@ -582,7 +1078,7 @@ pub const Flow = struct {
                 quiet_ms = 0;
             } else quiet_ms += linger_step_ms;
             const stopping = if (f.stop) |st| st.load(.acquire) else false;
-            if (quiet_ms >= linger_ms or stopping) {
+            if (quiet_ms >= limit_ms or stopping) {
                 upstream.shutdown(f.io, .both) catch {};
                 return;
             }
@@ -603,16 +1099,18 @@ pub const Flow = struct {
         try to.flush();
     }
 
-    /// Connect to the server of `v`, run the TLS or REALITY handshake if it
-    /// has one, and open its transport.
-    pub fn dialVless(f: *const Flow, v: Vless, u: *Upstream) !void {
-        f.dialVlessInner(v, u) catch |err| {
+    /// Connect to the server of `ob`, run the TLS or REALITY handshake if
+    /// it has one, and open its transport. The protocol's request is the
+    /// caller's to send.
+    pub fn dial(f: *const Flow, ob: *const Outbound, u: *Upstream) !void {
+        const v = ob.via() orelse return error.NoServer;
+        f.dialInner(ob, &v, u) catch |err| {
             noteDialFailure(f.io, v.host, err, if (u.layer_status != 0) u.layer_status else null);
             return err;
         };
     }
 
-    fn dialVlessInner(f: *const Flow, v: Vless, u: *Upstream) !void {
+    fn dialInner(f: *const Flow, ob: *const Outbound, v: *const Via, u: *Upstream) !void {
         const io = f.io;
         u.layer = null;
         u.layer_status = 0;
@@ -653,39 +1151,109 @@ pub const Flow = struct {
                 return err;
             };
         }
-        switch (v.transport) {
+
+        try f.openLayer(ob, v, u);
+    }
+
+    /// What runs inside the stream, if anything does. A function of its
+    /// own so that its frame is not under the TLS handshake's, the deepest
+    /// part of a dial: flow threads have small stacks.
+    fn openLayer(f: *const Flow, ob: *const Outbound, v: *const Via, u: *Upstream) !void {
+        const io = f.io;
+        const p = Plan.of(ob, v, u.tls) orelse return;
+        const l = try Layer.create(p);
+        errdefer l.destroy();
+        var r: *Io.Reader = &u.ur.interface;
+        var w: *Io.Writer = &u.uw.interface;
+        if (u.tls) {
+            l.sr = .init(&u.rr, l.take(p.sr));
+            l.sw = .init(&u.rw, l.take(p.sw));
+            r = &l.sr.interface;
+            w = &l.sw.interface;
+        }
+        switch (v.transport.*) {
             .raw => {},
-            .ws => |w| {
-                const l = try std.heap.c_allocator.create(Layer);
-                errdefer std.heap.c_allocator.destroy(l);
-                var below_r: *Io.Reader = &u.ur.interface;
-                var below_w: *Io.Writer = &u.uw.interface;
-                if (u.tls) {
-                    l.sr = .init(&u.rr, &l.srb);
-                    l.sw = .init(&u.rw, &l.swb);
-                    below_r = &l.sr.interface;
-                    below_w = &l.sw.interface;
-                }
-                l.ws = .init(io, below_r, below_w, &l.rb, &l.wb);
-                l.ws.handshake(.{ .path = w.path.slice(), .host = w.host.slice() }) catch |err| {
-                    u.layer_status = l.ws.status;
+            .ws => |*h| {
+                const c = l.make(ws.Conn);
+                c.* = .init(io, r, w, l.take(p.tr), l.take(p.tw));
+                l.transport = .{ .ws = c };
+                c.handshake(.{ .path = h.path.slice(), .host = h.host.slice() }) catch |err| {
+                    u.layer_status = c.status;
                     f.fault(.handshake);
                     return err;
                 };
-                u.layer = l;
+                r = &c.reader;
+                w = &c.writer;
+            },
+            .httpupgrade => |*h| {
+                const c = l.make(httpupgrade.Conn);
+                c.* = .init(io, r, w, l.take(p.tr));
+                l.transport = .{ .httpupgrade = c };
+                c.handshake(.{ .path = h.path.slice(), .host = h.host.slice(), .tls = u.tls }) catch |err| {
+                    u.layer_status = c.status;
+                    f.fault(.handshake);
+                    return err;
+                };
+                r = &c.reader;
+                w = c.writer();
+            },
+            // gRPC and XHTTP send their request without waiting for the
+            // answer, as Xray does: a refusal shows on the first read
+            .grpc => |*g| {
+                const c = l.make(grpc.Conn);
+                var ab: [264]u8 = undefined;
+                c.open(io, r, w, l.take(p.tr), l.take(p.tw), .{
+                    .service_name = g.service_name.slice(),
+                    .authority = grpc.authority(&ab, g.authority.slice(), if (v.tls) |t| t.server_name.slice() else "", v.reality != null, v.host, v.port),
+                    .mode = if (g.multi) .multi else .gun,
+                }) catch |err| {
+                    f.fault(.handshake);
+                    return err;
+                };
+                l.transport = .{ .grpc = c };
+                r = c.reader();
+                w = c.writer();
+            },
+            .xhttp => |*x| {
+                const c = l.make(xhttp.Conn);
+                c.open(io, r, w, l.take(p.tr), l.take(p.tw), xhttpOptions(x, v)) catch |err| {
+                    f.fault(.handshake);
+                    return err;
+                };
+                l.transport = .{ .xhttp = c };
+                r = c.reader();
+                w = c.writer();
             },
         }
+        l.r = r;
+        l.w = w;
+        u.layer = l;
     }
 
-    fn runVless(f: *const Flow, v: Vless, local: *Local, target: *const Target) !void {
+    /// SOCKS reply code for a dial that failed.
+    fn refuseCode(f: *const Flow, err: anyerror) u8 {
+        return switch (err) {
+            error.ConnectionRefused => 5,
+            error.RealityAuthFailed => 1,
+            else => if (up_fault(f) == .handshake or up_fault(f) == .reality_rejected) 1 else 4,
+        };
+    }
+
+    /// A connection that ended without a byte from the server: if the
+    /// server turned it down (`Upstream.refusal`), that is a handshake that
+    /// failed, for the server's health and for the log.
+    fn noteRefusal(f: *const Flow, u: *Upstream, host: []const u8) void {
+        const err = u.refusal() orelse return;
+        f.fault(.handshake);
+        noteDialFailure(f.io, host, err, if (u.layer_status != 0) u.layer_status else null);
+    }
+
+    fn runVless(f: *const Flow, ob: *const Outbound, local: *Local, target: *const Target) !void {
         const io = f.io;
+        const v = &ob.vless;
         var conn: Upstream = undefined;
-        f.dialVless(v, &conn) catch |err| {
-            local.refuse(switch (err) {
-                error.ConnectionRefused => 5,
-                error.RealityAuthFailed => 1,
-                else => if (up_fault(f) == .handshake or up_fault(f) == .reality_rejected) 1 else 4,
-            });
+        f.dial(ob, &conn) catch |err| {
+            local.refuse(f.refuseCode(err));
             return err;
         };
         defer conn.close(io);
@@ -704,6 +1272,8 @@ pub const Flow = struct {
         var bk: Back = .{};
         var dl: Downlink = .{
             .flow = f,
+            .conn = &conn,
+            .host = v.host,
             .tls = if (conn.tls and t_r == null) rr else null,
             .raw = t_r orelse &ur.interface,
             .local = local,
@@ -712,20 +1282,66 @@ pub const Flow = struct {
             .traffic = &traffic,
             .back = &bk,
         };
-        const back = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, Downlink.run, .{&dl});
+        const back = try std.Thread.spawn(.{ .stack_size = sys.stackSize(128 * 1024) }, Downlink.run, .{&dl});
         const tls_w: ?*tls13.RecordWriter = if (conn.tls and t_w == null) rw else null;
         if (f.uplink(v, local, t_w orelse &uw.interface, tls_w, &traffic, target)) {
-            upstream.shutdown(io, .send) catch {};
-            f.linger(&bk, upstream);
+            conn.endUpload(io);
+            f.linger(&bk, upstream, conn.lingerMs());
         } else |_| {
             upstream.shutdown(io, .both) catch {};
         }
         back.join();
     }
 
+    /// Trojan, VMess, Shadowsocks: after the request the application's data
+    /// goes as it is, inside the protocol's cipher if it has one.
+    fn runStream(f: *const Flow, ob: *const Outbound, local: *Local, target: *const Target) !void {
+        const io = f.io;
+        var conn: Upstream = undefined;
+        f.dial(ob, &conn) catch |err| {
+            local.refuse(f.refuseCode(err));
+            return err;
+        };
+        defer conn.close(io);
+        conn.attach(io, ob, target) catch |err| {
+            local.refuse(1);
+            return err;
+        };
+        try local.ready();
+
+        var bk: Back = .{};
+        var sb: StreamBack = .{ .flow = f, .conn = &conn, .host = ob.host().?, .local = local, .back = &bk };
+        const back = try std.Thread.spawn(.{ .stack_size = sys.stackSize(128 * 1024) }, StreamBack.run, .{&sb});
+        if (f.uplinkStream(ob, &conn, local, target)) {
+            conn.endUpload(io);
+            f.linger(&bk, conn.stream, conn.lingerMs());
+        } else |_| {
+            conn.stream.shutdown(io, .both) catch {};
+        }
+        back.join();
+    }
+
+    fn uplinkStream(f: *const Flow, ob: *const Outbound, conn: *Upstream, local: *Local, target: *const Target) !void {
+        const w = conn.writer();
+        switch (ob.*) {
+            // Xray takes a connection for Trojan only if its first read
+            // starts with the whole header: nothing may be flushed before it
+            .trojan => |*t| {
+                var hb: [trojan.header_max]u8 = undefined;
+                try w.writeAll(trojan.requestHeader(&hb, &t.key, .connect, target));
+            },
+            // the ciphers hold their request until the first flush
+            else => {},
+        }
+        // the request leaves with the first data, or alone after a short
+        // wait so server-first protocols are not stuck
+        if (!local.waitReadable(500)) try w.flush();
+        return f.pumpCounted(local.r, w, .up);
+    }
+
     fn uplink(
         f: *const Flow,
-        v: Vless,
+        v: *const Vless,
         local: *Local,
         raw: *Io.Writer,
         tls_w: ?*tls13.RecordWriter,
@@ -841,10 +1457,36 @@ const Back = struct {
 /// How long the other end may stay silent after the application finished
 /// sending (Xray's default for this is 5 s of its 300 s idle time).
 const linger_ms = 30_000;
+/// The same for a transport that cannot tell the server the upload is over
+/// (WebSocket has no half-close): the destination never learns that the
+/// application is done and usually just stays open, so waiting long only
+/// keeps finished flows around. Xray gives this case one second.
+const linger_unsignalled_ms = 4000;
 const linger_step_ms = 200;
+
+/// The downlink of a flow whose protocol leaves the application's data on
+/// the connection's reader as it is.
+const StreamBack = struct {
+    flow: *const Flow,
+    conn: *Upstream,
+    host: []const u8,
+    local: *Local,
+    back: *Back,
+
+    fn run(s: *StreamBack) void {
+        const f = s.flow;
+        defer s.back.finish(f.io);
+        const ended = if (f.pumpBack(s.conn.reader(), s.local.w, s.back)) true else |_| false;
+        if (s.back.chunks.load(.monotonic) == 0) f.noteRefusal(s.conn, s.host);
+        if (!ended) s.conn.abandon(f.io);
+        if (ended) s.local.closeBoth(f.io) else s.local.reset(f.io);
+    }
+};
 
 const Downlink = struct {
     flow: *const Flow,
+    conn: *Upstream,
+    host: []const u8,
     tls: ?*tls13.RecordReader,
     raw: *Io.Reader,
     local: *Local,
@@ -865,7 +1507,10 @@ const Downlink = struct {
 
     fn run(d: *Downlink) void {
         defer d.back.finish(d.flow.io);
-        if (d.loop()) d.local.closeBoth(d.flow.io) else |_| d.local.reset(d.flow.io);
+        const ended = if (d.loop()) true else |_| false;
+        if (d.back.chunks.load(.monotonic) == 0) d.flow.noteRefusal(d.conn, d.host);
+        if (!ended) d.conn.abandon(d.flow.io);
+        if (ended) d.local.closeBoth(d.flow.io) else d.local.reset(d.flow.io);
     }
 
     fn loop(d: *Downlink) !void {
@@ -963,12 +1608,12 @@ pub const Snapshot = struct {
 
     pub fn of(o: Outbound) Snapshot {
         var s: Snapshot = .{ .outbound = o };
-        if (o == .vless) {
-            s.host_len = @intCast(@min(o.vless.host.len, s.host.len));
-            @memcpy(s.host[0..s.host_len], o.vless.host[0..s.host_len]);
-            if (o.vless.reality) |re| {
-                s.sni_len = @intCast(@min(re.server_name.len, s.sni.len));
-                @memcpy(s.sni[0..s.sni_len], re.server_name[0..s.sni_len]);
+        if (s.outbound.strings()) |p| {
+            s.host_len = @intCast(@min(p.host.len, s.host.len));
+            @memcpy(s.host[0..s.host_len], p.host.*[0..s.host_len]);
+            if (p.sni) |sni| {
+                s.sni_len = @intCast(@min(sni.len, s.sni.len));
+                @memcpy(s.sni[0..s.sni_len], sni.*[0..s.sni_len]);
             }
         }
         return s;
@@ -976,15 +1621,12 @@ pub const Snapshot = struct {
 
     /// The outbound with its strings pointing into this snapshot.
     pub fn get(s: *const Snapshot) Outbound {
-        return switch (s.outbound) {
-            .vless => |vv| blk: {
-                var v = vv;
-                v.host = s.host[0..s.host_len];
-                if (v.reality) |*re| re.server_name = s.sni[0..s.sni_len];
-                break :blk .{ .vless = v };
-            },
-            else => s.outbound,
-        };
+        var o = s.outbound;
+        if (o.strings()) |p| {
+            p.host.* = s.host[0..s.host_len];
+            if (p.sni) |sni| sni.* = s.sni[0..s.sni_len];
+        }
+        return o;
     }
 };
 
@@ -1002,6 +1644,11 @@ pub const Proxy = struct {
     server: ?net.Server = null,
     running: std.atomic.Value(bool) = .init(false),
     accept_thread: ?std.Thread = null,
+    /// connections being served; `stop` waits for them, since each of
+    /// their threads still uses this Proxy
+    handlers: std.atomic.Value(u32) = .init(0),
+    /// tells flows that only wait for a server to finish to give up
+    stopping: std.atomic.Value(bool) = .init(false),
 
     pub fn setOutbound(p: *Proxy, o: Outbound) void {
         std.debug.assert(!p.running.load(.acquire));
@@ -1018,6 +1665,7 @@ pub const Proxy = struct {
         p.port = server.socket.address.getPort();
         p.server = server;
         p.meter.fault.store(.none, .monotonic);
+        p.stopping.store(false, .release);
         p.running.store(true, .release);
         p.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{ p, Snapshot.of(p.outbound) });
     }
@@ -1031,6 +1679,13 @@ pub const Proxy = struct {
         p.accept_thread = null;
         if (p.server) |*s| s.deinit(p.io);
         p.server = null;
+        // let the connections in flight end: a few seconds for those whose
+        // application is still there, the rest is left to the process
+        p.stopping.store(true, .release);
+        var waited_ms: u32 = 0;
+        while (p.handlers.load(.acquire) > 0 and waited_ms < 5000) : (waited_ms += 2) {
+            p.io.sleep(.fromMilliseconds(2), .awake) catch {};
+        }
     }
 
     fn acceptLoop(p: *Proxy, snap: Snapshot) void {
@@ -1040,7 +1695,9 @@ pub const Proxy = struct {
                 client.close(p.io);
                 break;
             }
-            const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, handle, .{ p, client, snap }) catch {
+            _ = p.handlers.fetchAdd(1, .acq_rel);
+            const t = std.Thread.spawn(.{ .stack_size = sys.stackSize(dial_stack_size) }, handle, .{ p, client, snap }) catch {
+                _ = p.handlers.fetchSub(1, .acq_rel);
                 client.close(p.io);
                 continue;
             };
@@ -1049,7 +1706,10 @@ pub const Proxy = struct {
     }
 
     fn handle(p: *Proxy, client: net.Stream, snap: Snapshot) void {
-        defer client.close(p.io);
+        // last: nothing of `p` is touched after the count goes down
+        defer _ = p.handlers.fetchSub(1, .acq_rel);
+        const io = p.io;
+        defer client.close(io);
         p.serve(client, &snap) catch {};
     }
 
@@ -1061,7 +1721,7 @@ pub const Proxy = struct {
         var cw = client.writer(io, &cwb);
         var local: Local = .{ .r = &cr.interface, .w = &cw.interface, .end = .{ .socks = client } };
         const target = try socksRequest(local.r, local.w);
-        const flow: Flow = .{ .io = io, .dialer = p.dialer, .meters = .{ &p.meter, p.extra, null } };
+        const flow: Flow = .{ .io = io, .dialer = p.dialer, .meters = .{ &p.meter, p.extra, null }, .stop = &p.stopping };
         const ob = snap.get();
         try flow.run(&local, &target, &ob);
     }
@@ -1146,7 +1806,10 @@ test "uuid and link capability" {
 
     try std.testing.expectError(error.BadRealityKey, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:1?security=reality&pbk=short", "h", 1));
     try std.testing.expectError(error.UnsupportedSecurity, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:1?security=xtls", "h", 1));
-    try std.testing.expectError(error.UnsupportedTransport, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:1?type=grpc", "h", 1));
+    try std.testing.expectError(error.UnsupportedTransport, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:1?type=kcp", "h", 1));
+    try std.testing.expectError(error.UnsupportedTransport, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:1?type=tcp&headerType=http", "h", 1));
+    // VLESS's own encryption is not spoken: better refused than sent in the clear
+    try std.testing.expectError(error.UnsupportedSecurity, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:1?encryption=mlkem768x25519plus.native.0rtt.abc", "h", 1));
 
     // WebSocket inside TLS behind a CDN: SNI, Host and path as the link says
     const cdn = try vlessFromLink("vless://11111111-2222-3333-4444-555555555555@104.16.1.1:443?type=ws&security=tls&encryption=none&alpn=http%2F1.1&host=cdn.example&sni=edge.example&path=%2Fstream%2Fx%3Fed%3D2048&fp=chrome#y", "104.16.1.1", 443);
@@ -1160,7 +1823,171 @@ test "uuid and link capability" {
     try std.testing.expectEqualStrings("s.example", bare.transport.ws.host.slice());
     try std.testing.expectError(error.UnsupportedFlow, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:443?type=ws&security=tls&flow=xtls-rprx-vision", "h", 443));
     try std.testing.expectError(error.UnsupportedFlow, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:1?flow=xtls-rprx-vision", "h", 1));
-    try std.testing.expectError(error.NotVless, vlessFromLink("trojan://p@h:1", "h", 1));
+    try std.testing.expectError(error.UnsupportedProtocol, vlessFromLink("trojan://p@h:1", "h", 1));
+
+    // HTTPUpgrade: WebSocket's parameters and HTTP/1.1
+    const hu = try vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:443?type=httpupgrade&security=tls&host=u.example&path=%2Fup%3Fed%3D2048", "h", 443);
+    try std.testing.expectEqualStrings("/up?ed=2048", hu.transport.httpupgrade.path.slice());
+    try std.testing.expectEqualStrings("u.example", hu.transport.httpupgrade.host.slice());
+    try std.testing.expectEqual(tls13.Alpn.http11, hu.tls.?.alpn);
+    // gRPC and XHTTP: HTTP/2, whatever the link's alpn says
+    const g = try vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:443?type=grpc&security=tls&serviceName=tun%2Fsub&mode=multi&authority=a.example&alpn=http%2F1.1&sni=g.example", "h", 443);
+    try std.testing.expectEqualStrings("tun/sub", g.transport.grpc.service_name.slice());
+    try std.testing.expectEqualStrings("a.example", g.transport.grpc.authority.slice());
+    try std.testing.expect(g.transport.grpc.multi);
+    try std.testing.expectEqual(tls13.Alpn.h2, g.tls.?.alpn);
+    try std.testing.expectError(error.UnsupportedTransport, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:1?type=grpc&mode=tun", "h", 1));
+    const xh = try vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:443?type=xhttp&security=reality&sni=www.example.com&pbk=jFuNsxsFdIt0Xig5jM1PAOIpJPKvJg9nU2PAMD5dPm8&path=%2Fx&mode=auto&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%7D", "h", 443);
+    try std.testing.expectEqualStrings("/x", xh.transport.xhttp.path.slice());
+    try std.testing.expectEqualStrings("www.example.com", xh.transport.xhttp.host.slice());
+    try std.testing.expectEqualStrings("{\"xPaddingBytes\":\"100-200\"}", xh.transport.xhttp.extra.slice());
+    try std.testing.expectError(error.UnsupportedFlow, vlessFromLink("vless://11111111-2222-3333-4444-555555555555@h:443?type=xhttp&security=reality&pbk=jFuNsxsFdIt0Xig5jM1PAOIpJPKvJg9nU2PAMD5dPm8&flow=xtls-rprx-vision", "h", 443));
+}
+
+test "a link of any protocol becomes an outbound, or says what it lacks" {
+    const t = std.testing;
+    const uuid = "11111111-2222-3333-4444-555555555555";
+    const pbk = "jFuNsxsFdIt0Xig5jM1PAOIpJPKvJg9nU2PAMD5dPm8";
+
+    try t.expect((try outboundFromLink("vless://" ++ uuid ++ "@h:443?security=reality&flow=xtls-rprx-vision&pbk=" ++ pbk, "h", 443)).vless.vision);
+    try t.expect((try outboundFromLink("VLESS://" ++ uuid ++ "@h:443?type=grpc&security=tls", "h", 443)).vless.transport == .grpc);
+
+    const tj = try outboundFromLink("trojan://pw@h:443?type=ws&host=cdn.example&path=%2Ft", "h", 443);
+    try t.expectEqualStrings("cdn.example", tj.trojan.transport.ws.host.slice());
+    try t.expectEqual(tls13.Alpn.http11, tj.via().?.tls.?.alpn);
+    try t.expect((try outboundFromLink("trojan://pw@h:443?security=reality&type=grpc&pbk=" ++ pbk, "h", 443)).via().?.reality != null);
+    try t.expectError(error.UnsupportedSecurity, outboundFromLink("trojan://pw@h:443?security=none", "h", 443));
+    try t.expectError(error.BadPassword, outboundFromLink("trojan://@h:443", "h", 443));
+    try t.expectError(error.UnsupportedFlow, outboundFromLink("trojan://pw@h:443?flow=xtls-rprx-vision", "h", 443));
+
+    // aes-256-gcm:pw
+    const ss = try outboundFromLink("ss://YWVzLTI1Ni1nY206cHc@h:8388#x", "h", 8388);
+    try t.expectEqual(shadowsocks.Method.aes_256_gcm, ss.shadowsocks.method);
+    try t.expect(ss.via().?.tls == null and ss.via().?.transport.* == .raw);
+    try t.expectError(error.UnsupportedMethod, outboundFromLink("ss://rc4-md5:pw@h:8388", "h", 8388));
+    try t.expectError(error.UnsupportedPlugin, outboundFromLink("ss://YWVzLTI1Ni1nY206cHc@h:8388?plugin=obfs-local%3Bobfs%3Dhttp", "h", 8388));
+    try t.expectError(error.BadLink, outboundFromLink("ss://@h:8388", "h", 8388));
+
+    const vm = try outboundFromLink("vmess://" ++ uuid ++ "@h:443?type=httpupgrade&security=tls&path=%2Fv", "h", 443);
+    try t.expectEqualStrings("/v", vm.vmess.transport.httpupgrade.path.slice());
+    // {"v":"2","add":"h","port":"80","id":"<uuid>","net":"ws","path":"/w"}
+    const vj = try outboundFromLink("vmess://eyJ2IjoiMiIsImFkZCI6ImgiLCJwb3J0IjoiODAiLCJpZCI6IjExMTExMTExLTIyMjItMzMzMy00NDQ0LTU1NTU1NTU1NTU1NSIsIm5ldCI6IndzIiwicGF0aCI6Ii93In0=", "h", 80);
+    try t.expectEqualStrings("/w", vj.vmess.transport.ws.path.slice());
+    try t.expect(vj.via().?.tls == null);
+    try t.expectError(error.BadUuid, outboundFromLink("vmess://nope-nope-nope-nope-nope-nope-nope-nope@h:443", "h", 443));
+    try t.expectError(error.BadLink, outboundFromLink("vmess://eyJ2IjoiMiJ9eA", "h", 443));
+
+    // XHTTP is carried as stream-one: named so, or "auto" inside REALITY
+    const x = "?type=xhttp&path=%2Fx";
+    try t.expect((try outboundFromLink("vless://" ++ uuid ++ "@h:443" ++ x ++ "&security=reality&pbk=" ++ pbk, "h", 443)).vless.transport == .xhttp);
+    try t.expect((try outboundFromLink("vless://" ++ uuid ++ "@h:443" ++ x ++ "&security=tls&mode=stream-one", "h", 443)).vless.transport == .xhttp);
+    try t.expect((try outboundFromLink("trojan://pw@h:443" ++ x ++ "&mode=stream-one", "h", 443)).trojan.transport == .xhttp);
+    try t.expectError(error.UnsupportedTransport, outboundFromLink("vless://" ++ uuid ++ "@h:443" ++ x ++ "&security=tls", "h", 443));
+    try t.expectError(error.UnsupportedTransport, outboundFromLink("vless://" ++ uuid ++ "@h:443" ++ x ++ "&mode=packet-up&security=reality&pbk=" ++ pbk, "h", 443));
+    try t.expectError(error.UnsupportedTransport, outboundFromLink("vmess://" ++ uuid ++ "@h:443" ++ x ++ "&security=tls&mode=stream-up", "h", 443));
+
+    for ([_][]const u8{ "hysteria2://pw@h:443", "tuic://u:p@h:443", "wireguard://k@h:51820", "no link at all" }) |l|
+        try t.expectError(error.UnsupportedProtocol, outboundFromLink(l, "h", 443));
+}
+
+test "an outbound of any kind keeps its strings in a snapshot and in a copy" {
+    const t = std.testing;
+    const pbk = "jFuNsxsFdIt0Xig5jM1PAOIpJPKvJg9nU2PAMD5dPm8";
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const links = [_][]const u8{
+        "vless://11111111-2222-3333-4444-555555555555@a.example:443?security=reality&sni=sni.example&pbk=" ++ pbk,
+        "trojan://pw@a.example:443?security=reality&sni=sni.example&pbk=" ++ pbk,
+        "vmess://11111111-2222-3333-4444-555555555555@a.example:443?security=reality&sni=sni.example&pbk=" ++ pbk,
+        "ss://YWVzLTI1Ni1nY206cHc@a.example:443",
+    };
+    for (links) |link| {
+        var host_buf: [16]u8 = undefined;
+        var link_buf: [256]u8 = undefined;
+        const host = try std.fmt.bufPrint(&host_buf, "a.example", .{});
+        const ob = try outboundFromLink(try std.fmt.bufPrint(&link_buf, "{s}", .{link}), host, 443);
+        const snap: Snapshot = .of(ob);
+        const copy = try ob.dupe(arena.allocator());
+        // what the link and the host were read from goes away
+        @memset(&host_buf, 'x');
+        @memset(&link_buf, 'x');
+        for ([_]Outbound{ snap.get(), copy }) |o| {
+            const v = o.via().?;
+            try t.expectEqualStrings("a.example", v.host);
+            try t.expectEqual(443, v.port);
+            if (o != .shadowsocks) try t.expectEqualStrings("sni.example", v.reality.?.server_name);
+            try t.expect(o.sameServer(&copy));
+        }
+    }
+    // the same address with another account, or another protocol, is another server
+    const a = try outboundFromLink("trojan://pw@a.example:443", "a.example", 443);
+    const b = try outboundFromLink("trojan://other@a.example:443", "a.example", 443);
+    const c = try outboundFromLink("ss://YWVzLTI1Ni1nY206cHc@a.example:443", "a.example", 443);
+    try t.expect(a.sameServer(&a) and !a.sameServer(&b) and !a.sameServer(&c));
+    const direct: Outbound = .direct;
+    try t.expect(direct.via() == null and direct.host() == null and direct.sameServer(&direct) and !direct.sameServer(&a));
+}
+
+test "a connection's layer: only what the protocol and the transport need" {
+    const t = std.testing;
+    const uuid = "11111111-2222-3333-4444-555555555555";
+    const total = struct {
+        fn of(link: []const u8) !?usize {
+            const ob = try outboundFromLink(link, "h", 443);
+            const v = ob.via().?;
+            const p = Plan.of(&ob, &v, v.tls != null or v.reality != null) orelse return null;
+            return p.buffers();
+        }
+    }.of;
+    // VLESS on the stream itself has no layer at all
+    try t.expectEqual(null, try total("vless://" ++ uuid ++ "@h:443?security=tls"));
+    try t.expectEqual(null, try total("vless://" ++ uuid ++ "@h:443"));
+    // WebSocket inside TLS as it always was
+    try t.expectEqual(52 * 1024, (try total("vless://" ++ uuid ++ "@h:443?type=ws&security=tls")).?);
+    // Trojan: the TLS stream the copy loop reads from
+    try t.expectEqual(16 * 1024, (try total("trojan://pw@h:443")).?);
+    // gRPC: a message buffer each way
+    try t.expect((try total("trojan://pw@h:443?type=grpc")).? < 33 * 1024);
+    // a cipher brings its own buffers, and what is below it shrinks
+    try t.expect((try total("vmess://" ++ uuid ++ "@h:443?security=tls")).? < 26 * 1024);
+    try t.expect((try total("ss://YWVzLTI1Ni1nY206cHc@h:443")).? < 36 * 1024);
+    // the layer itself is small: a transport's state comes only with the transport
+    try t.expect(@sizeOf(Layer) < 256);
+
+    // the block holds everything a dial takes from it, in the dial's order,
+    // wherever alignment puts the transport's and the cipher's state
+    const kinds = [_][]const u8{ "vless://" ++ uuid, "trojan://pw", "vmess://" ++ uuid, "ss://YWVzLTI1Ni1nY206cHc", "ss://2022-blake3-aes-256-gcm:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D" };
+    const transports = [_][]const u8{ "tcp", "ws", "httpupgrade", "grpc", "xhttp&mode=stream-one" };
+    const securities = [_][]const u8{ "none", "tls" };
+    var carved: usize = 0;
+    for (kinds) |kind| for (transports) |tr| for (securities) |sec| {
+        var buf: [256]u8 = undefined;
+        const link = try std.fmt.bufPrint(&buf, "{s}@h:443?type={s}&security={s}", .{ kind, tr, sec });
+        const ob = outboundFromLink(link, "h", 443) catch continue; // Trojan without TLS, Shadowsocks in a transport
+        const v = ob.via().?;
+        const tls = v.tls != null;
+        const p = Plan.of(&ob, &v, tls) orelse continue;
+        const l = try Layer.create(p);
+        defer l.destroy();
+        if (tls) _ = .{ l.take(p.sr), l.take(p.sw) };
+        switch (v.transport.*) {
+            .raw => {},
+            .ws => _ = l.make(ws.Conn),
+            .httpupgrade => _ = l.make(httpupgrade.Conn),
+            .grpc => _ = l.make(grpc.Conn),
+            .xhttp => _ = l.make(xhttp.Conn),
+        }
+        _ = .{ l.take(p.tr), l.take(p.tw) };
+        switch (ob) {
+            .vmess => _ = l.make(vmess.Conn),
+            .shadowsocks => _ = l.make(shadowsocks.Conn),
+            else => {},
+        }
+        _ = .{ l.take(p.cr), l.take(p.cw) };
+        try t.expect(l.used <= l.block.len and l.block.len - l.used < 3 * Layer.block_align);
+        carved += 1;
+    };
+    try t.expectEqual(5 * 2 + 5 + 5 * 2 + 2 - 2, carved);
 }
 
 test "vless header layout" {
@@ -1187,6 +2014,9 @@ const TestPeer = struct {
     /// when set, expect a VLESS request with this UUID before echoing
     vless_uuid: ?[16]u8 = null,
     header_ok: bool = false,
+    /// answer an HTTP/1.1 upgrade request first, as an HTTPUpgrade server
+    upgrade: bool = false,
+    upgrade_ok: bool = false,
 
     fn init(io: Io) !TestPeer {
         const address: net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -1201,6 +2031,17 @@ const TestPeer = struct {
         var wb: [4096]u8 = undefined;
         var r = s.reader(io, &rb);
         var w = s.writer(io, &wb);
+        if (peer.upgrade) {
+            var first = true;
+            while (true) {
+                const line = r.interface.takeDelimiterInclusive('\n') catch return;
+                if (first) peer.upgrade_ok = std.mem.eql(u8, line, "GET /up HTTP/1.1\r\n");
+                first = false;
+                if (line.len == 2) break;
+            }
+            w.interface.writeAll("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n") catch return;
+            w.interface.flush() catch return;
+        }
         if (peer.vless_uuid) |uuid| {
             const h = (r.interface.takeArray(1 + 16 + 1 + 1 + 2 + 1) catch return).*;
             const addr_ok = h[21] == 1 and std.mem.eql(u8, r.interface.take(4) catch return, &.{ 10, 9, 8, 7 });
@@ -1266,6 +2107,28 @@ test "socks5 -> vless sends a valid request and strips the response header" {
     peer.thread.join();
     try std.testing.expect(peer.header_ok);
     try std.testing.expectEqual(19, p.meter.down.load(.monotonic));
+}
+
+test "socks5 -> vless inside HTTPUpgrade: the transport's layer carries the flow" {
+    const io = std.testing.io;
+    var peer: TestPeer = try .init(io);
+    defer peer.server.deinit(io);
+    const uuid = parseUuid("11111111-2222-3333-4444-555555555555").?;
+    peer.vless_uuid = uuid;
+    peer.upgrade = true;
+    peer.thread = try std.Thread.spawn(.{}, TestPeer.run, .{ &peer, io });
+
+    var link_buf: [128]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "vless://11111111-2222-3333-4444-555555555555@127.0.0.1:{d}?type=httpupgrade&path=%2Fup&host=up.example", .{peer.port});
+    var p: Proxy = .{ .io = io };
+    p.setOutbound(try outboundFromLink(link, "127.0.0.1", peer.port));
+    try p.start(0);
+    defer p.stop();
+    try socksRoundTrip(io, p.port, .{ 10, 9, 8, 7 }, 4242, "hello through httpupgrade");
+    peer.thread.join();
+    try std.testing.expect(peer.upgrade_ok and peer.header_ok);
+    try std.testing.expectEqual(25, p.meter.down.load(.monotonic));
+    try std.testing.expectEqual(Fault.none, p.meter.fault.load(.monotonic));
 }
 
 test "socks5 -> block refuses the connection" {

@@ -26,6 +26,7 @@ pub const Bind = union(enum) {
     name: [16:0]u8,
 
     pub fn interface(name: []const u8) Bind {
+        if (comptime !supported) return .none;
         if (builtin.os.tag == .linux) {
             var n: [16:0]u8 = @splat(0);
             @memcpy(n[0..@min(name.len, 15)], name[0..@min(name.len, 15)]);
@@ -105,6 +106,31 @@ fn setNonblocking(fd: c.fd_t, on: bool) void {
     if (flags < 0) return;
     const nb: c_int = @bitCast(@as(u32, @bitCast(c.O{ .NONBLOCK = true })));
     _ = c.fcntl(fd, c.F.SETFL, if (on) flags | nb else flags & ~nb);
+}
+
+/// The stack size to ask for a thread whose own frames need `want` bytes.
+///
+/// glibc carves a thread's static TLS block (and its own bookkeeping) out
+/// of the very mapping it is given as the stack, and refuses to create the
+/// thread (EINVAL) when the size asked for does not hold both. So there
+/// what glibc itself needs is added on top; everywhere else `want` is what
+/// gets asked for. Only pages that are touched cost memory.
+pub fn stackSize(want: usize) usize {
+    if (comptime !(builtin.os.tag == .linux and builtin.abi.isGnu() and builtin.link_libc)) return want;
+    const S = struct {
+        var extra: std.atomic.Value(usize) = .init(0);
+    };
+    var e = S.extra.load(.monotonic);
+    if (e == 0) {
+        // glibc tells how much it needs, through a symbol made for runtimes
+        // that size their own stacks (it is not in the headers)
+        const Min = *const fn (?*const anyopaque) callconv(.c) usize;
+        e = if (c.dlsym(null, "__pthread_get_minstack")) |f| @as(Min, @ptrCast(@alignCast(f)))(null) else 0;
+        // unknown, or implausible: a margin that covers any TLS seen in practice
+        if (e < 16 * 1024 or e > 16 * 1024 * 1024) e = 256 * 1024;
+        S.extra.store(e, .monotonic);
+    }
+    return want + e;
 }
 
 /// Wait until `fd` is readable (or writable); false on timeout.
@@ -286,6 +312,7 @@ test "connect with timeout to a closed and an open port" {
 }
 
 test "udp request and reply over loopback" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sockets and pipes
     const lo = packet.v4(.{ 127, 0, 0, 1 });
     // echo peer: a bound UDP socket
     const sa, const len, const family = sockaddr(&lo, 0);

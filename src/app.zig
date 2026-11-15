@@ -200,7 +200,7 @@ pub fn save() void {
 fn refreshCarried() void {
     if (state.demo) return;
     for (state.servers.items) |*sv| {
-        sv.carried = if (core.proxy.vlessFromLink(sv.link, sv.host, sv.port)) |_| true else |_| false;
+        sv.carried = if (core.proxy.outboundFromLink(sv.link, sv.host, sv.port)) |_| true else |_| false;
     }
     updateAutoServer();
 }
@@ -536,18 +536,22 @@ fn defaultOutbound() ?core.proxy.Outbound {
         notify(true, tr.no_server, .{});
         return null;
     };
-    const vless = core.proxy.vlessFromLink(sv.link, sv.host, sv.port) catch |err| {
-        notify(true, "{s}: {s}", .{ sv.name, switch (err) {
-            error.NotVless => tr.err_protocol,
-            error.UnsupportedSecurity => tr.err_security,
-            error.BadRealityKey => tr.err_reality_key,
-            error.UnsupportedTransport => tr.err_transport,
-            error.UnsupportedFlow => tr.err_flow,
-            error.BadUuid => tr.err_key,
-        } });
+    return core.proxy.outboundFromLink(sv.link, sv.host, sv.port) catch |err| {
+        notify(true, "{s}: {s}", .{
+            sv.name,
+            switch (err) {
+                // a scheme, or a Shadowsocks cipher, this build does not speak
+                error.UnsupportedProtocol, error.UnsupportedMethod => tr.err_protocol,
+                error.UnsupportedSecurity => tr.err_security,
+                error.BadRealityKey => tr.err_reality_key,
+                // a plugin is a transport of its own around Shadowsocks
+                error.UnsupportedTransport, error.UnsupportedPlugin => tr.err_transport,
+                error.UnsupportedFlow => tr.err_flow,
+                error.BadLink, error.BadUuid, error.BadPassword => tr.err_key,
+            },
+        });
         return null;
     };
-    return .{ .vless = vless };
 }
 
 /// Start carrying traffic. With sample data this only drives the simulated

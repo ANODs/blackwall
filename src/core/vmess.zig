@@ -13,7 +13,8 @@
 //! where the masks and padding lengths come from SHAKE128 over the
 //! direction's IV, so neither length is plaintext. Security `none` drops
 //! the seal and the padding: [length (masked)][payload]. An empty chunk
-//! ends a direction.
+//! ends a direction. UDP goes as XUDP frames (xudp.zig) in a connection
+//! opened with `Command.mux`, as Xray's and sing-box's clients send it.
 //!
 //! Ciphers: "auto" is AES-128-GCM where AES runs in hardware, else
 //! ChaCha20-Poly1305, as in Xray. Xray 26 servers refuse `none` (and
@@ -109,7 +110,8 @@ pub const Error = error{
     /// request: an unknown UUID, a clock more than 120 s off (the auth ID
     /// carries the time), a replayed header, or a cipher it does not take
     /// (Xray 26 and `none`). Also what a destination it cannot reach looks
-    /// like.
+    /// like. Xray keeps a request it refuses open for up to a minute first
+    /// (it reads on, so that a prober learns nothing): time the first read.
     VmessNoResponse,
     /// The response header does not open, or does not echo our byte.
     VmessBadResponse,
@@ -273,7 +275,7 @@ pub fn requestPlain(out: *[max_plain]u8, s: *const Session, security: Security, 
     w.writeByte(1) catch unreachable;
     w.writeAll(&s.iv) catch unreachable;
     w.writeAll(&s.key) catch unreachable;
-    w.writeAll(&.{ s.v, security.options(), @as(u8, @intCast(padding.len)) << 4 | @intFromEnum(security), 0, @intFromEnum(req.command) }) catch unreachable;
+    w.writeAll(&.{ s.v, security.options(), @as(u8, @intCast(padding.len)) << 4 | @backingInt(security), 0, @backingInt(req.command) }) catch unreachable;
     if (req.command != .mux) {
         w.writeInt(u16, req.port, .big) catch unreachable;
         switch (req.address) {
@@ -408,9 +410,11 @@ pub const Conn = struct {
     left: u16 = 0,
 
     /// `rbuf` buffers `reader` and must hold a whole chunk
-    /// (`read_buffer_len`); `wbuf` bounds the chunks we send
-    /// (`write_buffer_len` for Xray's). The interfaces point back into the
-    /// result: keep it at one address.
+    /// (`read_buffer_len`) next to what the caller has not consumed yet: one
+    /// who takes all there is each time (peekGreedy, toss) needs no more,
+    /// one who asks for n bytes at once n - 1 more. `wbuf` bounds the chunks
+    /// we send (`write_buffer_len` for Xray's). The interfaces point back
+    /// into the result: keep it at one address.
     pub fn init(io: Io, user: User, security: Security, r: *Io.Reader, w: *Io.Writer, rbuf: []u8, wbuf: []u8) Conn {
         return initSession(io, user, security, .random(io), r, w, rbuf, wbuf);
     }
@@ -455,8 +459,11 @@ pub const Conn = struct {
     }
 
     /// Our side is done: what is buffered, then the empty chunk that tells
-    /// the server so (it half-closes towards the destination), flushed.
-    /// Nothing may be written after it.
+    /// the server so, flushed. Nothing may be written after it. Xray takes
+    /// it as the end of the upload; sing-box does so only without a cipher
+    /// (with one it reads Xray's marker as a chunk of nothing and waits
+    /// on), so a destination that answers only once we are done is not to
+    /// be waited for without a timeout.
     pub fn end(c: *Conn) Io.Writer.Error!void {
         try c.sendBuffered();
         try c.w.writeAll(c.up.seal(c.io, c.wbuf, 0));
@@ -648,7 +655,7 @@ fn truncated(e: Io.Reader.Error) (Error || Io.Reader.Error) {
 // ---------------------------------------------------------------- link
 
 /// A VMess server as a link describes it. `host` is the caller's; a REALITY
-/// server name and XHTTP's `extra` point into the link. At most one of
+/// server name points into the link. At most one of
 /// `tls` and `reality` is set: VMess seals its own body, so it also runs
 /// bare.
 pub const Vmess = struct {
@@ -662,38 +669,12 @@ pub const Vmess = struct {
 };
 
 /// What carries the VMess stream: the (TLS) connection itself, or a
-/// transport inside it. Shaped as the other outbounds' link results are, so
-/// one dialer can serve them all.
-pub const Transport = union(enum) {
-    raw,
-    ws: Http,
-    httpupgrade: Http,
-    grpc: Grpc,
-    xhttp: Xhttp,
-};
-
-pub const Http = struct {
-    path: proxy.Text(512) = .{},
-    /// Host header; a CDN routes by it
-    host: proxy.Text(255) = .{},
-};
-
-pub const Grpc = struct {
-    service_name: proxy.Text(255) = .{},
-    /// :authority, when the link names one
-    authority: proxy.Text(255) = .{},
-    /// mode multi (several messages per frame), else "gun"
-    multi: bool = false,
-};
-
-pub const Xhttp = struct {
-    path: proxy.Text(512) = .{},
-    host: proxy.Text(255) = .{},
-    /// empty, auto, stream-one, stream-up or packet-up, as the link has it
-    mode: proxy.Text(16) = .{},
-    /// The URL form's `extra`, still percent-encoded, in the link.
-    extra: []const u8 = "",
-};
+/// transport inside it. The dialer's own types: one dialer serves every
+/// protocol.
+pub const Transport = proxy.Transport;
+pub const Http = proxy.Http;
+pub const Grpc = proxy.Grpc;
+pub const Xhttp = proxy.Xhttp;
 
 pub const LinkError = error{
     NotVmess,
@@ -882,8 +863,9 @@ fn build(p: *const Params, host: []const u8, port: u16) LinkError!Vmess {
         g.multi = is(p.mode, "multi");
         out.transport = .{ .grpc = g };
     } else if (is(p.net, "xhttp") or is(p.net, "splithttp")) {
-        var x: Xhttp = .{ .extra = p.extra };
-        if (!p.set(&x.path, p.path) or !p.set(&x.mode, p.mode)) return error.UnsupportedTransport;
+        // which modes and extras can be carried is the dialer's to say
+        var x: Xhttp = .{};
+        if (!p.set(&x.path, p.path) or !p.set(&x.mode, p.mode) or !p.set(&x.extra, p.extra)) return error.UnsupportedTransport;
         if (!p.set(&x.host, if (p.host.len > 0) p.host else if (sni.len > 0) sni else host)) return error.UnsupportedTransport;
         out.transport = .{ .xhttp = x };
     } else return error.UnsupportedTransport;
@@ -905,7 +887,9 @@ fn build(p: *const Params, host: []const u8, port: u16) LinkError!Vmess {
         };
         out.tls = t;
     } else if (is(p.tls, "reality")) {
-        // only the URL form names the key; its text stays in the link
+        // Only the URL form names the key, so only its `sni`, which lies in
+        // the link, is kept here: the JSON form's lies in a buffer that is
+        // gone on return, and fails on the key first.
         out.reality = .{
             .server_name = if (sni.len > 0) sni else host,
             .public_key = realityKey(p.pbk) orelse return error.BadRealityKey,
@@ -1261,6 +1245,57 @@ test "a whole exchange with a server that opens and answers as Xray's" {
     }
 }
 
+test "request header: every kind of address, mux without one" {
+    const user: User = .init(test_uuid);
+    var buf: [max_request]u8 = undefined;
+    var rbuf: [read_buffer_len]u8 = undefined;
+    var wbuf: [write_buffer_len]u8 = undefined;
+    var below: Io.Reader = .fixed(&.{});
+    const now = Io.Clock.real.now(testing.io).toSeconds();
+    const longest: [255]u8 = @splat('a');
+    const too_long: [256]u8 = @splat('a');
+    const ip6 = hex("20010db8000000000000000000000001");
+    const Case = struct { req: Request, type: u8 = 0, addr: []const u8 = "" };
+    for ([_]Case{
+        .{ .req = .{ .address = .{ .ip4 = .{ 192, 0, 2, 1 } }, .port = 443 }, .type = 1, .addr = &.{ 192, 0, 2, 1 } },
+        .{ .req = .{ .address = .{ .ip6 = ip6 }, .port = 65535 }, .type = 3, .addr = &ip6 },
+        .{ .req = .{ .address = .{ .domain = "a" }, .port = 1 }, .type = 2, .addr = "a" },
+        .{ .req = .{ .address = .{ .domain = &longest }, .port = 8080 }, .type = 2, .addr = &longest },
+        // mux names its destinations in its frames: whatever the request holds stays out
+        .{ .req = .{ .command = .mux } },
+        .{ .req = .{ .command = .mux, .address = .{ .domain = "v1.mux.cool" }, .port = 666 } },
+    }) |case| {
+        var up: Io.Writer = .fixed(&buf);
+        var c: Conn = .init(testing.io, user, .chacha20_poly1305, &below, &up, &rbuf, &wbuf);
+        try c.writeRequest(case.req);
+        var in: Io.Reader = .fixed(up.buffered());
+        const s: TestServer = try .accept(&user, &in, now);
+        try testing.expectEqual(0, in.bufferedLen()); // the header and nothing else
+        try testing.expectEqual(case.req.command, s.command);
+        try testing.expectEqual(Security.chacha20_poly1305, s.security);
+        try testing.expectEqual(c.session.v, s.session.v);
+        try testing.expectEqualSlices(u8, &c.session.key, &s.session.key);
+        try testing.expectEqual(if (case.req.command == .mux) 0 else case.req.port, s.port);
+        try testing.expectEqual(case.type, s.address_type);
+        try testing.expectEqualSlices(u8, case.addr, s.address[0..s.address_len]);
+    }
+    for ([_][]const u8{ "", &too_long }) |domain| {
+        var up: Io.Writer = .fixed(&buf);
+        var c: Conn = .init(testing.io, user, .auto, &below, &up, &rbuf, &wbuf);
+        try testing.expectError(error.VmessBadAddress, c.writeRequest(.{ .address = .{ .domain = domain }, .port = 80 }));
+        try testing.expectEqual(0, up.end);
+    }
+    // a server whose clock is more than 120 s away refuses the auth ID
+    var up: Io.Writer = .fixed(&buf);
+    var c: Conn = .init(testing.io, user, .auto, &below, &up, &rbuf, &wbuf);
+    try c.writeRequest(.{ .address = .{ .domain = "example.com" }, .port = 80 });
+    var in: Io.Reader = .fixed(up.buffered());
+    try testing.expectError(error.BadTime, TestServer.accept(&user, &in, now + 200));
+    // and one with another user's key does not find it
+    in = .fixed(up.buffered());
+    try testing.expectError(error.BadAuthId, TestServer.accept(&User.init(@splat(7)), &in, now));
+}
+
 /// A stream below that hands out at most `step` bytes at a time, as a
 /// socket may.
 const Trickle = struct {
@@ -1530,7 +1565,7 @@ test "links: Xray's URL form" {
     const re = try fromLink(link, "h", 443);
     try testing.expectEqualStrings("/x", re.transport.xhttp.path.slice());
     try testing.expectEqualStrings("stream-up", re.transport.xhttp.mode.slice());
-    try testing.expectEqualStrings("%7B%22a%22%3A1%7D", re.transport.xhttp.extra);
+    try testing.expectEqualStrings("{\"a\":1}", re.transport.xhttp.extra.slice());
     try testing.expectEqual(null, re.tls);
     try testing.expectEqualStrings("www.example.com", re.reality.?.server_name);
     try testing.expectEqual(0x8c, re.reality.?.public_key[0]);

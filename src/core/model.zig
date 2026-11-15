@@ -10,6 +10,7 @@ pub const Protocol = enum {
     hysteria2,
     tuic,
     wireguard,
+    vmess,
 
     pub fn label(p: Protocol) []const u8 {
         return switch (p) {
@@ -19,6 +20,7 @@ pub const Protocol = enum {
             .hysteria2 => "HY2",
             .tuic => "TUIC",
             .wireguard => "WG",
+            .vmess => "VMess",
         };
     }
 };

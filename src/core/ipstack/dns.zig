@@ -675,6 +675,7 @@ test "the resolver cache stays bounded and drops what expires first" {
 }
 
 test "resolver forwards to a real server and caches the answer" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sockets and pipes
     // a tiny DNS server on loopback answering every A query with 10.1.2.3
     const c = std.c;
     const lo = packet.v4(.{ 127, 0, 0, 1 });
@@ -723,6 +724,7 @@ test "resolver forwards to a real server and caches the answer" {
 }
 
 test "resolver: a silent first server, the next one answers; lookups of one name share a query" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sockets and pipes
     const c = std.c;
     const lo = packet.v4(.{ 127, 0, 0, 1 });
     // a socket nobody reads stands for the resolver that stopped answering

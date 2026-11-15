@@ -225,7 +225,9 @@ pub fn fromLink(link: []const u8, host: []const u8, port: u16) LinkError!Shadows
         } else if (std.ascii.findIgnoreCase(info, "%3a") != null) {
             info = percentDecode(&pw, info) orelse return error.BadPassword;
         } else {
-            info = decodeBase64(&b64, info) orelse return error.BadUserInfo;
+            // generators that escape the whole link escape the padding too
+            const plain = if (std.mem.indexOfScalar(u8, info, '%') != null) percentDecode(&pw, info) orelse return error.BadPassword else info;
+            info = decodeBase64(&b64, plain) orelse return error.BadUserInfo;
         }
     } else {
         const all = decodeBase64(&b64, std.mem.trimEnd(u8, rest, "/")) orelse return error.BadUserInfo;
@@ -616,6 +618,9 @@ pub const Conn = struct {
         const got = try c.r.readSliceShort(salt[0..kl]);
         if (got == 0) return error.EndOfStream; // closed without a word
         if (got < kl) return c.fail(error.SsTruncated);
+        // our own salt back means our own upload reflected at us: with it
+        // every chunk we sent would pass as the server's answer
+        if (std.mem.eql(u8, salt[0..kl], c.salt[0..kl])) return c.fail(error.SsBadResponse);
         c.recv = .init(m, &c.key, salt[0..kl]);
         if (!m.is2022()) return false;
 

@@ -33,11 +33,11 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
     for (state.servers.items) |sv| {
         if (standby) break;
         if (!sv.available or sv.link.len == 0) continue;
-        const v = proxy.vlessFromLink(try a.dupe(u8, sv.link), try a.dupe(u8, sv.host), sv.port) catch {
+        const ob = proxy.outboundFromLink(try a.dupe(u8, sv.link), try a.dupe(u8, sv.host), sv.port) catch {
             skipped += 1;
             continue;
         };
-        try obs.append(a, .{ .vless = v });
+        try obs.append(a, ob);
         try ids.append(a, sv.id);
     }
 

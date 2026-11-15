@@ -121,28 +121,11 @@ pub const Trojan = struct {
 };
 
 /// What the TLS stream carries: Trojan itself, or a transport around it.
-/// `raw` and `ws` are what proxy.Transport carries; the others are parsed so
-/// the dialer can take them as their transports land.
-pub const Transport = union(enum) {
-    raw,
-    ws: Http,
-    httpupgrade: Http,
-    grpc: Grpc,
-};
-
-pub const Http = struct {
-    path: Text(512) = .{},
-    /// Host header; a CDN routes by it
-    host: Text(255) = .{},
-};
-
-pub const Grpc = struct {
-    service_name: Text(255) = .{},
-    /// :authority, when the link names one
-    authority: Text(255) = .{},
-    /// mode=multi (several messages per frame), else "gun"
-    multi: bool = false,
-};
+/// The dialer's own types: one dialer serves every protocol.
+pub const Transport = proxy.Transport;
+pub const Http = proxy.Http;
+pub const Grpc = proxy.Grpc;
+pub const Xhttp = proxy.Xhttp;
 
 pub const LinkError = error{
     NotTrojan,
@@ -157,8 +140,8 @@ pub const LinkError = error{
 /// `host` and `port` are the server's, already taken from the link.
 /// Parameters as Xray's share links and v2rayN write them: security
 /// (default tls), sni (or the older peer), alpn, type (tcp, ws,
-/// httpupgrade, grpc) with path, host, serviceName, authority and mode, and
-/// pbk / sid for REALITY. fp is ignored (the ClientHello is always Chrome's);
+/// httpupgrade, grpc, xhttp) with path, host, serviceName, authority, mode
+/// and extra, and pbk / sid for REALITY. fp is ignored (the ClientHello is always Chrome's);
 /// so is allowInsecure: certificates are always checked.
 pub fn fromLink(link: []const u8, host: []const u8, port: u16) LinkError!Trojan {
     const prefix = "trojan://";
@@ -190,6 +173,7 @@ pub fn fromLink(link: []const u8, host: []const u8, port: u16) LinkError!Trojan 
         flow: []const u8 = "",
         pbk: []const u8 = "",
         sid: []const u8 = "",
+        extra: []const u8 = "",
     } = .{};
     var it = std.mem.tokenizeScalar(u8, query, '&');
     while (it.next()) |kv| {
@@ -201,7 +185,7 @@ pub fn fromLink(link: []const u8, host: []const u8, port: u16) LinkError!Trojan 
             .{ "alpn", &p.alpn },           .{ "type", &p.type }, .{ "headerType", &p.header_type },
             .{ "path", &p.path },           .{ "host", &p.host }, .{ "serviceName", &p.service_name },
             .{ "authority", &p.authority }, .{ "mode", &p.mode }, .{ "flow", &p.flow },
-            .{ "pbk", &p.pbk },             .{ "sid", &p.sid },
+            .{ "pbk", &p.pbk },             .{ "sid", &p.sid },   .{ "extra", &p.extra },
         };
         inline for (fields) |f| if (std.mem.eql(u8, k, f[0])) {
             f[1].* = v;
@@ -234,6 +218,13 @@ pub fn fromLink(link: []const u8, host: []const u8, port: u16) LinkError!Trojan 
         if (p.mode.len > 0 and !is(p.mode, "gun") and !is(p.mode, "multi")) return error.UnsupportedTransport;
         g.multi = is(p.mode, "multi");
         out.transport = .{ .grpc = g };
+    } else if (is(p.type, "xhttp") or is(p.type, "splithttp")) {
+        // which modes and extras can be carried is the dialer's to say
+        var x: Xhttp = .{};
+        if (!setDecoded(&x.path, p.path) or !setDecoded(&x.mode, p.mode) or !setDecoded(&x.extra, p.extra)) return error.UnsupportedTransport;
+        const name = if (p.host.len > 0) p.host else if (p.sni.len > 0) p.sni else host;
+        if (!setDecoded(&x.host, name)) return error.UnsupportedTransport;
+        out.transport = .{ .xhttp = x };
     } else return error.UnsupportedTransport;
 
     const sni = if (p.sni.len > 0) p.sni else p.peer;
@@ -246,9 +237,9 @@ pub fn fromLink(link: []const u8, host: []const u8, port: u16) LinkError!Trojan 
         const has_h2 = std.mem.find(u8, p.alpn, "h2") != null;
         const has_h11 = std.mem.find(u8, p.alpn, "http") != null;
         t.alpn = switch (out.transport) {
-            // WebSocket and HTTPUpgrade need HTTP/1.1, gRPC needs HTTP/2
+            // WebSocket and HTTPUpgrade need HTTP/1.1; gRPC and XHTTP run on HTTP/2
             .ws, .httpupgrade => .http11,
-            .grpc => .h2,
+            .grpc, .xhttp => .h2,
             .raw => if (has_h11 and !has_h2) .http11 else if (has_h2 and !has_h11) .h2 else .h2_http11,
         };
         out.tls = t;
@@ -444,7 +435,14 @@ test "trojan links" {
     try testing.expectError(error.UnsupportedSecurity, fromLink("trojan://pw@h:1?security=none", "h", 1));
     try testing.expectError(error.UnsupportedSecurity, fromLink("trojan://pw@h:1?security=xtls", "h", 1));
     try testing.expectError(error.UnsupportedFlow, fromLink("trojan://pw@h:1?flow=xtls-rprx-vision", "h", 1));
-    try testing.expectError(error.UnsupportedTransport, fromLink("trojan://pw@h:1?type=xhttp", "h", 1));
+    // XHTTP: HTTP/2, the Host from sni when the link names none
+    const xh = try fromLink("trojan://pw@h:443?type=xhttp&path=%2Fx&mode=stream-one&sni=x.example&extra=%7B%22a%22%3A1%7D", "h", 443);
+    try testing.expectEqualStrings("/x", xh.transport.xhttp.path.slice());
+    try testing.expectEqualStrings("stream-one", xh.transport.xhttp.mode.slice());
+    try testing.expectEqualStrings("x.example", xh.transport.xhttp.host.slice());
+    try testing.expectEqualStrings("{\"a\":1}", xh.transport.xhttp.extra.slice());
+    try testing.expectEqual(tls13.Alpn.h2, xh.tls.?.alpn);
+    try testing.expectError(error.UnsupportedTransport, fromLink("trojan://pw@h:1?type=kcp", "h", 1));
     try testing.expectError(error.UnsupportedTransport, fromLink("trojan://pw@h:1?type=tcp&headerType=http", "h", 1));
     try testing.expectError(error.UnsupportedTransport, fromLink("trojan://pw@h:1?type=grpc&mode=tun", "h", 1));
     try testing.expectError(error.UnsupportedTransport, fromLink("trojan://pw@h:1?type=ws&path=nope", "h", 1));

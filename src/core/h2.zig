@@ -1314,6 +1314,7 @@ const DuplexPeer = struct {
 };
 
 test "full duplex: both bodies at once under small windows, a SETTINGS change, PING" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sockets and pipes
     const io = testing.io;
     const c2s = try pipe();
     const s2c = try pipe();

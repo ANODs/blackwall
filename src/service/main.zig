@@ -146,8 +146,9 @@ const Service = struct {
         // for the servers the routes use: a long list would hold up reloads
         if (s.args.tun != null and s.settings.kill_switch == .strict) {
             for (b.cfg.outbounds, 0..) |ob, i| {
-                if (ob != .vless or !routes.uses(b.cfg, @intCast(i))) continue;
-                if (s.serverAddress(ob.vless.host)) |ip| s.server_ips.append(s.gpa, ip) catch s.gpa.free(ip);
+                if (!routes.uses(b.cfg, @intCast(i))) continue;
+                const host = ob.host() orelse continue;
+                if (s.serverAddress(host)) |ip| s.server_ips.append(s.gpa, ip) catch s.gpa.free(ip);
             }
         }
         if (s.via_helper and builtin.os.tag.isDarwin()) darwin.helper.servers(s.gpa, s.io, s.server_ips.items);
@@ -215,7 +216,7 @@ const Service = struct {
             try t.setConfig(s.built.?.cfg);
             s.device = try .init(fd, builtin.os.tag.isDarwin());
             s.t = t;
-            s.device_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, tunnel.Tunnel.run, .{ t, &s.device });
+            s.device_thread = try std.Thread.spawn(.{ .stack_size = core.sys.stackSize(512 * 1024) }, tunnel.Tunnel.run, .{ t, &s.device });
             log.info("tun up (fd {d}, mtu {d})", .{ fd, s.args.mtu });
         }
         if (s.args.socks) |port| {

@@ -143,7 +143,7 @@ pub const Link = struct {
             .admin_prompt = admin_prompt,
             .sink = sink,
         };
-        const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{l}) catch {
+        const t = std.Thread.spawn(.{ .stack_size = core.sys.stackSize(256 * 1024) }, run, .{l}) catch {
             gpa.free(l.bin_dir);
             gpa.destroy(l);
             return null;

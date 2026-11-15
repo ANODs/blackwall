@@ -234,13 +234,7 @@ pub const Tunnel = struct {
         const rules = try a.alloc(Rule, cfg.rules.len);
         for (cfg.rules, rules) |src, *dst| dst.* = .{ .app = try a.dupe(u8, src.app), .choice = src.choice };
         const obs = try a.alloc(proxy.Outbound, cfg.outbounds.len);
-        for (cfg.outbounds, obs) |src, *dst| {
-            dst.* = src;
-            if (src == .vless) {
-                dst.vless.host = try a.dupe(u8, src.vless.host);
-                if (src.vless.reality) |re| dst.vless.reality.?.server_name = try a.dupe(u8, re.server_name);
-            }
-        }
+        for (cfg.outbounds, obs) |src, *dst| dst.* = try src.dupe(a);
         const ex = try a.alloc([]const u8, cfg.dns_exclusions.len);
         for (cfg.dns_exclusions, ex) |src, *dst| dst.* = try a.dupe(u8, src);
         return .{ .default = cfg.default, .unknown = cfg.unknown, .rules = rules, .outbounds = obs, .main = try a.dupe(u16, cfg.main), .dns_exclusions = ex, .drop_quic = cfg.drop_quic };
@@ -322,7 +316,7 @@ pub const Tunnel = struct {
         const t: *Tunnel = @ptrCast(@alignCast(ctx));
         if (t.stopping.load(.acquire)) return false;
         _ = t.workers.fetchAdd(1, .acq_rel);
-        const th = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, tcpWorker, .{ t, conn }) catch {
+        const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(proxy.dial_stack_size) }, tcpWorker, .{ t, conn }) catch {
             _ = t.workers.fetchSub(1, .acq_rel);
             return false;
         };
@@ -399,7 +393,7 @@ pub const Tunnel = struct {
                 if (t.dns_inflight.load(.acquire) >= 32) return; // the app will retry
                 const copy = t.gpa.dupe(u8, query) catch return;
                 _ = t.dns_inflight.fetchAdd(1, .acq_rel);
-                const th = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, dnsForward, .{ t, src, dst, copy }) catch {
+                const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(64 * 1024) }, dnsForward, .{ t, src, dst, copy }) catch {
                     _ = t.dns_inflight.fetchSub(1, .acq_rel);
                     t.gpa.free(copy);
                     return;
@@ -490,6 +484,8 @@ pub const Tunnel = struct {
             // QUIC of proxied apps is dropped: browsers fall back to TCP,
             // which Vision carries far more efficiently
             .vless => if (dst.port == 443 and t.dropQuic()) t.rememberDrop(key, stats) else t.startXudp(src, dst, payload, snap, stats),
+            // UDP over these is not carried yet: dropped rather than leaked
+            .trojan, .shadowsocks, .vmess => t.rememberDrop(key, stats),
             .direct => t.startDirect(key, payload, stats),
         }
     }
@@ -522,7 +518,7 @@ pub const Tunnel = struct {
         };
         t.udp_mutex.unlock(t.io);
         _ = t.workers.fetchAdd(1, .acq_rel);
-        const th = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, udpReader, .{ t, flow }) catch {
+        const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(128 * 1024) }, udpReader, .{ t, flow }) catch {
             _ = t.workers.fetchSub(1, .acq_rel);
             t.removeUdp(flow);
             return;
@@ -618,7 +614,7 @@ pub const Tunnel = struct {
         };
         t.udp_mutex.unlock(t.io);
         _ = t.workers.fetchAdd(1, .acq_rel);
-        const th = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Xudp.uplink, .{sess}) catch {
+        const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(proxy.dial_stack_size) }, Xudp.uplink, .{sess}) catch {
             _ = t.workers.fetchSub(1, .acq_rel);
             sess.close();
             sess.release();
@@ -771,12 +767,13 @@ pub const Tunnel = struct {
             defer _ = t.workers.fetchSub(1, .acq_rel);
             defer x.release();
             const f = x.flow();
-            const v = x.snap.get().vless;
-            f.dialVless(v, &x.up) catch return x.close();
+            const ob = x.snap.get();
+            const v = &ob.vless;
+            f.dial(&ob, &x.up) catch return x.close();
             x.connected.store(true, .release);
             _ = x.refs.fetchAdd(1, .acq_rel);
             _ = t.workers.fetchAdd(1, .acq_rel);
-            const th = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, downlink, .{x}) catch {
+            const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(128 * 1024) }, downlink, .{x}) catch {
                 _ = x.refs.fetchSub(1, .acq_rel);
                 _ = t.workers.fetchSub(1, .acq_rel);
                 return x.close();
@@ -786,7 +783,7 @@ pub const Tunnel = struct {
             x.close();
         }
 
-        fn sendLoop(x: *Xudp, f: *const proxy.Flow, v: proxy.Vless) !void {
+        fn sendLoop(x: *Xudp, f: *const proxy.Flow, v: *const proxy.Vless) !void {
             const t = x.tunnel;
             var hb: [37]u8 = undefined;
             const header = xudp.header(&hb, v.uuid, v.vision);
@@ -830,6 +827,8 @@ pub const Tunnel = struct {
         /// Write to the server: the VLESS header in the clear, frames inside
         /// Vision padding for the first few, then plain.
         fn write(x: *Xudp, bytes: []const u8, padding: *bool, padder: *vision.Padder, frames: *u32, rand: std.Random, is_header: bool) !void {
+            // inside a transport: its stream (Vision does not run there)
+            if (x.up.transportWriter()) |w| return w.writeAll(bytes);
             if (!x.up.tls) return x.up.uw.interface.writeAll(bytes);
             const rw = &x.up.rw;
             if (is_header or !padding.*) return rw.write(bytes);
@@ -841,6 +840,7 @@ pub const Tunnel = struct {
         }
 
         fn flush(x: *Xudp) !void {
+            if (x.up.transportWriter()) |w| return w.flush();
             if (x.up.tls) return x.up.rw.flush();
             return x.up.uw.interface.flush();
         }
@@ -871,16 +871,18 @@ pub const Tunnel = struct {
             const f = x.flow();
             while (!x.closed.load(.acquire)) {
                 var raw_len: usize = 0;
-                const data: []const u8 = if (x.up.tls)
+                // inside a transport: its stream; else the records or the socket
+                const raw = x.up.transportReader() orelse &x.up.ur.interface;
+                const data: []const u8 = if (x.up.tls and raw == &x.up.ur.interface)
                     (try x.up.rr.next()) orelse return
                 else blk: {
-                    const chunk = x.up.ur.interface.peekGreedy(1) catch return;
+                    const chunk = raw.peekGreedy(1) catch return;
                     raw_len = chunk.len;
                     break :blk chunk;
                 };
                 const body = try header.strip(data);
                 if (v.vision) _ = try unpad.feed(body, &sink) else try sink.content(body);
-                if (raw_len > 0) x.up.ur.interface.toss(raw_len);
+                if (raw_len > 0) raw.toss(raw_len);
                 while (try reader.next()) |ev| switch (ev) {
                     .end => return,
                     .data => |d| {
@@ -953,6 +955,8 @@ pub const Device = struct {
     dropped: std.atomic.Value(u64) = .init(0),
 
     pub fn init(fd: c.fd_t, af_header: bool) !Device {
+        // a TUN device exists where the service does; Windows has neither yet
+        if (comptime !sys.supported) return error.Unsupported;
         var p: [2]c.fd_t = undefined;
         if (c.pipe(&p) != 0) return error.PipeFailed;
         const nb: c_int = @bitCast(@as(u32, @bitCast(c.O{ .NONBLOCK = true })));
@@ -969,6 +973,7 @@ pub const Device = struct {
     }
 
     pub fn write(d: *Device, pkt: []const u8) void {
+        if (comptime !sys.supported) return;
         if (pkt.len == 0) return;
         if (!d.af_header) {
             if (c.write(d.fd, pkt.ptr, pkt.len) < 0) _ = d.dropped.fetchAdd(1, .monotonic);
@@ -1003,6 +1008,30 @@ test "routing: rule beats default, unknown outbound blocks" {
     try std.testing.expectEqualStrings("nl.example", t.decide(null).snap.get().vless.host);
     try std.testing.expect(t.decide("/Applications/Bad.app").snap.outbound == .block);
     try std.testing.expect(!t.decide(null).main);
+}
+
+test "tunnel: UDP to a server whose protocol carries none yet is dropped, not leaked" {
+    const t = try Tunnel.create(std.testing.allocator, std.testing.io, .{});
+    defer t.destroy();
+    const link = "trojan://pw@tj.example:443";
+    try t.setConfig(.{
+        .default = .{ .outbound = 0 },
+        .outbounds = &.{try proxy.outboundFromLink(link, "tj.example", 443)},
+    });
+    // the copy keeps nothing of the caller's strings
+    try std.testing.expect(t.decide(null).snap.outbound == .trojan);
+    try std.testing.expectEqualStrings("tj.example", t.decide(null).snap.get().trojan.host);
+
+    const app: Endpoint = .{ .addr = packet.v4(.{ 198, 18, 0, 1 }), .port = 50000 };
+    const there: Endpoint = .{ .addr = packet.v4(.{ 203, 0, 113, 9 }), .port = 3478 };
+    t.udpDatagram(app, there, "stun");
+    t.udpDatagram(app, there, "stun again");
+    t.udp_mutex.lockUncancelable(t.io);
+    defer t.udp_mutex.unlock(t.io);
+    // remembered as a drop: no socket of ours, no session to a server
+    try std.testing.expectEqual(1, t.udp.count());
+    try std.testing.expect(t.udp.get(.{ .app = app, .remote = there }).?.sock == null);
+    try std.testing.expectEqual(0, t.sessions.count());
 }
 
 test "tunnel: a flow without a rule follows the application that started it" {
@@ -1044,6 +1073,7 @@ test "tunnel: the main route uses the group's server and blocks without one" {
 }
 
 test "DNS through the tunnel: fake answer goes back to the asking app" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sockets and pipes
     const T = struct {
         var got: [512]u8 = undefined;
         var got_len: usize = 0;

@@ -1588,7 +1588,7 @@ test "sendUdp fits on the small stack of a DNS forwarding thread" {
     const s = try Stack.create(std.testing.allocator, std.testing.io, .{}, .{ .ctx = &ctx, .write = T.write }, .{ .ctx = &ctx, .tcp = T.onTcp, .udp = T.onUdp });
     defer s.destroy();
     // half of the 64 KiB that sendUdp once put on its caller's stack
-    const th = try std.Thread.spawn(.{ .stack_size = 32 * 1024 }, T.reply, .{s});
+    const th = try std.Thread.spawn(.{ .stack_size = @import("../sys.zig").stackSize(32 * 1024) }, T.reply, .{s});
     th.join();
     try std.testing.expectEqual(1500, T.bytes.load(.monotonic));
     // one byte more than the MTU takes is dropped
