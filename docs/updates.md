@@ -23,7 +23,8 @@ was built into it, so whoever holds the secret key decides what the apps install
 
 2. In the GitHub repository, **Settings → Secrets and variables → Actions**:
    - secret **`BLACKWALL_UPDATE_KEY`** = the secret seed;
-   - variable (tab "Variables") **`BLACKWALL_UPDATE_PUBKEY`** = the public key.
+   - variable (tab "Variables") **`BLACKWALL_UPDATE_PUBKEY`** = the public key (a secret of
+     the same name works too).
 
 3. Keep a copy of the seed offline (password manager). Do not commit it anywhere.
 
