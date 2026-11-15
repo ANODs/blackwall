@@ -5,7 +5,7 @@
 //
 //   POST /hit        a page view or a download click, sent by the page with sendBeacon
 //   GET  /releases   the latest release, its files and the download counts, from GitHub (cached 5 min)
-//   GET  /stats      the aggregates the statistics page draws (needs STATS_KEY when that secret is set)
+//   GET  /stats      the aggregates the page's statistics block draws (open; a STATS_KEY secret would lock it)
 //
 // What is kept: counters per day (views, visitors, country, page language, system, device,
 // referrer host, downloads). What is not: addresses, user agents, cookies, anything per person.
@@ -134,7 +134,7 @@ async function stats(req, env) {
   const top = Object.fromEntries(TOP.map(d => [d, []]));
   for (const r of topRows.results) if (top[r.dim].length < 12) top[r.dim].push([r.key, r.n]);
   const sum = k => daily.reduce((a, d) => a + d[k], 0);
-  return json({ days: n, daily, top, totals: { views: sum('views'), uniques: sum('uniques'), dl: sum('dl') } }, 200, { 'Cache-Control': 'no-store', ...cors(req, env) });
+  return json({ days: n, daily, top, totals: { views: sum('views'), uniques: sum('uniques'), dl: sum('dl') } }, 200, { 'Cache-Control': env.STATS_KEY ? 'no-store' : 'public, max-age=120', ...cors(req, env) });
 }
 
 // The site is built and published by GitHub Pages; this hands it out under the site's own

@@ -103,6 +103,126 @@ if (BW.worker) {
   fetch(BW.worker + '/releases').then(r => r.ok ? r.json() : null).then(applyReleases).catch(() => {});
 }
 
+/* ---------- statistics: what the worker has counted, open to everyone ---------- */
+(() => {
+  const sec = $('#stats');
+  if (!sec || !BW.worker) return;
+  const T = sec.dataset, box = $('#chart');
+  const el = (tag, cls, text) => { const e = d.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const svg = (tag, attrs) => { const e = d.createElementNS('http://www.w3.org/2000/svg', tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+  let regions = null, dayFmt = null;
+  try { regions = new Intl.DisplayNames([BW.lang], { type: 'region' }); } catch (e) {}
+  try { dayFmt = new Intl.DateTimeFormat(BW.lang, { day: 'numeric', month: 'short', timeZone: 'UTC' }); } catch (e) {}
+  const date = iso => dayFmt ? dayFmt.format(new Date(iso + 'T00:00:00Z')) : iso.slice(5);
+  const SYS = { mac: 'macOS', win: 'Windows', linux: 'Linux', ios: 'iOS', android: 'Android', other: '?' };
+  function name(dim, key) {
+    if (dim === 'os') return SYS[key] || key;
+    if (dim === 'country') { try { return (regions && key !== 'XX' && regions.of(key)) || key; } catch (e) { return key; } }
+    return key;
+  }
+
+  function rows(list, to) {
+    to.textContent = '';
+    if (!list || !list.length) { to.append(el('p', 'none', T.empty)); return; }
+    const max = list[0][1] || 1;
+    list.slice(0, 5).forEach(([key, n]) => {
+      const row = el('div', 'row');
+      row.style.setProperty('--w', (n / max * 100).toFixed(1) + '%');
+      row.append(el('span', '', name(to.dataset.dim, key)), el('b', '', nf.format(n)));
+      to.append(row);
+    });
+  }
+
+  // Views and visitors are the same unit, so they share one axis: a bar per day,
+  // visitors drawn in front of the views they are part of.
+  function chart(daily) {
+    box.textContent = '';
+    const W = Math.max(280, box.clientWidth - 56), H = 230, L = 38, Tp = 8, B = 26;
+    const n = daily.length, iw = W - L, ih = H - Tp - B, band = iw / n, bw = Math.max(2, Math.min(30, band * 0.7));
+    const raw = Math.max(1, ...daily.map(x => x.views));
+    const pow = Math.pow(10, Math.floor(Math.log10(raw)));
+    const top = Math.max(4, Math.ceil(raw / pow * 2) / 2 * pow);
+    const base = Tp + ih, y = v => base - v / top * ih, cx = i => L + band * (i + 0.5);
+    const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': T.views + ', ' + T.uniques });
+    for (let i = 0; i <= 2; i++) {
+      const v = top / 2 * i;
+      s.append(svg('rect', { x: L, y: Math.round(y(v)), width: iw, height: 1, fill: '#1F1F23' }));
+      const t = svg('text', { x: L - 10, y: y(v) + 4, 'text-anchor': 'end' }); t.textContent = nf.format(v); s.append(t);
+    }
+    [0, Math.floor((n - 1) / 2), n - 1].filter((v, i, a) => a.indexOf(v) === i).forEach(i => {
+      const t = svg('text', { x: cx(i), y: H - 6, 'text-anchor': i === 0 && n > 10 ? 'start' : i === n - 1 && n > 10 ? 'end' : 'middle' });
+      t.textContent = date(daily[i].day); s.append(t);
+    });
+    const bar = (i, v, fill) => {
+      const h = v / top * ih;
+      if (h < 0.5) return;
+      const x = cx(i) - bw / 2, r = Math.min(4, bw / 2, h), t = base - h;
+      const b = svg('path', { class: 'bar', fill, d: `M${x} ${base}V${t + r}Q${x} ${t} ${x + r} ${t}H${x + bw - r}Q${x + bw} ${t} ${x + bw} ${t + r}V${base}Z` });
+      b.style.animationDelay = (reduce ? 0 : i * Math.min(14, 420 / n)) + 'ms';
+      s.append(b);
+    };
+    daily.forEach((p, i) => { bar(i, p.views, '#4A4A54'); bar(i, p.uniques, '#F2F2F3'); });
+
+    const tip = el('div', 'tip'), cols = [];
+    daily.forEach((p, i) => {
+      const c = svg('rect', { class: 'col', x: L + band * i, y: Tp, width: band, height: ih });
+      cols.push(c); s.append(c);
+    });
+    box.append(s, tip);
+    const table = el('table', 'vh'), head = el('tr');
+    ['', T.views, T.uniques].forEach(h => head.append(el('th', '', h)));
+    table.append(head);
+    daily.forEach(p => { const tr = el('tr'); [p.day, p.views, p.uniques].forEach(v => tr.append(el('td', '', v))); table.append(tr); });
+    box.append(table);
+
+    let cur = -1;
+    const off = () => { if (cur >= 0) cols[cur].classList.remove('on'); cur = -1; tip.classList.remove('show'); };
+    s.addEventListener('pointerleave', off);
+    s.addEventListener('pointermove', e => {
+      const r = s.getBoundingClientRect(), px = (e.clientX - r.left) / r.width * W;
+      const i = clamp(Math.floor((px - L) / band), 0, n - 1), p = daily[i];
+      if (i === cur) return;
+      off(); cur = i; cols[i].classList.add('on');
+      tip.textContent = '';
+      tip.append(el('b', '', date(p.day)));
+      [[T.views, p.views], [T.uniques, p.uniques]].forEach(([k, v]) => { const row = el('div', '', k); row.append(el('i', '', nf.format(v))); tip.append(row); });
+      const tx = 28 + cx(i) / W * r.width, full = box.clientWidth;
+      tip.style.left = clamp(tx > full / 2 ? tx - tip.offsetWidth - 16 : tx + 16, 8, full - tip.offsetWidth - 8) + 'px';
+      tip.classList.add('show');
+    });
+  }
+
+  let data = null, seen = false, days = 30;
+  function draw(first) {
+    if (!data || !seen) return;
+    [['#sx-views', 'views'], ['#sx-uniques', 'uniques'], ['#sx-dl', 'dl']].forEach(([id, k]) => {
+      first ? countUp($(id), data.totals[k]) : ($(id).textContent = nf.format(data.totals[k]));
+    });
+    chart(data.daily);
+    $$('.rows', sec).forEach(to => rows(data.top[to.dataset.dim], to));
+  }
+  function load(first) {
+    fetch(BW.worker + '/stats?days=' + days).then(r => r.ok ? r.json() : null).then(j => {
+      if (!j || !j.daily) return;
+      data = j;
+      sec.hidden = false;
+      draw(first);
+    }).catch(() => {});
+  }
+  $$('#period button').forEach(b => b.addEventListener('click', () => {
+    days = +b.dataset.d;
+    $$('#period button').forEach(o => o.setAttribute('aria-pressed', String(o === b)));
+    load(false);
+  }));
+  if ('IntersectionObserver' in window) {
+    const io = new IntersectionObserver(es => { if (es[0].isIntersecting) { seen = true; io.disconnect(); draw(true); } }, { rootMargin: '0px 0px -10% 0px' });
+    io.observe(sec);
+  } else seen = true;
+  let rz = 0, lastW = innerWidth;
+  addEventListener('resize', () => { if (innerWidth === lastW) return; lastW = innerWidth; clearTimeout(rz); rz = setTimeout(() => draw(false), 150); });
+  load(true);
+})();
+
 /* ---------- reveal on scroll ---------- */
 if ('IntersectionObserver' in window) {
   const io = new IntersectionObserver(es => es.forEach(e => {

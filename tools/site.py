@@ -8,9 +8,9 @@ One template per page (site/src/*.html), one strings file per language
 (site/i18n/*.json). Every language must have the same keys, and a template may
 only use keys that exist: anything else stops the build, as in src/i18n.zig.
 
-    /            English          /stats/        statistics
-    /ru/         Russian          /ru/stats/
-    /zh/         Chinese          /zh/stats/
+    /            English
+    /ru/         Russian
+    /zh/         Chinese
 
 Template syntax:  {{key}} a string,  {{@name}} a build value,
 {{@inc:file}} a file from site/src placed inline.
@@ -38,7 +38,7 @@ SRC = SITE / "src"
 OUT = ROOT / "_site"
 
 LANGS = ["en", "ru", "zh"]
-PAGES = {"index.html": "", "stats.html": "stats/"}
+PAGES = {"index.html": ""}
 LOCALES = {"en": "en_US", "ru": "ru_RU", "zh": "zh_CN"}
 SYSTEMS = {"mac": "macos-arm64.zip", "win": "windows-x86_64.exe", "linux": "linux-x86_64.tar.gz"}
 
@@ -178,7 +178,6 @@ def jsonld(cfg: dict, strings: dict, lang: str, url: str, base: str, releases: d
 
 
 def write_sitemap(base: str) -> None:
-    """Only the landing page; the statistics pages are noindex."""
     def loc(l: str) -> str:
         return base + ("" if l == "en" else l + "/")
 

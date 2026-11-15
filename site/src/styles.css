@@ -175,8 +175,47 @@ details[open] summary::before{content:"\2212"}
 summary:hover{color:var(--text)}
 details p{margin:10px 0 0 16px;color:var(--text3);line-height:1.55}
 
+/* statistics: one panel, the way Umami lays it out. Numbers, the days, three lists. */
+.sx{margin-top:clamp(32px,5vw,56px);border:1px solid var(--hairline);border-radius:18px;background:var(--panel);overflow:hidden}
+.sx-top{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap;padding:28px 28px 4px}
+.sx-nums{display:flex;gap:clamp(24px,5vw,60px);flex-wrap:wrap}
+.sx-nums span{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text2)}
+.sx-nums b{display:block;margin-top:8px;font:400 clamp(28px,4vw,44px)/1 var(--mono);letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+.sw{width:10px;height:10px;border-radius:3px;background:#4A4A54}
+.sw2{background:var(--text)}
+.sx-per{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text3)}
+.sx-per .seg{background:var(--bg)}
+.chart{position:relative;padding:22px 28px 6px}
+.chart svg{width:100%;height:auto;overflow:visible;stroke:none}
+.chart text{fill:var(--text3);font:400 11px var(--mono)}
+.chart .bar{transform-box:fill-box;transform-origin:50% 100%;animation:rise var(--slow) var(--e) both}
+.chart .col{fill:transparent}
+.chart .col.on{fill:rgba(242,242,243,.05)}
+@keyframes rise{from{transform:scaleY(0)}}
+.tip{position:absolute;top:14px;z-index:1;min-width:150px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--raised);font-size:12px;color:var(--text2);pointer-events:none;opacity:0;transition:opacity var(--fast) var(--e)}
+.tip.show{opacity:1}
+.tip b{display:block;margin-bottom:6px;font:400 12px var(--mono);color:var(--text)}
+.tip div{display:flex;justify-content:space-between;gap:16px}
+.tip i{font:normal 400 12px var(--mono);color:var(--text)}
+.sx-lists{display:grid;grid-template-columns:repeat(3,1fr);margin-top:14px;border-top:1px solid var(--hairline)}
+.sx-lists>div{min-width:0;padding:22px 28px 24px}
+.sx-lists>div+div{border-left:1px solid var(--hairline)}
+.sx-lists h3{font-size:13px;font-weight:500;color:var(--text2)}
+.rows{display:grid;gap:2px;margin:12px -10px 0}
+.row{position:relative;display:flex;justify-content:space-between;gap:12px;padding:7px 10px;font-size:13px}
+.row::before{content:"";position:absolute;inset:0 auto 0 0;width:var(--w);border-radius:7px;background:var(--raised);transform-origin:0 50%;animation:grow var(--slow) var(--e) both}
+.row span,.row b{position:relative}
+.row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row b{font:400 12px/20px var(--mono);color:var(--text2)}
+.rows .none{padding:7px 10px;font-size:13px;color:var(--text3)}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+@keyframes grow{from{transform:scaleX(0)}}
+
 /* narrow screens */
 @media (max-width:860px){
+  .sx-lists{grid-template-columns:1fr}
+  .sx-lists>div+div{border-left:0;border-top:1px solid var(--hairline)}
+  .sx-top,.chart,.sx-lists>div{padding-left:20px;padding-right:20px}
   .plats{grid-template-columns:1fr}
   .plat{min-height:0}
   .count{text-align:left}

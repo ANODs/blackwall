@@ -190,6 +190,35 @@
   </div>
 </section>
 
+<section class="sec" id="stats" hidden data-views="{{stats_views}}" data-uniques="{{stats_uniques}}" data-empty="{{stats_empty}}">
+  <div class="wrap">
+    <h2 class="rv">{{stats_h}}</h2>
+    <div class="sx rv" style="--i:1">
+      <div class="sx-top">
+        <div class="sx-nums">
+          <div><span><i class="sw"></i>{{stats_views}}</span><b id="sx-views">0</b></div>
+          <div><span><i class="sw sw2"></i>{{stats_uniques}}</span><b id="sx-uniques">0</b></div>
+          <div><span>{{stats_downloads}}</span><b id="sx-dl">0</b></div>
+        </div>
+        <div class="sx-per">
+          <div class="seg" id="period" role="group" aria-label="{{stats_days}}">
+            <button type="button" data-d="7">7</button>
+            <button type="button" data-d="30" aria-pressed="true">30</button>
+            <button type="button" data-d="90">90</button>
+          </div>
+          <span>{{stats_days}}</span>
+        </div>
+      </div>
+      <div class="chart" id="chart"></div>
+      <div class="sx-lists">
+        <div><h3>{{stats_country}}</h3><div class="rows" data-dim="country"></div></div>
+        <div><h3>{{stats_ref}}</h3><div class="rows" data-dim="ref"></div></div>
+        <div><h3>{{stats_os}}</h3><div class="rows" data-dim="os"></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
 </main>
 
 <script id="bw" type="application/json">{{@data}}</script>
