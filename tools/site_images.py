@@ -69,7 +69,7 @@ def og(lang: str, tile: Image.Image) -> Image.Image:
 
     mono = ImageFont.truetype(str(FONTS / "GeistMono-Regular.ttf"), 22)
     d.text((80, 548), "VLESS · Trojan · Shadowsocks · VMess", font=mono, fill=TEXT3)
-    d.text((80, 580), "macOS · Windows · Linux", font=mono, fill=TEXT3)
+    d.text((80, 580), "macOS · Windows · Linux · Android", font=mono, fill=TEXT3)
     return img
 
 

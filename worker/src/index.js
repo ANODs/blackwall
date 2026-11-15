@@ -13,7 +13,7 @@
 // random, lives for that day only, and is deleted with the hashes by the nightly cron.
 
 const LANGS = ['en', 'ru', 'zh'];
-const SYSTEMS = { mac: 'macos-arm64.zip', win: 'windows-x86_64.exe', linux: 'linux-x86_64.tar.gz' };
+const SYSTEMS = { mac: 'macos-arm64.zip', win: 'windows-x86_64.exe', linux: 'linux-x86_64.tar.gz', android: 'android.apk' };
 const OS = ['mac', 'win', 'linux', 'ios', 'android', 'other'];
 const BOT = /bot|crawl|spider|slurp|preview|headless|lighthouse|monitor|curl|wget|python|scrapy/i;
 const TOP = ['country', 'lang', 'os', 'device', 'ref', 'dl'];
@@ -84,7 +84,7 @@ async function hit(req, env) {
 
 // GitHub's release list -> {version, files[lang][system], downloads}. Same shape as tools/site.py.
 function normalize(releases) {
-  const downloads = { total: 0, mac: 0, win: 0, linux: 0 };
+  const downloads = { total: 0, mac: 0, win: 0, linux: 0, android: 0 };
   const newer = (a, b) => { const x = a.split('.').map(Number), y = b.split('.').map(Number); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]; return false; };
   let best = null, files = {};
   for (const rel of releases) {

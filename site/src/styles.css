@@ -146,7 +146,7 @@ h2{font-size:clamp(32px,5.2vw,60px);font-weight:600;line-height:1.05;letter-spac
 .count{text-align:right}
 .count b{display:block;font:400 clamp(44px,7vw,84px)/1 var(--mono);letter-spacing:-.04em;font-variant-numeric:tabular-nums}
 .count span{display:block;margin-top:8px;font-size:14px;color:var(--text3)}
-.plats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:clamp(40px,6vw,72px)}
+.plats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:clamp(40px,6vw,72px)}
 .plat{position:relative;display:flex;flex-direction:column;min-height:280px;padding:28px;border:1px solid var(--hairline);border-radius:18px;background:var(--panel);transition:border-color var(--mid) var(--e),background var(--mid) var(--e)}
 .plat:hover{border-color:var(--border)}
 .plat h3{font-size:24px;font-weight:600;letter-spacing:-.02em}
@@ -220,6 +220,7 @@ details p{margin:10px 0 0 16px;color:var(--text3);line-height:1.55}
 .foot-r span a:hover{border-color:var(--text3)}
 
 /* narrow screens */
+@media (max-width:1180px){.plats{grid-template-columns:repeat(2,1fr)}}
 @media (max-width:860px){
   .sx-lists{grid-template-columns:1fr}
   .sx-lists>div+div{border-left:0;border-top:1px solid var(--hairline)}

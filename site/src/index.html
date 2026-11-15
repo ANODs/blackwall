@@ -82,10 +82,10 @@
     <h1><span class="r" style="--i:1">{{h1_a}}</span> <span class="r dim" style="--i:2">{{h1_b}}</span></h1>
     <p class="sub r" style="--i:3">{{sub}}</p>
     <div class="cta r" style="--i:4">
-      <a class="btn btn-p" id="cta" href="#download" data-mac="{{cta_mac}}" data-win="{{cta_win}}" data-linux="{{cta_linux}}">{{cta_any}}</a>
+      <a class="btn btn-p" id="cta" href="#download" data-mac="{{cta_mac}}" data-win="{{cta_win}}" data-linux="{{cta_linux}}" data-android="{{cta_android}}">{{cta_any}}</a>
       <a class="btn btn-g" href="{{@repo_url}}" rel="noopener">GitHub</a>
     </div>
-    <p class="meta r" style="--i:5"><span id="cta-meta" data-mb="{{mb}}">v{{@version}} · macOS · Windows · Linux</span><a id="cta-all" href="#download" hidden>{{all_platforms}}</a></p>
+    <p class="meta r" style="--i:5"><span id="cta-meta" data-mb="{{mb}}">v{{@version}} · macOS · Windows · Linux · Android</span><a id="cta-all" href="#download" hidden>{{all_platforms}}</a></p>
   </div>
 
   <div class="stage" id="stage">
@@ -176,6 +176,16 @@
           <span class="nums"><span data-size="linux" data-mb="{{mb}}"></span><span data-count="linux"></span></span>
         </div>
       </article>
+      <article class="plat rv" data-os="android" style="--i:3">
+        <span class="tag">{{dl_yours}}</span>
+        <h3>Android</h3>
+        <p class="arch">10+ · .apk</p>
+        <p class="note">{{dl_android_note}}</p>
+        <div class="plat-b">
+          <a class="btn btn-g" data-dl="android" href="{{@file_android}}">{{dl_get}}</a>
+          <span class="nums"><span data-size="android" data-mb="{{mb}}"></span><span data-count="android"></span></span>
+        </div>
+      </article>
     </div>
 
     <div class="dl-foot rv">
@@ -183,6 +193,7 @@
         <summary>{{dl_first_run}}</summary>
         <p>{{dl_first_mac}}</p>
         <p>{{dl_first_win}}</p>
+        <p>{{dl_first_android}}</p>
       </details>
       <a href="{{@repo_url}}/releases" rel="noopener">{{dl_older}} <span data-ver>v{{@version}}</span></a>
     </div>

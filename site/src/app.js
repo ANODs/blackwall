@@ -38,8 +38,8 @@ const OS = (() => {
   if (/Linux|X11/i.test(p)) return 'linux';
   return 'other';
 })();
-const DESKTOP = OS === 'mac' || OS === 'win' || OS === 'linux';
-const ARCH = { mac: 'Apple Silicon', win: 'Windows x64', linux: 'Linux x64' };
+const OURS = OS === 'mac' || OS === 'win' || OS === 'linux' || OS === 'android';
+const ARCH = { mac: 'Apple Silicon', win: 'Windows x64', linux: 'Linux x64', android: 'Android 10+' };
 
 /* ---------- visits and downloads: counted by the worker, without cookies ---------- */
 const quiet = navigator.doNotTrack === '1' || navigator.globalPrivacyControl === true;
@@ -75,14 +75,14 @@ function applyReleases(rel) {
   $$('[data-ver]').forEach(el => { el.textContent = 'v' + rel.version; });
 
   const cta = $('#cta'), meta = $('#cta-meta');
-  if (cta && DESKTOP) {
+  if (cta && OURS && files[OS]) {
     cta.href = files[OS].url;
     cta.dataset.dl = OS;
     cta.textContent = cta.dataset[OS];
     meta.textContent = ['v' + rel.version, mb(files[OS].size, meta.dataset.mb), ARCH[OS]].filter(Boolean).join(' · ');
     $('#cta-all').hidden = false;
   } else if (meta) {
-    meta.textContent = 'v' + rel.version + ' · macOS · Windows · Linux';
+    meta.textContent = 'v' + rel.version + ' · macOS · Windows · Linux · Android';
   }
 
   const dl = rel.downloads, box = $('#count');

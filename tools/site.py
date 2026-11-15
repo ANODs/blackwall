@@ -40,7 +40,7 @@ OUT = ROOT / "_site"
 LANGS = ["en", "ru", "zh"]
 PAGES = {"index.html": ""}
 LOCALES = {"en": "en_US", "ru": "ru_RU", "zh": "zh_CN"}
-SYSTEMS = {"mac": "macos-arm64.zip", "win": "windows-x86_64.exe", "linux": "linux-x86_64.tar.gz"}
+SYSTEMS = {"mac": "macos-arm64.zip", "win": "windows-x86_64.exe", "linux": "linux-x86_64.tar.gz", "android": "android.apk"}
 
 # The first visit to "/" goes to the visitor's language: a saved or explicit choice,
 # then the browser's languages, then the time zone. No request leaves the page.
@@ -113,7 +113,7 @@ def fallback_releases(cfg: dict) -> dict:
     files = {
         lang: {
             s: {
-                "url": f"https://github.com/{cfg['repo']}/releases/download/v{ver}-{lang}/BLACKWALL-{ver}-{lang}-{suffix}",
+                "url": f"https://github.com/{cfg['repo']}/releases/download/v{ver}-{lang}/BLACKWALL-{ver}-{'' if s == 'android' else lang + '-'}{suffix}",
                 "size": int(sizes[s] * 1e6) if s in sizes else None,
             }
             for s, suffix in SYSTEMS.items()
@@ -164,7 +164,7 @@ def jsonld(cfg: dict, strings: dict, lang: str, url: str, base: str, releases: d
         "screenshot": f"{base}assets/og-{lang}.png",
         "applicationCategory": "SecurityApplication",
         "applicationSubCategory": "VPN client",
-        "operatingSystem": "macOS, Windows, Linux",
+        "operatingSystem": "macOS, Windows, Linux, Android",
         "softwareVersion": releases["version"],
         "downloadUrl": f"{repo}/releases",
         "license": "https://opensource.org/license/mit",
