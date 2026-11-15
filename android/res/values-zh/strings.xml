@@ -34,4 +34,6 @@
     <string name="ipv6_system">系统</string>
     <string name="s_always">始终开启与断网保护</string>
     <string name="s_always_d">Android 自身可在开机后保持 VPN 开启并拦截 VPN 之外的所有连接：请在系统设置中为 BLACKWALL 打开“始终开启的 VPN”和“屏蔽未使用 VPN 的所有连接”。</string>
+    <string name="s_privacy">隐私政策</string>
+    <string name="s_privacy_d">不向开发者发送任何数据：没有统计，也没有账户。密钥和规则只保存在本设备上。</string>
 </resources>

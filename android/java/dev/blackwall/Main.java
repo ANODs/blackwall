@@ -54,6 +54,7 @@ public class Main extends Activity implements Core.Listener {
     static final int BG = 0xFF0A0A0C, CARD = 0xFF16161A, LINE = 0xFF2A2A30, TEXT = 0xFFF2F2F2, DIM = 0xFF8E8E93,
             GREEN = 0xFF34C77B, AMBER = 0xFFE0A030, RED = 0xFFE5484D;
     private static final int CONNECT = 0, APPS = 1, SERVERS = 2, SETTINGS = 3;
+    private static final String PRIVACY = "https://github.com/ANODs/blackwall/blob/main/docs/privacy.md";
     private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT, WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
 
     private Core core;
@@ -700,6 +701,19 @@ public class Main extends Activity implements Core.Listener {
             }
         });
         col.addView(always);
+
+        // Google Play asks for the policy to be reachable from inside the app
+        ImageView open = new ImageView(this);
+        open.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));
+        View privacy = setting(R.string.s_privacy, R.string.s_privacy_d, open);
+        privacy.setOnClickListener(v -> {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(PRIVACY)));
+            } catch (Exception e) {
+                // no browser
+            }
+        });
+        col.addView(privacy);
 
         TextView version = label("BLACKWALL " + Core.version(this), 12, DIM);
         version.setPadding(0, dp(24), 0, 0);

@@ -34,4 +34,6 @@
     <string name="ipv6_system">System</string>
     <string name="s_always">Always-on and kill switch</string>
     <string name="s_always_d">Android itself keeps the VPN on from boot and blocks everything outside it: turn on “Always-on VPN” and “Block connections without VPN” for BLACKWALL in the system settings.</string>
+    <string name="s_privacy">Privacy policy</string>
+    <string name="s_privacy_d">Nothing is sent to the developer: no analytics, no accounts. Your keys and rules stay on this device.</string>
 </resources>

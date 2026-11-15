@@ -34,4 +34,6 @@
     <string name="ipv6_system">Система</string>
     <string name="s_always">Постоянный VPN и блокировка</string>
     <string name="s_always_d">Android сам держит VPN включённым с загрузки и блокирует всё мимо него: включите «Постоянная VPN» и «Блокировать соединения без VPN» для BLACKWALL в настройках системы.</string>
+    <string name="s_privacy">Политика конфиденциальности</string>
+    <string name="s_privacy_d">Разработчику ничего не отправляется: ни аналитики, ни аккаунтов. Ключи и правила остаются на этом устройстве.</string>
 </resources>
