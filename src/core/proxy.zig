@@ -540,6 +540,9 @@ pub const handshake_timeout_ms = 10_000;
 pub const dial_stack_size = 512 * 1024;
 
 /// How outbound connections are made.
+/// Unbound sockets also connect with a deadline.
+const plain_timed = builtin.abi.isAndroid();
+
 pub const Dialer = struct {
     /// keep our own sockets off the TUN
     bind: sys.Bind = .none,
@@ -562,7 +565,9 @@ pub const Dialer = struct {
     }
 
     pub fn connectAddr(d: *const Dialer, io: Io, a: *const packet.Addr, port: u16) !net.Stream {
-        if (d.bind == .none) return sys.toIpAddress(a, port).connect(io, .{ .mode = .stream });
+        // Android leaves our package out of the VPN, so nothing is bound
+        // there; the connect must still give up in time
+        if (d.bind == .none and !plain_timed) return sys.toIpAddress(a, port).connect(io, .{ .mode = .stream });
         return sys.connectTcp(a, port, d.bind, d.timeout_ms);
     }
 

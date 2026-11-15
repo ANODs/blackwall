@@ -92,18 +92,21 @@ release is a single file of 4 to 11 MB.
 
 ## Platform support
 
-| | macOS (Apple Silicon) | Windows (x64) | Linux (x64) |
-|---|---|---|---|
-| Capture all traffic (TUN) | Yes | Not yet | Service only, manual setup |
-| Routes per application | Yes | Not yet | Not yet |
-| Local SOCKS5 proxy (`127.0.0.1:1080`) | Yes | Yes | Yes |
-| Kill switch, protection after Disconnect, hold from boot | Yes | No | No |
-| Menu bar / tray item | Yes | Built, untested | Built, untested |
-| Automatic updates | Yes | Yes | Yes |
+| | macOS (Apple Silicon) | Android 10+ | Linux (x64) | Windows (x64) |
+|---|---|---|---|---|
+| Capture all traffic (TUN) | Yes | Yes | Service only (`--tun auto`) | Not yet |
+| Routes per application | Yes | Yes | Not yet | Not yet |
+| Local SOCKS5 proxy (`127.0.0.1:1080`) | Yes | No | Yes | Yes |
+| Protection after Disconnect | Yes | Yes | No | No |
+| Kill switch, on from boot | Yes | Android's own "Always-on VPN" | Service only | No |
+| Menu bar / tray / notification | Yes | Yes | Built, untested | Built, untested |
+| Automatic updates | Yes | No | Yes | Yes |
 
-macOS is the platform used and tested every day. The Windows and Linux builds pass the
-automatic tests on their own systems in CI, and have not been through real use yet.
-Android is planned.
+macOS is the platform used and tested every day. The Android app has been through an
+emulator (Android 16, arm64) from first start to a reboot with "Block connections without
+VPN" on, and not through daily use on a phone yet. The Windows and Linux builds pass the
+automatic tests on their own systems in CI; the Linux service's own tunnel is tested in a
+virtual machine.
 
 ## Protocols and transports
 
@@ -132,12 +135,15 @@ comes in three languages; pick the one you read.
 | macOS (Apple Silicon) | `BLACKWALL-<version>-<lang>-macos-arm64.zip` |
 | Windows (x64) | `BLACKWALL-<version>-<lang>-windows-x86_64.exe` |
 | Linux (x64) | `BLACKWALL-<version>-<lang>-linux-x86_64.tar.gz` |
+| Android 10+ (arm64, x86_64) | `BLACKWALL-<version>-android.apk` (every language in one file) |
 
 The builds are not signed by Apple or Microsoft yet:
 
 - **macOS**: right-click the app, choose Open. The first connection in TUN mode asks for
   the administrator password once, to install the network helper.
 - **Windows**: SmartScreen, More info, Run anyway.
+- **Android**: open the APK and allow the installation from that source. The first
+  connection asks once whether the app may be a VPN.
 
 Every release file has a `.sig` next to it, an Ed25519 signature the updater checks
 before it installs anything. See [docs/updates.md](docs/updates.md).
@@ -272,6 +278,20 @@ helper inside, ad-hoc signed.
 Releases are built by GitHub Actions from a `v<version>` tag; see
 [docs/updates.md](docs/updates.md) for the signing key and the release steps.
 
+### Android
+
+```sh
+export ANDROID_HOME=~/Library/Android/sdk     # an SDK with a platform, build-tools and an NDK
+export JAVA_HOME=/path/to/jdk-17
+zig build android -Doptimize=ReleaseSafe      # zig-out/package/BLACKWALL-<version>-android.apk
+```
+
+There is no Gradle: Zig builds the core as `libblackwall.so` against the NDK's libc, and
+[android/build.sh](android/build.sh) compiles and packs the shell with the SDK's own tools
+(`aapt2`, `javac`, `d8`, `zipalign`, `apksigner`). The APK is about 3 MB. See
+[docs/android.md](docs/android.md) for how the app is put together and how releases are
+signed.
+
 ## Testing
 
 ```sh
@@ -317,14 +337,20 @@ src/
     sublink.zig            subscriptions and links
     update.zig             the updater
   service/                 the background service
+  android/                 the core as a library for the Android app
   helper/                  the root helper (macOS)
   tools/                   release signing, headless proxy
-docs/                      updates and release notes
+android/                   the Android shell: VpnService, the window, resources
+docs/                      updates, Android, release notes
 ```
 
 ## Known limitations
 
-- Capturing all traffic and per-application routes work on macOS only for now.
+- Capturing all traffic and per-application routes work on macOS and Android; on Linux
+  the service captures everything, without routes per application and without the window.
+- Android: no automatic updates, no pinned server per application in the interface yet,
+  and with "Block connections without VPN" on, Android itself cuts off the applications
+  set to Direct.
 - UDP is carried over VLESS only; over Trojan, VMess and Shadowsocks it is dropped.
   QUIC from proxied applications is dropped on purpose so that browsers fall back to TCP.
 - XHTTP supports the stream-one mode.
@@ -336,7 +362,7 @@ docs/                      updates and release notes
 
 ## Roadmap
 
-- Capture and per-application routes on Windows and Linux; Android.
+- Capture and per-application routes on Windows and Linux.
 - Hysteria2, TUIC and WireGuard.
 - UDP over the remaining protocols.
 - A local DPI bypass route.

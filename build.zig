@@ -195,15 +195,130 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     }) })).step);
 
+    // the Android core (src/android): its session runs and is tested on the
+    // host; the library itself is built by the `android` step
+    const routes = b.createModule(.{
+        .root_source_file = b.path("src/service/routes.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+    if (os != .windows) test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/android/session.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "routes", .module = routes } },
+    }) })).step);
+
     package(b, exe, service, helper, sign, update_pubkey.len > 0, lang, version, target.result);
+    android(b, optimize, strip, version);
 }
+
+/// `zig build android -Doptimize=ReleaseSafe` → zig-out/package/BLACKWALL-<version>-android.apk
+/// `zig build android-bundle -Doptimize=ReleaseSafe` → ...-android.aab, for Google Play
+///
+/// One APK for every interface language (Android picks by the system's)
+/// and both 64-bit ABIs. The core is src/android/lib.zig built against the
+/// NDK's libc; the shell in android/ is compiled and packed by
+/// android/build.sh with the SDK's own tools, without Gradle.
+///
+/// Needs ANDROID_HOME (SDK with a platform, build-tools and an NDK) and a
+/// JDK 17+ (JAVA_HOME or `javac` on the PATH); ANDROID_NDK_HOME picks a
+/// particular NDK.
+fn android(b: *std.Build, optimize: std.builtin.OptimizeMode, strip: bool, version: []const u8) void {
+    const step = b.step("android", "Android app (APK) in zig-out/package");
+    const env = b.graph.environ_map;
+    const sdk = env.get("ANDROID_HOME") orelse env.get("ANDROID_SDK_ROOT") orelse {
+        step.dependOn(&b.addFail("ANDROID_HOME is not set (the Android SDK; see README, Building for Android)").step);
+        return;
+    };
+    const ndk = env.get("ANDROID_NDK_HOME") orelse b.fmt("{s}/ndk/{s}", .{ sdk, android_ndk });
+    const host = switch (b.graph.host.result.os.tag) {
+        .macos => "darwin-x86_64", // universal binaries under this name
+        .windows => "windows-x86_64",
+        else => "linux-x86_64",
+    };
+    const sysroot = b.fmt("{s}/toolchains/llvm/prebuilt/{s}/sysroot", .{ ndk, host });
+
+    // the same script packs both forms: an APK to install directly, and an
+    // App Bundle, which is what Google Play takes (`zig build android-bundle`)
+    const bundle_step = b.step("android-bundle", "Android App Bundle for Google Play in zig-out/package");
+    var packs: [2]*std.Build.Step.Run = undefined;
+    var outputs: [2]std.Build.LazyPath = undefined;
+    for ([_][]const u8{ "blackwall.apk", "blackwall.aab" }, 0..) |name, i| {
+        const pack = b.addSystemCommand(&.{"sh"});
+        pack.addFileArg(b.path("android/build.sh"));
+        pack.addArgs(&.{ sdk, version });
+        outputs[i] = pack.addOutputFileArg(name);
+        // the shell's sources are not arguments, so the step cannot tell when they change
+        pack.has_side_effects = true;
+        packs[i] = pack;
+    }
+
+    const Abi = struct { name: []const u8, arch: std.Target.Cpu.Arch, triple: []const u8 };
+    for ([_]Abi{
+        .{ .name = "arm64-v8a", .arch = .aarch64, .triple = "aarch64-linux-android" },
+        .{ .name = "x86_64", .arch = .x86_64, .triple = "x86_64-linux-android" },
+    }) |abi| {
+        const target = b.resolveTargetQuery(.{ .cpu_arch = abi.arch, .os_tag = .linux, .abi = .android, .android_api_level = android_min_api });
+        const lib_dir = b.fmt("{s}/usr/lib/{s}/{d}", .{ sysroot, abi.triple, android_min_api });
+        const libc = b.addWriteFiles().add(b.fmt("libc-{s}.txt", .{abi.name}), b.fmt(
+            \\include_dir={s}/usr/include
+            \\sys_include_dir={s}/usr/include/{s}
+            \\crt_dir={s}
+            \\cc_dir={s}
+            \\msvc_lib_dir=
+            \\kernel32_lib_dir=
+            \\darwin_sdk_dir=
+            \\
+        , .{ sysroot, sysroot, abi.triple, lib_dir, lib_dir }));
+        const core = b.createModule(.{
+            .root_source_file = b.path("src/core/core.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const routes = b.createModule(.{
+            .root_source_file = b.path("src/service/routes.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "core", .module = core }},
+        });
+        const lib = b.addLibrary(.{
+            .linkage = .dynamic,
+            .name = "blackwall",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/android/lib.zig"),
+                .target = target,
+                .optimize = optimize,
+                .strip = strip,
+                .link_libc = true,
+                .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "routes", .module = routes } },
+            }),
+        });
+        lib.setLibCFile(libc);
+        lib.root_module.addLibraryPath(.{ .cwd_relative = lib_dir });
+        lib.root_module.linkSystemLibrary("log", .{});
+        // devices with 16 KB pages load only libraries aligned for them
+        lib.link_z_max_page_size = 16384;
+        for (packs) |pack| pack.addPrefixedFileArg(b.fmt("{s}=", .{abi.name}), lib.getEmittedBin());
+    }
+    step.dependOn(&b.addInstallFileWithDir(outputs[0], .{ .custom = "package" }, b.fmt("BLACKWALL-{s}-android.apk", .{version})).step);
+    bundle_step.dependOn(&b.addInstallFileWithDir(outputs[1], .{ .custom = "package" }, b.fmt("BLACKWALL-{s}-android.aab", .{version})).step);
+}
+
+/// Android 10: the first release that tells a VPN who owns a connection.
+const android_min_api = 29;
+/// The NDK used when ANDROID_NDK_HOME does not name one.
+const android_ndk = "29.0.14206865";
 
 /// `zig build package -Dlang=.. -Doptimize=ReleaseSafe` → one release file in zig-out/package:
 ///   BLACKWALL-<version>-<lang>-macos-arm64.zip       (BLACKWALL.app with the service and
 ///                                                     the root helper, ad-hoc signed)
 ///   BLACKWALL-<version>-<lang>-windows-x86_64.exe    (single file, nothing to install)
 ///   BLACKWALL-<version>-<lang>-linux-x86_64.tar.gz
-/// Android is not built yet: the step fails there with a message.
+/// Android has its own step (`zig build android`, below).
 fn package(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -305,7 +420,7 @@ fn package(
             step.dependOn(&b.addInstallFileWithDir(exe.getEmittedBin(), .{ .custom = "package" }, b.fmt("{s}.exe", .{base})).step);
         },
         .linux => if (t.abi.isAndroid()) {
-            step.dependOn(&b.addFail("Android is not packaged yet").step);
+            step.dependOn(&b.addFail("Android is built by `zig build android`").step);
         } else {
             const tar = b.addSystemCommand(&.{ "tar", "-czf" });
             const archive = tar.addOutputFileArg(b.fmt("{s}.tar.gz", .{base}));

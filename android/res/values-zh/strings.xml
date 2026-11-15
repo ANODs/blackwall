@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="st_guard">VPN 已关闭 · 应用被拦截</string>
+    <string name="connect">连接</string>
+    <string name="disconnect">断开</string>
+    <string name="fastest">最快</string>
+    <string name="keys">密钥</string>
+    <string name="add_hint">订阅链接或密钥</string>
+    <string name="add">添加</string>
+    <string name="cancel">取消</string>
+    <string name="remove_q">删除“%s”及其服务器？</string>
+    <string name="remove">删除</string>
+    <string name="others">其他所有应用</string>
+    <string name="d_vpn">通过 VPN</string>
+    <string name="r_default">与其他应用相同</string>
+    <string name="r_vpn">仅通过 VPN</string>
+    <string name="r_direct">直连</string>
+    <string name="r_block">禁止联网</string>
+    <string name="n_added">已添加：%d</string>
+    <string name="n_added_skipped">已添加：%1$d · 已跳过：%2$d</string>
+    <string name="n_updated">服务器：%d</string>
+    <string name="n_updated_skipped">服务器：%1$d · 已跳过：%2$d</string>
+    <string name="n_failed">订阅未更新</string>
+    <string name="n_empty">未找到服务器</string>
+    <string name="n_start">VPN 无法启动</string>
+    <string name="s_failover">备用服务器</string>
+    <string name="s_failover_d">服务器无响应时先重连一次，然后切换到已加星标的服务器。绝不直连。</string>
+    <string name="s_guard">断开后继续拦截应用</string>
+    <string name="s_guard_d">设为“仅通过 VPN”或“禁止联网”的应用在 VPN 关闭期间无法联网。</string>
+    <string name="s_ipv6">IPv6</string>
+    <string name="s_ipv6_d">拦截：连接期间禁用 IPv6。隧道：经由服务器。系统：不经过 VPN。</string>
+    <string name="ipv6_block">拦截</string>
+    <string name="ipv6_tunnel">隧道</string>
+    <string name="ipv6_system">系统</string>
+    <string name="s_always">始终开启与断网保护</string>
+    <string name="s_always_d">Android 自身可在开机后保持 VPN 开启并拦截 VPN 之外的所有连接：请在系统设置中为 BLACKWALL 打开“始终开启的 VPN”和“屏蔽未使用 VPN 的所有连接”。</string>
+</resources>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- the mark: a bright stroke across the dark (assets/icon) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:pathData="M18,84 L90,24" android:strokeColor="#22FFFFFF" android:strokeWidth="9" android:strokeLineCap="round" />
+    <path android:pathData="M30,74 L78,34" android:strokeColor="#55FFFFFF" android:strokeWidth="6" android:strokeLineCap="round" />
+    <path android:pathData="M10,90.7 L98,17.3" android:strokeColor="#FFFFFF" android:strokeWidth="2.6" />
+</vector>

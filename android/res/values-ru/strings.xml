@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="st_guard">VPN выключен · приложения удержаны</string>
+    <string name="connect">Подключить</string>
+    <string name="disconnect">Отключить</string>
+    <string name="fastest">Самый быстрый</string>
+    <string name="keys">Ключи</string>
+    <string name="add_hint">Ссылка на подписку или ключи</string>
+    <string name="add">Добавить</string>
+    <string name="cancel">Отмена</string>
+    <string name="remove_q">Удалить «%s» и её серверы?</string>
+    <string name="remove">Удалить</string>
+    <string name="others">Все остальные приложения</string>
+    <string name="d_vpn">Через VPN</string>
+    <string name="r_default">Как остальные</string>
+    <string name="r_vpn">Только через VPN</string>
+    <string name="r_direct">Напрямую</string>
+    <string name="r_block">Без сети</string>
+    <string name="n_added">Добавлено: %d</string>
+    <string name="n_added_skipped">Добавлено: %1$d · пропущено: %2$d</string>
+    <string name="n_updated">Серверов: %d</string>
+    <string name="n_updated_skipped">Серверов: %1$d · пропущено: %2$d</string>
+    <string name="n_failed">Подписка не обновилась</string>
+    <string name="n_empty">Серверы не найдены</string>
+    <string name="n_start">VPN не удалось запустить</string>
+    <string name="s_failover">Резервные серверы</string>
+    <string name="s_failover_d">Если сервер перестал отвечать — одно переподключение, затем переход на серверы со звёздочкой. Никогда не напрямую.</string>
+    <string name="s_guard">Удерживать приложения после отключения</string>
+    <string name="s_guard_d">Приложения с правилом «Только через VPN» или «Без сети» остаются без сети, пока VPN выключен.</string>
+    <string name="s_ipv6">IPv6</string>
+    <string name="s_ipv6_d">Блокировать: без IPv6, пока VPN включён. Туннель: через сервер. Система: мимо VPN.</string>
+    <string name="ipv6_block">Блокировать</string>
+    <string name="ipv6_tunnel">Туннель</string>
+    <string name="ipv6_system">Система</string>
+    <string name="s_always">Постоянный VPN и блокировка</string>
+    <string name="s_always_d">Android сам держит VPN включённым с загрузки и блокирует всё мимо него: включите «Постоянная VPN» и «Блокировать соединения без VPN» для BLACKWALL в настройках системы.</string>
+</resources>

@@ -6,8 +6,11 @@ name: Release
 #   v<version>-ru  "BLACKWALL <version> — Русский"  notes: docs/releases/<version>/ru.md
 #   v<version>-zh  "BLACKWALL <version> — 中文"      notes: docs/releases/<version>/zh.md
 # The version is in build.zig.zon. Every language needs its own notes file, or nothing is published.
-# Platforms: macOS (arm64), Windows (x86_64), Linux (x86_64). Android comes later (needs the NDK
-# for SDL) — add it to the build matrix below once `zig build package` supports it.
+# Platforms: macOS (arm64), Windows (x86_64), Linux (x86_64), and one Android APK (arm64 and
+# x86_64, every language inside) attached to each of the three releases.
+# Android (docs/android.md): the APK must be signed with the same key in every release, so it is
+# built only when the secrets BLACKWALL_ANDROID_KEYSTORE (the keystore, base64),
+# BLACKWALL_ANDROID_KEYSTORE_PASS and BLACKWALL_ANDROID_KEYSTORE_ALIAS are set.
 # Auto-update (docs/updates.md): with the secret BLACKWALL_UPDATE_KEY and the variable
 # BLACKWALL_UPDATE_PUBKEY set, the apps are built with the updater and every file gets a
 # "<file>.sig". Without them the release is still built and published, without auto-update.
@@ -85,7 +88,6 @@ jobs:
           - { name: macos, runner: macos-latest, target: -Dcpu=apple_m1 }
           - { name: windows, runner: ubuntu-latest, target: -Dtarget=x86_64-windows }
           - { name: linux, runner: ubuntu-latest, target: -Dtarget=x86_64-linux-gnu }
-          # - { name: android, runner: ubuntu-latest, target: -Dtarget=aarch64-linux-android }
     runs-on: ${{ matrix.platform.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -112,9 +114,44 @@ jobs:
           path: zig-out/package/*
           if-no-files-found: error
 
+  # The runner's image has the Android SDK, an NDK and JDK 17. Without the keystore the job
+  # succeeds with nothing to upload, and the releases are published without Android.
+  android:
+    name: Build android
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEYSTORE: ${{ secrets.BLACKWALL_ANDROID_KEYSTORE != '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - if: env.HAS_KEYSTORE != 'true'
+        run: echo "::warning::BLACKWALL_ANDROID_KEYSTORE not set: this release has no Android package"
+      - uses: mlugg/setup-zig@v2
+        if: env.HAS_KEYSTORE == 'true'
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Package
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          KEYSTORE: ${{ secrets.BLACKWALL_ANDROID_KEYSTORE }}
+          BLACKWALL_ANDROID_KEYSTORE_PASS: ${{ secrets.BLACKWALL_ANDROID_KEYSTORE_PASS }}
+          BLACKWALL_ANDROID_KEYSTORE_ALIAS: ${{ secrets.BLACKWALL_ANDROID_KEYSTORE_ALIAS }}
+        run: |
+          printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
+          export BLACKWALL_ANDROID_KEYSTORE="$RUNNER_TEMP/release.jks"
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          zig build android -Doptimize=ReleaseSafe
+          rm -f "$RUNNER_TEMP/release.jks"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pkg-android
+          path: zig-out/package/*
+          if-no-files-found: ignore
+
   publish:
     name: Publish ${{ matrix.lang }}
-    needs: [version, build]
+    needs: [version, build, android]
     strategy:
       # one release after another, so "Latest" ends up on the English one
       max-parallel: 1
@@ -129,6 +166,12 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           pattern: pkg-${{ matrix.lang }}-*
+          path: dist
+          merge-multiple: true
+      # the same APK goes into every language's release (there is none without the keystore)
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: pkg-android
           path: dist
           merge-multiple: true
       - uses: mlugg/setup-zig@v2
