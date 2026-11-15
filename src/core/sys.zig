@@ -298,6 +298,7 @@ pub const Udp = struct {
 };
 
 test "connect with timeout to a closed and an open port" {
+    if (comptime !supported) return error.SkipZigTest; // connectTcp is for the systems the service runs on
     const io = std.testing.io;
     const lo = packet.v4(.{ 127, 0, 0, 1 });
     // an open port
