@@ -275,9 +275,6 @@ def build(offline: bool = False, releases: dict | None = None) -> dict:
             out.write_text(render(template, strings[lang], ctx))
 
     write_sitemap(base)
-    host = base.split('/')[2]
-    if not host.endswith('.github.io'):
-        (OUT / 'CNAME').write_text(host + '\n')  # the custom domain of GitHub Pages
     write_manifest(strings["en"])
     size = (OUT / "index.html").stat().st_size
     print(f"site: built {len(PAGES) * len(LANGS)} pages, v{releases['version']}, index.html {size / 1024:.1f} KB")

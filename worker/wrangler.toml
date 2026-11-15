@@ -1,11 +1,16 @@
 name = "blackwall-site"
 main = "src/index.js"
+workers_dev = false
+# the site's own domain: Cloudflare creates the DNS record and the certificate
+routes = [{ pattern = "blackwall.timoshkin.dev", custom_domain = true }]
 compatibility_date = "2026-01-01"
 
 [vars]
 REPO = "ANODs/blackwall"
 # the page's origin (no path); several are separated by commas
-ALLOWED_ORIGINS = "https://blackwall.timoshkin.dev"
+ALLOWED_ORIGINS = "https://blackwall.timoshkin.dev,https://anods.github.io"
+# where GitHub Pages publishes the site
+PAGES_ORIGIN = "https://anods.github.io/blackwall"
 
 # secrets, set with `wrangler secret put <NAME>`:
 #   STATS_KEY     the key the statistics page asks for; without it /stats is open to everyone
@@ -14,7 +19,7 @@ ALLOWED_ORIGINS = "https://blackwall.timoshkin.dev"
 [[d1_databases]]
 binding = "DB"
 database_name = "blackwall-site"
-database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+database_id = "9ab19fc6-646f-431e-aa7e-2383e796f1c9"
 
 [triggers]
 crons = ["17 3 * * *"]

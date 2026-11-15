@@ -5,3 +5,4 @@ zig-pkg/
 _site/
 worker/.wrangler/
 worker/node_modules/
+worker/.stats-key

@@ -1,6 +1,6 @@
 {
   "base_url": "https://blackwall.timoshkin.dev/",
   "repo": "ANODs/blackwall",
-  "worker_url": "",
+  "worker_url": "https://blackwall.timoshkin.dev/api",
   "fallback_sizes_mb": { "mac": 5.2 }
 }

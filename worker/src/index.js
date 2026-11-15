@@ -1,5 +1,8 @@
 // The landing page's only backend: a Cloudflare Worker with one D1 database.
 //
+// On the site's domain these are under /api; every other path is the site, passed on from
+// GitHub Pages (PAGES_ORIGIN).
+//
 //   POST /hit        a page view or a download click, sent by the page with sendBeacon
 //   GET  /releases   the latest release, its files and the download counts, from GitHub (cached 5 min)
 //   GET  /stats      the aggregates the statistics page draws (needs STATS_KEY when that secret is set)
@@ -134,10 +137,31 @@ async function stats(req, env) {
   return json({ days: n, daily, top, totals: { views: sum('views'), uniques: sum('uniques'), dl: sum('dl') } }, 200, { 'Cache-Control': 'no-store', ...cors(req, env) });
 }
 
+// The site is built and published by GitHub Pages; this hands it out under the site's own
+// domain. Redirects GitHub answers with (a missing trailing slash) are pointed back here.
+async function pages(req, env, url) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return new Response('method not allowed', { status: 405 });
+  const origin = env.PAGES_ORIGIN.replace(/\/$/, ''), prefix = new URL(origin).pathname;
+  const headers = {};
+  for (const k of ['Accept', 'Accept-Language', 'If-None-Match', 'If-Modified-Since', 'Range', 'User-Agent']) {
+    const v = req.headers.get(k);
+    if (v) headers[k] = v;
+  }
+  const r = await fetch(origin + url.pathname + url.search, { method: req.method, headers, redirect: 'manual' });
+  const out = new Headers(r.headers);
+  const loc = out.get('Location');
+  if (loc) out.set('Location', loc.startsWith(origin) ? url.origin + loc.slice(origin.length) : loc.startsWith(prefix + '/') ? loc.slice(prefix.length) : loc);
+  return new Response(r.body, { status: r.status, headers: out });
+}
+
 export default {
   async fetch(req, env, ctx) {
-    const { pathname } = new URL(req.url);
+    const url = new URL(req.url);
+    let pathname = url.pathname;
     try {
+      // on the site's own domain the API lives under /api, everything else is the site itself
+      if (pathname.startsWith('/api/')) pathname = pathname.slice(4);
+      else if (env.PAGES_ORIGIN) return await pages(req, env, url);
       if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors(req, env), 'Access-Control-Max-Age': '86400' } });
       if (pathname === '/hit' && req.method === 'POST') return await hit(req, env);
       if (pathname === '/releases' && req.method === 'GET') return await releases(req, env, ctx);

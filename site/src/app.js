@@ -327,7 +327,7 @@ function drawWall(now, dt) {
 
   if (open > 0.01) {
     const gl = c.createRadialGradient(cx, wallY + 22, 0, cx, wallY + 22, 170);
-    gl.addColorStop(0, 'rgba(242,242,243,' + (0.11 * open).toFixed(3) + ')');
+    gl.addColorStop(0, 'rgba(242,242,243,' + (0.08 * open).toFixed(3) + ')');
     gl.addColorStop(1, 'rgba(242,242,243,0)');
     c.fillStyle = gl; c.fillRect(cx - 170, wallY - 150, 340, 340);
   }
@@ -371,13 +371,13 @@ function drawWall(now, dt) {
   for (const st of streams) {
     const vpn = st.type === 'vpn';
     c.strokeStyle = st.type === 'direct' ? grey : white;
-    c.globalAlpha = shown * (vpn ? 0.07 + 0.09 * open : st.type === 'direct' ? 0.2 : 0.05);
+    c.globalAlpha = shown * (vpn ? 0.035 + 0.05 * open : st.type === 'direct' ? 0.1 : 0.03);
     c.beginPath();
     const last = vpn ? st.pts.length - 2 : st.pts.length - 1;
     for (let i = 0; i <= last; i++) i ? c.lineTo(st.pts[i][0], st.pts[i][1]) : c.moveTo(st.pts[0][0], st.pts[0][1]);
     c.stroke();
     if (vpn && open > 0.01) {
-      c.globalAlpha = shown * 0.3 * open;
+      c.globalAlpha = shown * 0.2 * open;
       c.beginPath(); c.moveTo(st.pts[last][0], st.pts[last][1]); c.lineTo(st.pts[last + 1][0], st.pts[last + 1][1]); c.stroke();
     }
   }
@@ -395,8 +395,8 @@ function drawWall(now, dt) {
       if (p.s - p.l > limit) { Object.assign(p, pulse(st)); continue; }
       if (p.s <= 0) continue;
       const head = Math.min(p.s, limit), from = Math.max(0, p.s - p.l);
-      const a = p.a * shown * (st.type === 'direct' ? 0.5 : st.type === 'block' ? 0.55 : 0.6 + 0.4 * open);
-      lit(st, from, head, rgb, a, 1.5);
+      const a = p.a * shown * (st.type === 'direct' ? 0.26 : st.type === 'block' ? 0.3 : 0.34 + 0.24 * open);
+      lit(st, from, head, rgb, a, 1.2);
       if (p.s >= limit && limit === st.wall) {
         // stopped by the wall: a short mark, red for a blocked stream
         const e = st.pts[vpn ? st.pts.length - 2 : st.pts.length - 1], k = clamp(1 - (p.s - limit) / p.l, 0, 1);
