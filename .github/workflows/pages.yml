@@ -1,0 +1,45 @@
+name: Site
+
+# Builds site/ into _site/ with tools/site.py and publishes it on GitHub Pages
+# (Settings -> Pages -> Source: GitHub Actions).
+# It runs when the page changes, after every release (so the download buttons point at
+# the new files) and once a day (so the download counter moves without a release).
+
+on:
+  push:
+    branches: [main]
+    paths: ['site/**', 'tools/site.py', 'build.zig.zon', 'docs/screens/2-connect-on.png', '.github/workflows/pages.yml']
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/site.py
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -2,3 +2,6 @@ zig-out/
 .zig-cache/
 zig-pkg/
 .DS_Store
+_site/
+worker/.wrangler/
+worker/node_modules/

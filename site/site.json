@@ -1,0 +1,6 @@
+{
+  "base_url": "https://anods.github.io/blackwall/",
+  "repo": "ANODs/blackwall",
+  "worker_url": "",
+  "fallback_sizes_mb": { "mac": 5.2 }
+}

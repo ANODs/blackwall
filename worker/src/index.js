@@ -1,0 +1,158 @@
+// The landing page's only backend: a Cloudflare Worker with one D1 database.
+//
+//   POST /hit        a page view or a download click, sent by the page with sendBeacon
+//   GET  /releases   the latest release, its files and the download counts, from GitHub (cached 5 min)
+//   GET  /stats      the aggregates the statistics page draws (needs STATS_KEY when that secret is set)
+//
+// What is kept: counters per day (views, visitors, country, page language, system, device,
+// referrer host, downloads). What is not: addresses, user agents, cookies, anything per person.
+// A visitor is told apart for one day by sha256(day salt + address + user agent); the salt is
+// random, lives for that day only, and is deleted with the hashes by the nightly cron.
+
+const LANGS = ['en', 'ru', 'zh'];
+const SYSTEMS = { mac: 'macos-arm64.zip', win: 'windows-x86_64.exe', linux: 'linux-x86_64.tar.gz' };
+const OS = ['mac', 'win', 'linux', 'ios', 'android', 'other'];
+const BOT = /bot|crawl|spider|slurp|preview|headless|lighthouse|monitor|curl|wget|python|scrapy/i;
+const TOP = ['country', 'lang', 'os', 'device', 'ref', 'dl'];
+
+const day = (offset = 0) => new Date(Date.now() - offset * 864e5).toISOString().slice(0, 10);
+
+function origins(env) {
+  return (env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+function allowed(req, env) {
+  const o = req.headers.get('Origin') || '';
+  return origins(env).includes(o) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(o) ? o : '';
+}
+function cors(req, env) {
+  const o = allowed(req, env);
+  return o ? { 'Access-Control-Allow-Origin': o, 'Access-Control-Allow-Headers': 'Authorization', Vary: 'Origin' } : {};
+}
+const json = (body, status, headers) =>
+  new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', ...headers } });
+
+let saltCache = { day: '', value: '' };
+async function salt(env, today) {
+  if (saltCache.day === today) return saltCache.value;
+  const fresh = crypto.randomUUID() + crypto.randomUUID();
+  await env.DB.prepare('INSERT OR IGNORE INTO salts(day, v) VALUES(?, ?)').bind(today, fresh).run();
+  const row = await env.DB.prepare('SELECT v FROM salts WHERE day = ?').bind(today).first();
+  saltCache = { day: today, value: row.v };
+  return row.v;
+}
+async function sha(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf).slice(0, 12), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function hit(req, env) {
+  if (!allowed(req, env)) return new Response(null, { status: 403 });
+  const ua = req.headers.get('User-Agent') || '';
+  if (!ua || BOT.test(ua)) return new Response(null, { status: 204 });
+  let e;
+  try { e = JSON.parse((await req.text()).slice(0, 1024)); } catch (err) { return new Response(null, { status: 400 }); }
+  const lang = LANGS.includes(e.l) ? e.l : 'en';
+  const os = OS.includes(e.o) ? e.o : 'other';
+  const today = day();
+  const bump = (dim, key) =>
+    env.DB.prepare('INSERT INTO counts(day, dim, key, n) VALUES(?, ?, ?, 1) ON CONFLICT(day, dim, key) DO UPDATE SET n = n + 1')
+      .bind(today, dim, key);
+
+  if (e.t === 'dl') {
+    if (!(os in SYSTEMS)) return new Response(null, { status: 204 });
+    await env.DB.batch([bump('dl', os), bump('dl_lang', lang), bump('dls', 'all')]);
+    return new Response(null, { status: 204 });
+  }
+  if (e.t !== 'view') return new Response(null, { status: 400 });
+
+  const page = typeof e.p === 'string' && /^\/[\w\-/]{0,40}$/.test(e.p) ? e.p : '/';
+  const ref = typeof e.r === 'string' && /^[a-z0-9.\-]{1,64}$/i.test(e.r) ? e.r.toLowerCase().replace(/^www\./, '') : '';
+  const country = (req.cf && req.cf.country) || 'XX';
+  const device = /Mobi|Android|iPhone|iPad/i.test(ua) ? 'mobile' : 'desktop';
+
+  const h = await sha((await salt(env, today)) + '|' + (req.headers.get('CF-Connecting-IP') || '') + '|' + ua);
+  const seen = await env.DB.prepare('INSERT OR IGNORE INTO seen(day, h) VALUES(?, ?)').bind(today, h).run();
+  const batch = [bump('views', 'all'), bump('page', page), bump('lang', lang), bump('os', os), bump('device', device), bump('country', country)];
+  if (ref) batch.push(bump('ref', ref));
+  if (seen.meta.changes === 1) batch.push(bump('uniques', 'all'));
+  await env.DB.batch(batch);
+  return new Response(null, { status: 204 });
+}
+
+// GitHub's release list -> {version, files[lang][system], downloads}. Same shape as tools/site.py.
+function normalize(releases) {
+  const downloads = { total: 0, mac: 0, win: 0, linux: 0 };
+  const newer = (a, b) => { const x = a.split('.').map(Number), y = b.split('.').map(Number); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]; return false; };
+  let best = null, files = {};
+  for (const rel of releases) {
+    const m = /^v(\d+\.\d+\.\d+)-(en|ru|zh)$/.exec(rel.tag_name || '');
+    if (!m || rel.draft || rel.prerelease) continue;
+    for (const asset of rel.assets || []) {
+      const system = Object.keys(SYSTEMS).find(s => asset.name.endsWith('-' + SYSTEMS[s]));
+      if (!system) continue;
+      downloads[system] += asset.download_count || 0;
+      downloads.total += asset.download_count || 0;
+      if (best === null || newer(m[1], best)) { best = m[1]; files = {}; }
+      if (m[1] === best) (files[m[2]] = files[m[2]] || {})[system] = { url: asset.browser_download_url, size: asset.size };
+    }
+  }
+  if (best === null || LANGS.some(l => Object.keys(SYSTEMS).some(s => !(files[l] && files[l][s])))) return null;
+  return { version: best, files, downloads };
+}
+
+async function releases(req, env, ctx) {
+  const cacheKey = new Request(new URL('/releases', req.url).toString());
+  const cache = caches.default;
+  let body = await cache.match(cacheKey).then(r => r && r.text());
+  if (!body) {
+    const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'site-worker' };
+    if (env.GITHUB_TOKEN) headers.Authorization = 'Bearer ' + env.GITHUB_TOKEN;
+    const r = await fetch(`https://api.github.com/repos/${env.REPO}/releases?per_page=100`, { headers });
+    const data = r.ok ? normalize(await r.json()) : null;
+    if (!data) return json({ error: 'no releases' }, 502, cors(req, env));
+    body = JSON.stringify(data);
+    ctx.waitUntil(cache.put(cacheKey, new Response(body, { headers: { 'Cache-Control': 'public, max-age=300' } })));
+  }
+  return new Response(body, { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=300', ...cors(req, env) } });
+}
+
+async function stats(req, env) {
+  if (env.STATS_KEY && req.headers.get('Authorization') !== 'Bearer ' + env.STATS_KEY) return json({ error: 'key' }, 401, cors(req, env));
+  const n = Math.min(365, Math.max(1, parseInt(new URL(req.url).searchParams.get('days'), 10) || 30));
+  const from = day(n - 1);
+  const [dailyRows, topRows] = await env.DB.batch([
+    env.DB.prepare("SELECT day, dim, SUM(n) AS n FROM counts WHERE day >= ? AND dim IN ('views', 'uniques', 'dls') GROUP BY day, dim").bind(from),
+    env.DB.prepare(`SELECT dim, key, SUM(n) AS n FROM counts WHERE day >= ? AND dim IN (${TOP.map(() => '?').join(',')}) GROUP BY dim, key ORDER BY n DESC`).bind(from, ...TOP),
+  ]);
+  const byDay = {};
+  for (let i = n - 1; i >= 0; i--) byDay[day(i)] = { day: day(i), views: 0, uniques: 0, dl: 0 };
+  for (const r of dailyRows.results) if (byDay[r.day]) byDay[r.day][r.dim === 'dls' ? 'dl' : r.dim] = r.n;
+  const daily = Object.values(byDay);
+  const top = Object.fromEntries(TOP.map(d => [d, []]));
+  for (const r of topRows.results) if (top[r.dim].length < 12) top[r.dim].push([r.key, r.n]);
+  const sum = k => daily.reduce((a, d) => a + d[k], 0);
+  return json({ days: n, daily, top, totals: { views: sum('views'), uniques: sum('uniques'), dl: sum('dl') } }, 200, { 'Cache-Control': 'no-store', ...cors(req, env) });
+}
+
+export default {
+  async fetch(req, env, ctx) {
+    const { pathname } = new URL(req.url);
+    try {
+      if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors(req, env), 'Access-Control-Max-Age': '86400' } });
+      if (pathname === '/hit' && req.method === 'POST') return await hit(req, env);
+      if (pathname === '/releases' && req.method === 'GET') return await releases(req, env, ctx);
+      if (pathname === '/stats' && req.method === 'GET') return await stats(req, env);
+      return new Response('not found', { status: 404 });
+    } catch (e) {
+      return json({ error: 'internal' }, 500, cors(req, env));
+    }
+  },
+  // nightly: yesterday's visitor hashes and salts are no longer needed
+  async scheduled(event, env) {
+    const today = day();
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM seen WHERE day < ?').bind(today),
+      env.DB.prepare('DELETE FROM salts WHERE day < ?').bind(today),
+    ]);
+  },
+};

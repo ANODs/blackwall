@@ -1,0 +1,20 @@
+name = "blackwall-site"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+REPO = "ANODs/blackwall"
+# the page's origin (no path); several are separated by commas
+ALLOWED_ORIGINS = "https://anods.github.io"
+
+# secrets, set with `wrangler secret put <NAME>`:
+#   STATS_KEY     the key the statistics page asks for; without it /stats is open to everyone
+#   GITHUB_TOKEN  optional, raises GitHub's rate limit for /releases
+
+[[d1_databases]]
+binding = "DB"
+database_name = "blackwall-site"
+database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+
+[triggers]
+crons = ["17 3 * * *"]
