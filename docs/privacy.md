@@ -1,0 +1,42 @@
+# Privacy policy
+
+BLACKWALL is a VPN client: it connects your device to servers **you** add, by a
+subscription link or by keys. It does not come with servers and has no accounts.
+
+**The developer of BLACKWALL receives nothing from the app.** There is no analytics,
+no advertising, no crash reporting and no tracking in it, on any platform.
+
+## What stays on your device
+
+- Your subscription links, server keys, per-application routes and settings. They are
+  stored in the app's private folder and are not included in device backups on Android.
+- Traffic counters and the connection log, kept only to show them to you.
+
+## What the app sends, and where
+
+- **Your traffic** goes to the VPN server you chose, encrypted by that server's
+  protocol (VLESS with REALITY or TLS, Trojan, VMess, Shadowsocks). What the server's
+  operator does with it is governed by their policy, not this one.
+- **Your subscription link** is requested from the provider that gave it to you, to
+  refresh the server list.
+- **Name lookups for the server's own address** go to your network's resolver and, when
+  it does not answer, to public resolvers (8.8.8.8, 1.1.1.1, 9.9.9.9).
+- **A connectivity check**: through the VPN server, the app asks
+  `www.gstatic.com/generate_204` for an empty page to see whether the server carries
+  traffic. Nothing about you is in that request.
+- **Updates** (desktop only): the app asks GitHub which release is the latest and
+  downloads it from there. GitHub sees your IP address, as with any download.
+
+## Android: why the app is a VPN
+
+On Android the app uses the system's `VpnService` to carry the traffic of your
+applications to the server you chose; that is its whole purpose. To apply a different
+route to a particular application it asks Android which application owns a connection.
+The list of installed applications is read to let you pick them, and never leaves the
+device.
+
+## Changes and contact
+
+Changes to this policy appear in this file, with the history kept by the repository:
+<https://github.com/ANODs/blackwall/commits/main/docs/privacy.md>. Questions:
+<https://github.com/ANODs/blackwall/issues>.
