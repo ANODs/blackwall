@@ -51,6 +51,7 @@ test {
     _ = tunnel;
     _ = failover;
     _ = ipc;
+    _ = helper_ipc;
     _ = ipstack.packet;
     _ = ipstack.stack;
     _ = ipstack.dns;

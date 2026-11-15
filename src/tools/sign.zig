@@ -2,10 +2,14 @@
 //!   blackwall-sign keygen          new key pair: seed (secret) and public key, base64
 //!   blackwall-sign sign <file>...  writes <file>.sig; seed from $BLACKWALL_UPDATE_KEY
 //!   blackwall-sign verify <file>...  checks <file>.sig against $BLACKWALL_UPDATE_PUBKEY
+//!   blackwall-sign sign-helper <release> <helper> <out.sig>
+//!                                  signs the root helper for its self-update (see
+//!                                  core/helper_ipc.zig); seed from $BLACKWALL_UPDATE_KEY
 //! The seed never appears on the command line, so it stays out of CI logs.
 
 const std = @import("std");
 const update = @import("update");
+const helper_ipc = @import("core").helper_ipc;
 const Ed25519 = std.crypto.sign.Ed25519;
 const b64 = std.base64.standard;
 
@@ -27,7 +31,18 @@ pub fn main(init: std.process.Init) !void {
         for (files) |f| try verifyFile(init.gpa, init.io, key, f);
         return;
     }
-    fail("usage: blackwall-sign keygen | sign <file>... | verify <file>...");
+    if (std.mem.eql(u8, cmd, "sign-helper") and files.len == 3) {
+        const kp = try keyPair(init.environ_map.get("BLACKWALL_UPDATE_KEY") orelse fail("BLACKWALL_UPDATE_KEY is not set"));
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, files[1], init.gpa, .limited(64 << 20));
+        defer init.gpa.free(bytes);
+        var buf: [b64.Encoder.calcSize(Ed25519.Signature.encoded_length)]u8 = undefined;
+        const sig = try helper_ipc.signHelper(init.io, kp, files[0], bytes, &buf);
+        const text = try std.fmt.allocPrint(init.gpa, "{s}\n{s}\n", .{ files[0], sig });
+        defer init.gpa.free(text);
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = files[2], .data = text });
+        return;
+    }
+    fail("usage: blackwall-sign keygen | sign <file>... | verify <file>... | sign-helper <release> <helper> <out.sig>");
 }
 
 fn fail(msg: []const u8) noreturn {

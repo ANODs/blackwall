@@ -29,6 +29,7 @@ const pf = @import("darwin/pf.zig");
 const proc = @import("darwin/proc.zig");
 
 const proto = core.helper_ipc;
+const build_options = @import("build_options");
 const c = std.c;
 const Io = std.Io;
 const log = std.log.scoped(.helper);
@@ -118,6 +119,17 @@ const Helper = struct {
         } else if (std.mem.eql(u8, req.cmd, "hold")) {
             setHold(h.io, req.hold);
             h.reply(conn, a, .{ .ok = true }, null);
+        } else if (std.mem.eql(u8, req.cmd, "upgrade")) {
+            h.upgrade(a, req) catch |err| {
+                log.warn("upgrade refused: {t}", .{err});
+                return h.reply(conn, a, .{ .@"error" = @errorName(err) }, null);
+            };
+            h.reply(conn, a, .{ .ok = true }, null);
+            // launchd starts the new helper; with the hold from boot on, it
+            // takes the traffic back at once
+            log.info("replaced by a newer signed helper; restarting", .{});
+            h.down();
+            std.process.exit(0);
         } else if (std.mem.eql(u8, req.cmd, "servers")) {
             h.setServers(a, req) catch |err| return h.reply(conn, a, .{ .@"error" = @errorName(err) }, null);
             h.reply(conn, a, .{ .ok = true }, null);
@@ -224,6 +236,18 @@ const Helper = struct {
             .dns = dns_list.items,
             .killswitch = @tagName(h.killswitch),
         };
+    }
+
+    /// Replace this helper's file with a newer one that the release key
+    /// signed. Nothing of the caller's is trusted or run: the bytes are
+    /// read once, checked, and written by us.
+    fn upgrade(h: *Helper, a: std.mem.Allocator, req: proto.Request) !void {
+        if (!std.fs.path.isAbsolute(req.path)) return error.BadPath;
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(h.io, req.path, a, .limited(16 << 20));
+        try checkUpgrade(build_options.update_pubkey, build_options.version, req.sig, bytes);
+        const tmp = proto.install_path ++ ".new";
+        try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = tmp, .data = bytes, .flags = .{ .permissions = .fromMode(0o755) } });
+        try std.Io.Dir.rename(.cwd(), tmp, .cwd(), proto.install_path, h.io);
     }
 
     /// One step of the hold from boot: capture as soon as there is a
@@ -607,6 +631,42 @@ fn serve(h: *Helper) !void {
         if (uid != h.allow_uid and uid != 0) continue;
         h.handle(fd);
     }
+}
+
+/// Whether `bytes` may replace a helper of release `own` built with the
+/// public key `key`: signed by that key as a helper, and not older.
+fn checkUpgrade(key: []const u8, own: []const u8, sig_text: []const u8, bytes: []const u8) !void {
+    // a build without the key (every local build) trusts nobody's signature
+    if (key.len == 0) return error.UnsignedBuild;
+    const signed = proto.Signed.parse(sig_text) orelse return error.BadSignature;
+    try proto.verifyHelper(key, signed, bytes);
+    const theirs = std.SemanticVersion.parse(signed.version) catch return error.BadSignature;
+    const ours = std.SemanticVersion.parse(own) catch return error.BadVersion;
+    // an older helper, however well signed, may be the one with the bug
+    if (theirs.order(ours) == .lt) return error.OlderRelease;
+}
+
+test "only a newer helper signed by the release key replaces this one" {
+    const Ed = std.crypto.sign.Ed25519;
+    const enc = std.base64.standard.Encoder;
+    const kp = try Ed.KeyPair.generateDeterministic(@splat(5));
+    var key_buf: [enc.calcSize(Ed.PublicKey.encoded_length)]u8 = undefined;
+    const key = enc.encode(&key_buf, &kp.public_key.toBytes());
+    const Sig = struct {
+        fn file(buf: []u8, pair: Ed.KeyPair, release: []const u8, bytes: []const u8) ![]const u8 {
+            var b: [enc.calcSize(Ed.Signature.encoded_length)]u8 = undefined;
+            return std.fmt.bufPrint(buf, "{s}\n{s}\n", .{ release, try proto.signHelper(std.testing.io, pair, release, bytes, &b) });
+        }
+    };
+    var buf: [200]u8 = undefined;
+    try checkUpgrade(key, "0.1.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "new helper");
+    try checkUpgrade(key, "0.2.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "new helper");
+    try std.testing.expectError(error.OlderRelease, checkUpgrade(key, "0.3.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "new helper"));
+    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "other bytes"));
+    const stranger = try Ed.KeyPair.generateDeterministic(@splat(6));
+    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", try Sig.file(&buf, stranger, "0.2.0", "new helper"), "new helper"));
+    try std.testing.expectError(error.UnsignedBuild, checkUpgrade("", "0.1.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "new helper"));
+    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", "garbage", "new helper"));
 }
 
 /// Remember (across reboots) whether traffic is held from boot.

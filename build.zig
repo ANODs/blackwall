@@ -166,7 +166,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/tools/sign.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "update", .module = update }},
+            .imports = &.{ .{ .name = "update", .module = update }, .{ .name = "core", .module = core } },
         }),
     });
     b.installArtifact(sign);
@@ -195,7 +195,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     }) })).step);
 
-    package(b, exe, service, helper, lang, version, target.result);
+    package(b, exe, service, helper, sign, update_pubkey.len > 0, lang, version, target.result);
 }
 
 /// `zig build package -Dlang=.. -Doptimize=ReleaseSafe` → one release file in zig-out/package:
@@ -209,6 +209,9 @@ fn package(
     exe: *std.Build.Step.Compile,
     service: ?*std.Build.Step.Compile,
     helper: ?*std.Build.Step.Compile,
+    /// the signing tool, and whether this build carries the update key
+    sign_tool: *std.Build.Step.Compile,
+    updater: bool,
     lang: Lang,
     version: []const u8,
     t: std.Target,
@@ -270,6 +273,21 @@ fn package(
                 sign_part.has_side_effects = true;
                 sign_part.step.dependOn(&installed.step);
                 sign.step.dependOn(&sign_part.step);
+                // A release signs the helper with the update key (the seed is in
+                // the environment), so an installed helper can replace itself
+                // with this one without the administrator (core/helper_ipc.zig).
+                // Signed as it ships: after its own code signature, before the
+                // bundle is sealed.
+                if (part == helper.? and updater and b.graph.environ_map.get("BLACKWALL_UPDATE_KEY") != null) {
+                    const sig = b.addRunArtifact(sign_tool);
+                    sig.addArgs(&.{ "sign-helper", version });
+                    sig.addFileArg(b.graph.path(.install_prefix, b.fmt("{s}/Contents/MacOS/{s}", .{ app_dir, part.out_filename })));
+                    sig.addFileArg(b.graph.path(.install_prefix, app_dir ++ "/Contents/Resources/blackwall-helper.sig"));
+                    sig.has_side_effects = true;
+                    sig.step.dependOn(&sign_part.step);
+                    sig.step.dependOn(&icns.step); // the Resources folder exists
+                    sign.step.dependOn(&sig.step);
+                }
             }
             const zip = b.addSystemCommand(&.{ "/usr/bin/ditto", "-c", "-k", "--norsrc", "--noextattr", "--keepParent" });
             zip.addDirectoryArg(b.graph.path(.install_prefix, app_dir));

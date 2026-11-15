@@ -94,6 +94,10 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - name: Package
         shell: bash
+        env:
+          # the macOS package signs the root helper inside the app with it, so installed
+          # helpers can replace themselves without the administrator (docs/updates.md)
+          BLACKWALL_UPDATE_KEY: ${{ secrets.BLACKWALL_UPDATE_KEY }}
         run: |
           update=()
           if [ -n "$UPDATE_PUBKEY" ] && [ "$HAS_UPDATE_KEY" = true ]; then

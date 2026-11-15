@@ -36,6 +36,17 @@ key needs a new build, which users install by hand once. **Leaking the seed** le
 who can also publish to this repository's releases ship code to every install: rotate the
 key (new pair, new manual release) and revoke whoever had access.
 
+## The root helper updates itself
+
+On macOS the app installs a small root helper once, with the administrator's password. A
+release also signs that helper (`blackwall-sign sign-helper`, during the macOS package step;
+the signature is `Contents/Resources/blackwall-helper.sig`). When a newer app finds an older
+helper running, it hands the helper its own copy and that signature; the helper checks the
+signature with the public key it was built with, refuses anything older than itself, writes
+the new file itself and restarts. So the password is asked once per installation, not once
+per helper change. Builds without the key (every local build) cannot do this and ask for the
+password instead.
+
 ## How a release gets signed
 
 `release.yml`, on a `vX.Y.Z` tag:

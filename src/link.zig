@@ -485,6 +485,14 @@ pub const Link = struct {
             .unresponsive => return error.HelperNotResponding,
             .missing, .outdated => {},
         }
+        // a helper from a release replaces itself with this app's newer
+        // signed one: no administrator, also for automatic starts
+        if (l.upgradeHelper()) {
+            for (0..50) |_| {
+                if (l.helperState() == .current) return;
+                l.io.sleep(.fromMilliseconds(200), .awake) catch {};
+            }
+        }
         if (!interactive) return error.NeedsAdministrator;
         try l.installHelper();
         // launchd starts it right away; give it a moment to listen
@@ -493,6 +501,29 @@ pub const Link = struct {
             l.io.sleep(.fromMilliseconds(200), .awake) catch {};
         }
         return error.HelperNotAnswering;
+    }
+
+    /// Ask the installed helper to replace itself with the one in this app,
+    /// which works when both come from releases (the helper checks the
+    /// signature next to it). False when there is nothing to offer or the
+    /// helper says no; the administrator prompt remains the other way.
+    fn upgradeHelper(l: *Link) bool {
+        var bin_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var sig_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const bin = std.fmt.bufPrint(&bin_buf, "{s}/blackwall-helper", .{l.bin_dir}) catch return false;
+        const sig_path = std.fmt.bufPrint(&sig_buf, "{s}/../Resources/" ++ helper.sig_file, .{l.bin_dir}) catch return false;
+        const sig = std.Io.Dir.cwd().readFileAlloc(l.io, sig_path, l.gpa, .limited(1024)) catch return false;
+        defer l.gpa.free(sig);
+        const line = std.json.Stringify.valueAlloc(l.gpa, .{ .cmd = "upgrade", .path = bin, .sig = sig }, .{}) catch return false;
+        defer l.gpa.free(line);
+        const req = std.mem.concat(l.gpa, u8, &.{ line, "\n" }) catch return false;
+        defer l.gpa.free(req);
+        const answer = ipc.request(l.gpa, l.io, helper.socket_path, req, 10_000) catch return false;
+        defer l.gpa.free(answer);
+        const r = std.json.parseFromSlice(helper.Reply, l.gpa, answer, .{ .ignore_unknown_fields = true }) catch return false;
+        defer r.deinit();
+        if (!r.value.ok) log.info("helper keeps its version: {s}", .{r.value.@"error"});
+        return r.value.ok;
     }
 
     fn installHelper(l: *Link) !void {
