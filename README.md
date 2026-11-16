@@ -122,10 +122,12 @@ of its own there, and the window and the tray have not been through a real deskt
 | VLESS | REALITY (with Vision), TLS, none | TCP, WebSocket, HTTPUpgrade, gRPC, XHTTP |
 | Trojan | TLS, REALITY | TCP, WebSocket, HTTPUpgrade, gRPC, XHTTP |
 | VMess (AEAD) | TLS, REALITY, none | TCP, WebSocket, HTTPUpgrade, gRPC, XHTTP |
-| Shadowsocks | AEAD (AES-GCM, ChaCha20) and 2022 (BLAKE3) | TCP |
+| Shadowsocks | AEAD (AES-GCM, ChaCha20) and 2022 (BLAKE3) | TCP, UDP |
 
 Every combination above is checked against a real [Xray](https://github.com/XTLS/Xray-core)
-server: a download, an upload and a small request per link. Link formats understood:
+server: a download, an upload and a small request per link. UDP goes through every
+protocol and is checked the same way, a datagram and a DNS query per protocol
+(`blackwall-proxy udp <link> <ip:port>`). Link formats understood:
 `vless://`, `trojan://`, `ss://`, `vmess://` (both the base64 JSON and the URL form), and
 Xray JSON subscriptions.
 
@@ -386,8 +388,10 @@ docs/                      updates, Android, release notes
 - Android: no automatic updates, no pinned server per application in the interface yet,
   and with "Block connections without VPN" on, Android itself cuts off the applications
   set to Direct.
-- UDP is carried over VLESS only; over Trojan, VMess and Shadowsocks it is dropped.
-  QUIC from proxied applications is dropped on purpose so that browsers fall back to TCP.
+- QUIC from proxied applications is dropped on purpose so that browsers fall back to TCP.
+  Other UDP goes through every protocol (XUDP over VLESS and VMess, UDP associations over
+  Trojan, Shadowsocks UDP), except Shadowsocks 2022 through a relay (identity headers),
+  where it is dropped.
 - XHTTP supports the stream-one mode.
 - "DPI bypass" is listed as a route but not implemented; it behaves like Direct.
 - A changed route applies to new connections; open ones finish on the route they started

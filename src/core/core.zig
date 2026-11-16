@@ -20,6 +20,7 @@ pub const xudp = @import("xudp.zig");
 pub const sys = @import("sys.zig");
 pub const wintun = @import("wintun.zig");
 pub const win_scm = @import("win_scm.zig");
+pub const udp_out = @import("udp_out.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const failover = @import("failover.zig");
 pub const ipc = @import("ipc.zig");

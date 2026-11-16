@@ -782,6 +782,249 @@ fn identityHeader(m: Method, psk: []const u8, salt: []const u8, next: []const u8
 
 // ---------------------------------------------------------------- tests
 
+// ---------------------------------------------------------------- UDP
+
+/// Shadowsocks UDP: every datagram is sealed on its own and goes to the
+/// server's UDP port, naming its peer inside, so one socket carries one
+/// application socket to any number of peers.
+///
+///   AEAD:  [salt][sealed: address, payload][tag]; the subkey comes from a
+///          new salt in every packet, the nonce is zero.
+///   2022 with AES (SIP022): [separate header, one AES block under the
+///          PSK: session id 8, packet id 8][sealed body][tag]; the body
+///          under the session's subkey (BLAKE3 of the PSK and the session
+///          id), its nonce the header's last 12 bytes. Body: type (0 from
+///          the client, 1 from the server), timestamp, for the server our
+///          session id, padding length and padding, address, payload.
+///   2022 with ChaCha: [random nonce 24][XChaCha20-Poly1305 under the PSK
+///          of: session id, packet id, then the body as above].
+///
+/// The server has sessions of its own (one per our session, a new one
+/// after a restart); their subkeys and replay windows are kept for the
+/// last two seen. Identity headers (relays, multi-user servers) are not
+/// carried over UDP here: `Udp.init` refuses such a server.
+pub const Udp = struct {
+    method: Method,
+    key: [32]u8,
+    session: [8]u8,
+    packet: u64 = 0,
+    /// 2022 with AES: ours, made once
+    send_aead: ?SessionAead = null,
+    servers: [2]?ServerSession = .{ null, null },
+    /// which of `servers` goes next
+    next_slot: u1 = 0,
+
+    pub const overhead_max = 32 + tag_len + 24 + 1 + 8 + 8 + 2 + address_max;
+
+    const SessionAead = union(enum) {
+        aes128: aes_gcm.Aes128Gcm,
+        aes256: aes_gcm.Aes256Gcm,
+
+        fn of(m: Method, psk: []const u8, session: []const u8) SessionAead {
+            var sub: [32]u8 = undefined;
+            defer crypto.secureZero(u8, &sub);
+            deriveKey("shadowsocks 2022 session subkey", psk[0..m.keyLen()], session, sub[0..m.keyLen()]);
+            return if (m == .blake3_aes_128_gcm) .{ .aes128 = .init(sub[0..16].*) } else .{ .aes256 = .init(sub) };
+        }
+
+        fn seal(a: *const SessionAead, buf: []u8, tag: *[tag_len]u8, nonce: [12]u8) void {
+            switch (a.*) {
+                inline else => |*x| x.encrypt(buf, tag, buf, nonce),
+            }
+        }
+
+        fn open(a: *const SessionAead, buf: []u8, tag: [tag_len]u8, nonce: [12]u8) error{AuthenticationFailed}!void {
+            switch (a.*) {
+                inline else => |*x| try x.decrypt(buf, buf, tag, nonce),
+            }
+        }
+    };
+
+    const ServerSession = struct {
+        id: [8]u8,
+        aead: ?SessionAead,
+        window: Window = .{},
+    };
+
+    /// Packet ids seen: the highest, and the 64 below it.
+    const Window = struct {
+        top: u64 = 0,
+        bits: u64 = 0,
+        any: bool = false,
+
+        fn check(w: *const Window, id: u64) bool {
+            if (!w.any or id > w.top) return true;
+            const back = w.top - id;
+            return back < 64 and w.bits & (@as(u64, 1) << @intCast(back)) == 0;
+        }
+
+        fn mark(w: *Window, id: u64) void {
+            if (!w.any or id > w.top) {
+                const shift = if (w.any) id - w.top else 64;
+                w.bits = if (shift >= 64) 0 else w.bits << @intCast(shift);
+                w.top = id;
+                w.any = true;
+            }
+            w.bits |= @as(u64, 1) << @intCast(w.top - id);
+        }
+    };
+
+    pub const InitError = error{UdpNotSupported};
+
+    pub fn init(io: Io, ss: *const Shadowsocks) InitError!Udp {
+        if (ss.identity_count > 0) return error.UdpNotSupported;
+        var u: Udp = .{ .method = ss.method, .key = ss.key, .session = undefined };
+        io.random(&u.session);
+        if (u.method == .blake3_aes_128_gcm or u.method == .blake3_aes_256_gcm)
+            u.send_aead = .of(u.method, &u.key, &u.session);
+        return u;
+    }
+
+    pub fn deinit(u: *Udp) void {
+        crypto.secureZero(u8, &u.key);
+    }
+
+    /// Seal a datagram for `to` into `out`; returns the packet.
+    pub fn seal(u: *Udp, io: Io, out: []u8, to: *const Target, payload: []const u8) error{NoSpaceLeft}![]u8 {
+        const m = u.method;
+        const kl = m.keyLen();
+        var w: Io.Writer = .fixed(out);
+        switch (m) {
+            .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305, .xchacha20_poly1305 => {
+                var salt: [32]u8 = undefined;
+                io.random(salt[0..kl]);
+                w.writeAll(salt[0..kl]) catch return error.NoSpaceLeft;
+                const start = w.end;
+                writeAddress(&w, to) catch return error.NoSpaceLeft;
+                w.writeAll(payload) catch return error.NoSpaceLeft;
+                const body = out[start..w.end];
+                if (out.len - w.end < tag_len) return error.NoSpaceLeft;
+                var c: Cipher = .init(m, &u.key, salt[0..kl]);
+                c.seal(m, body, out[w.end..][0..tag_len]);
+                return out[0 .. w.end + tag_len];
+            },
+            .blake3_aes_128_gcm, .blake3_aes_256_gcm => {
+                if (out.len < 16) return error.NoSpaceLeft;
+                var header: [16]u8 = undefined;
+                header[0..8].* = u.session;
+                std.mem.writeInt(u64, header[8..16], u.packet, .big);
+                u.packet += 1;
+                w.end = 16;
+                const start = w.end;
+                try writeBody(&w, io, null, to, payload);
+                if (out.len - w.end < tag_len) return error.NoSpaceLeft;
+                u.send_aead.?.seal(out[start..w.end], out[w.end..][0..tag_len], header[4..16].*);
+                blockEncrypt(m, &u.key, &header, out[0..16]);
+                return out[0 .. w.end + tag_len];
+            },
+            .blake3_chacha20_poly1305 => {
+                var nonce: [24]u8 = undefined;
+                io.random(&nonce);
+                w.writeAll(&nonce) catch return error.NoSpaceLeft;
+                const start = w.end;
+                w.writeAll(&u.session) catch return error.NoSpaceLeft;
+                w.writeInt(u64, u.packet, .big) catch return error.NoSpaceLeft;
+                u.packet += 1;
+                try writeBody(&w, io, null, to, payload);
+                if (out.len - w.end < tag_len) return error.NoSpaceLeft;
+                const body = out[start..w.end];
+                crypto.aead.chacha_poly.XChaCha20Poly1305.encrypt(body, out[w.end..][0..tag_len], body, "", nonce, u.key);
+                return out[0 .. w.end + tag_len];
+            },
+        }
+    }
+
+    /// type, timestamp, (server: the client's session), padding, address, payload
+    fn writeBody(w: *Io.Writer, io: Io, client_session: ?[8]u8, to: *const Target, payload: []const u8) error{NoSpaceLeft}!void {
+        w.writeByte(if (client_session == null) 0 else 1) catch return error.NoSpaceLeft;
+        w.writeInt(u64, @intCast(@max(0, Io.Clock.real.now(io).toSeconds())), .big) catch return error.NoSpaceLeft;
+        if (client_session) |cs| w.writeAll(&cs) catch return error.NoSpaceLeft;
+        w.writeInt(u16, 0, .big) catch return error.NoSpaceLeft;
+        writeAddress(w, to) catch return error.NoSpaceLeft;
+        w.writeAll(payload) catch return error.NoSpaceLeft;
+    }
+
+    pub const Datagram = struct { from: Target, payload: []u8 };
+
+    pub const OpenError = error{ SsAuthFailed, SsBadPacket, SsClockSkew, SsReplay };
+
+    /// Open a packet from the server, in place.
+    pub fn open(u: *Udp, io: Io, pkt: []u8) OpenError!Datagram {
+        const m = u.method;
+        const kl = m.keyLen();
+        switch (m) {
+            .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305, .xchacha20_poly1305 => {
+                if (pkt.len < kl + tag_len) return error.SsBadPacket;
+                const body = pkt[kl .. pkt.len - tag_len];
+                var c: Cipher = .init(m, &u.key, pkt[0..kl]);
+                _ = c.open(m, pkt[kl..]) catch return error.SsAuthFailed;
+                return parseTail(body);
+            },
+            .blake3_aes_128_gcm, .blake3_aes_256_gcm => {
+                if (pkt.len < 16 + tag_len) return error.SsBadPacket;
+                var header: [16]u8 = undefined;
+                blockDecrypt(m, &u.key, pkt[0..16], &header);
+                const id = std.mem.readInt(u64, header[8..16], .big);
+                const s = u.server(header[0..8].*, true);
+                if (!s.window.check(id)) return error.SsReplay;
+                const body = pkt[16 .. pkt.len - tag_len];
+                s.aead.?.open(body, pkt[pkt.len - tag_len ..][0..tag_len].*, header[4..16].*) catch return error.SsAuthFailed;
+                const d = try u.parseBody(io, body);
+                s.window.mark(id);
+                return d;
+            },
+            .blake3_chacha20_poly1305 => {
+                if (pkt.len < 24 + 16 + tag_len) return error.SsBadPacket;
+                const body = pkt[24 .. pkt.len - tag_len];
+                crypto.aead.chacha_poly.XChaCha20Poly1305.decrypt(body, body, pkt[pkt.len - tag_len ..][0..tag_len].*, "", pkt[0..24].*, u.key) catch
+                    return error.SsAuthFailed;
+                const id = std.mem.readInt(u64, body[8..16], .big);
+                const s = u.server(body[0..8].*, false);
+                if (!s.window.check(id)) return error.SsReplay;
+                const d = try u.parseBody(io, body[16..]);
+                s.window.mark(id);
+                return d;
+            },
+        }
+    }
+
+    /// The server session `id`: a known one, or the older slot made over.
+    fn server(u: *Udp, id: [8]u8, aes: bool) *ServerSession {
+        for (&u.servers) |*slot| if (slot.*) |*s| if (std.mem.eql(u8, &s.id, &id)) return s;
+        const slot = &u.servers[u.next_slot];
+        u.next_slot +%= 1;
+        slot.* = .{ .id = id, .aead = if (aes) SessionAead.of(u.method, &u.key, &id) else null };
+        return &slot.*.?;
+    }
+
+    fn parseBody(u: *const Udp, io: Io, body: []u8) OpenError!Datagram {
+        if (body.len < 1 + 8 + 8 + 2) return error.SsBadPacket;
+        if (body[0] != 1) return error.SsBadPacket;
+        const skew = @as(i128, Io.Clock.real.now(io).toSeconds()) - std.mem.readInt(u64, body[1..9], .big);
+        if (skew > 30 or skew < -30) return error.SsClockSkew;
+        // an answer to another client's session is not ours
+        if (!std.mem.eql(u8, body[9..17], &u.session)) return error.SsBadPacket;
+        const pad = std.mem.readInt(u16, body[17..19], .big);
+        if (19 + @as(usize, pad) > body.len) return error.SsBadPacket;
+        return parseTail(body[19 + pad ..]);
+    }
+
+    /// A SOCKS address, then the payload.
+    fn parseTail(b: []u8) OpenError!Datagram {
+        var r: Io.Reader = .fixed(b);
+        const from = @import("trojan.zig").readAddress(&r) catch return error.SsBadPacket;
+        return .{ .from = from, .payload = b[r.seek..] };
+    }
+
+    fn blockEncrypt(m: Method, key: *const [32]u8, in: *const [16]u8, out: *[16]u8) void {
+        if (m == .blake3_aes_128_gcm) crypto.core.aes.Aes128.initEnc(key[0..16].*).encrypt(out, in) else crypto.core.aes.Aes256.initEnc(key.*).encrypt(out, in);
+    }
+
+    fn blockDecrypt(m: Method, key: *const [32]u8, in: *const [16]u8, out: *[16]u8) void {
+        if (m == .blake3_aes_128_gcm) crypto.core.aes.Aes128.initDec(key[0..16].*).decrypt(out, in) else crypto.core.aes.Aes256.initDec(key.*).decrypt(out, in);
+    }
+};
+
 const testing = std.testing;
 
 fn fromHex(comptime hex: []const u8) [hex.len / 2]u8 {
@@ -1378,4 +1621,134 @@ test "ss links" {
     // a raw key of the right length is taken as it is (Xray does the same)
     const raw = try fromLink("ss://2022-blake3-aes-128-gcm:0123456789abcdef@h:1", "h", 1);
     try testing.expectEqualStrings("0123456789abcdef", raw.key[0..16]);
+}
+
+/// The server's half of Shadowsocks UDP, for the tests: opens a client's
+/// packet and seals an answer from `from`.
+const TestUdpServer = struct {
+    method: Method,
+    key: [32]u8,
+    session: [8]u8 = @splat(0x5a),
+    packet: u64 = 0,
+
+    const Got = struct { to: Target, payload: []u8, client_session: [8]u8 };
+
+    fn openClient(s: *TestUdpServer, pkt: []u8) !Got {
+        const m = s.method;
+        const kl = m.keyLen();
+        switch (m) {
+            .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305, .xchacha20_poly1305 => {
+                var c: Cipher = .init(m, &s.key, pkt[0..kl]);
+                const body = try c.open(m, pkt[kl..]);
+                const d = try Udp.parseTail(body);
+                return .{ .to = d.from, .payload = d.payload, .client_session = @splat(0) };
+            },
+            .blake3_aes_128_gcm, .blake3_aes_256_gcm => {
+                var header: [16]u8 = undefined;
+                Udp.blockDecrypt(m, &s.key, pkt[0..16], &header);
+                const aead: Udp.SessionAead = .of(m, &s.key, header[0..8]);
+                const body = pkt[16 .. pkt.len - tag_len];
+                try aead.open(body, pkt[pkt.len - tag_len ..][0..tag_len].*, header[4..16].*);
+                return clientBody(body, header[0..8].*);
+            },
+            .blake3_chacha20_poly1305 => {
+                const body = pkt[24 .. pkt.len - tag_len];
+                try crypto.aead.chacha_poly.XChaCha20Poly1305.decrypt(body, body, pkt[pkt.len - tag_len ..][0..tag_len].*, "", pkt[0..24].*, s.key);
+                return clientBody(body[16..], body[0..8].*);
+            },
+        }
+    }
+
+    fn clientBody(body: []u8, session: [8]u8) !Got {
+        if (body[0] != 0) return error.TestUnexpectedResult;
+        const pad = std.mem.readInt(u16, body[9..11], .big);
+        const d = try Udp.parseTail(body[11 + pad ..]);
+        return .{ .to = d.from, .payload = d.payload, .client_session = session };
+    }
+
+    fn sealAnswer(s: *TestUdpServer, io: Io, out: []u8, client_session: [8]u8, from: *const Target, payload: []const u8) ![]u8 {
+        const m = s.method;
+        const kl = m.keyLen();
+        var w: Io.Writer = .fixed(out);
+        switch (m) {
+            .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305, .xchacha20_poly1305 => {
+                const salt: [32]u8 = @splat(0x77);
+                try w.writeAll(salt[0..kl]);
+                try writeAddress(&w, from);
+                try w.writeAll(payload);
+                var c: Cipher = .init(m, &s.key, salt[0..kl]);
+                c.seal(m, out[kl..w.end], out[w.end..][0..tag_len]);
+                return out[0 .. w.end + tag_len];
+            },
+            .blake3_aes_128_gcm, .blake3_aes_256_gcm => {
+                var header: [16]u8 = undefined;
+                header[0..8].* = s.session;
+                std.mem.writeInt(u64, header[8..16], s.packet, .big);
+                s.packet += 1;
+                w.end = 16;
+                try Udp.writeBody(&w, io, client_session, from, payload);
+                const aead: Udp.SessionAead = .of(m, &s.key, &s.session);
+                aead.seal(out[16..w.end], out[w.end..][0..tag_len], header[4..16].*);
+                Udp.blockEncrypt(m, &s.key, &header, out[0..16]);
+                return out[0 .. w.end + tag_len];
+            },
+            .blake3_chacha20_poly1305 => {
+                const nonce: [24]u8 = @splat(0x24);
+                try w.writeAll(&nonce);
+                try w.writeAll(&s.session);
+                try w.writeInt(u64, s.packet, .big);
+                s.packet += 1;
+                try Udp.writeBody(&w, io, client_session, from, payload);
+                const body = out[24..w.end];
+                crypto.aead.chacha_poly.XChaCha20Poly1305.encrypt(body, out[w.end..][0..tag_len], body, "", nonce, s.key);
+                return out[0 .. w.end + tag_len];
+            },
+        }
+    }
+};
+
+test "UDP: every method there and back, replays and strangers refused" {
+    const io = testing.io;
+    for (std.enums.values(Method)) |m| {
+        const password = if (m.is2022()) (if (m.keyLen() == 16) "AAECAwQFBgcICQoLDA0ODw==" else "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=") else "pw";
+        const ss: Shadowsocks = try .init(m, password, "h", 1);
+        var u: Udp = try .init(io, &ss);
+        defer u.deinit();
+        var server: TestUdpServer = .{ .method = m, .key = ss.key };
+        const to = Target.fromDomain("dns.example", 53);
+        var buf: [2048]u8 = undefined;
+        for (0..3) |i| {
+            const pkt = try u.seal(io, &buf, &to, "query");
+            const got = try server.openClient(pkt);
+            try testing.expectEqualStrings("dns.example", got.to.addr());
+            try testing.expectEqual(53, got.to.port);
+            try testing.expectEqualStrings("query", got.payload);
+            if (m.is2022()) try testing.expectEqualSlices(u8, &u.session, &got.client_session);
+
+            const from = Target.fromEndpoint(.{ .addr = @import("ipstack/packet.zig").v4(.{ 9, 9, 9, 9 }), .port = 53 });
+            var ans_buf: [2048]u8 = undefined;
+            const ans = try server.sealAnswer(io, &ans_buf, got.client_session, &from, "answer");
+            var copy: [2048]u8 = undefined;
+            @memcpy(copy[0..ans.len], ans);
+            const d = try u.open(io, ans);
+            try testing.expectEqualStrings("answer", d.payload);
+            try testing.expectEqualSlices(u8, &.{ 9, 9, 9, 9 }, d.from.addr());
+            if (m.is2022()) {
+                // the same packet again is a replay
+                try testing.expectError(error.SsReplay, u.open(io, copy[0..ans.len]));
+            }
+            _ = i;
+        }
+        // a packet sealed under another key
+        var other: TestUdpServer = .{ .method = m, .key = @splat(0xee) };
+        const from = Target.fromDomain("x.example", 1);
+        var ans_buf: [2048]u8 = undefined;
+        const bad = try other.sealAnswer(io, &ans_buf, u.session, &from, "nope");
+        if (u.open(io, bad)) |_| return error.TestUnexpectedResult else |_| {}
+    }
+}
+
+test "UDP: a relay's identity headers are not carried" {
+    const ss: Shadowsocks = try .init(.blake3_aes_128_gcm, "AAECAwQFBgcICQoLDA0ODw==:AAECAwQFBgcICQoLDA0ODw==", "h", 1);
+    try testing.expectError(error.UdpNotSupported, Udp.init(testing.io, &ss));
 }

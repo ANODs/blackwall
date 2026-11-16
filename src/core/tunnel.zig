@@ -22,6 +22,7 @@ const dns = @import("ipstack/dns.zig");
 const tls13 = @import("tls13.zig");
 const vision = @import("vision.zig");
 const xudp = @import("xudp.zig");
+const udp_out = @import("udp_out.zig");
 const failover = @import("failover.zig");
 pub const wintun = @import("wintun.zig");
 const windows = builtin.os.tag == .windows;
@@ -106,7 +107,7 @@ pub const Tunnel = struct {
 
     udp_mutex: Io.Mutex = .init,
     udp: std.HashMapUnmanaged(UdpKey, *UdpFlow, UdpKeyContext, 80) = .empty,
-    sessions: std.HashMapUnmanaged(Endpoint, *Xudp, EndpointContext, 80) = .empty,
+    sessions: std.HashMapUnmanaged(Endpoint, *UdpSession, EndpointContext, 80) = .empty,
 
     workers: std.atomic.Value(u32) = .init(0),
     dns_inflight: std.atomic.Value(u32) = .init(0),
@@ -483,12 +484,13 @@ pub const Tunnel = struct {
         const snap = t.decide(app).snap;
         switch (snap.outbound) {
             .block => t.rememberDrop(key, stats),
-            // QUIC of proxied apps is dropped: browsers fall back to TCP,
-            // which Vision carries far more efficiently
-            .vless => if (dst.port == 443 and t.dropQuic()) t.rememberDrop(key, stats) else t.startXudp(src, dst, payload, snap, stats),
-            // UDP over these is not carried yet: dropped rather than leaked
-            .trojan, .shadowsocks, .vmess => t.rememberDrop(key, stats),
             .direct => t.startDirect(key, payload, stats),
+            // QUIC of proxied apps is dropped: browsers fall back to TCP,
+            // which the servers carry far more efficiently
+            .vless, .vmess, .trojan, .shadowsocks => if (dst.port == 443 and t.dropQuic())
+                t.rememberDrop(key, stats)
+            else
+                t.startSession(src, dst, payload, snap, stats),
         }
     }
 
@@ -603,9 +605,9 @@ pub const Tunnel = struct {
         t.udp.clearRetainingCapacity();
     }
 
-    fn startXudp(t: *Tunnel, src: Endpoint, dst: Endpoint, payload: []const u8, snap: proxy.Snapshot, stats: ?*AppStats) void {
-        const sess = t.gpa.create(Xudp) catch return;
-        sess.* = .{ .tunnel = t, .app = src, .stats = stats, .snap = snap };
+    fn startSession(t: *Tunnel, src: Endpoint, dst: Endpoint, payload: []const u8, snap: proxy.Snapshot, stats: ?*AppStats) void {
+        const sess = t.gpa.create(UdpSession) catch return;
+        sess.* = .{ .tunnel = t, .app = src, .stats = stats, .conn = udp_out.Conn.init(t.io, snap.get()) orelse return t.gpa.destroy(sess) };
         if (dst.port == 53 or dst.port == 123) sess.idle_ms = dns_idle_ms;
         sess.last_ms.store(t.nowMs(), .monotonic);
         sess.enqueue(dst, payload);
@@ -616,7 +618,7 @@ pub const Tunnel = struct {
         };
         t.udp_mutex.unlock(t.io);
         _ = t.workers.fetchAdd(1, .acq_rel);
-        const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(proxy.dial_stack_size) }, Xudp.uplink, .{sess}) catch {
+        const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(proxy.dial_stack_size) }, UdpSession.uplink, .{sess}) catch {
             _ = t.workers.fetchSub(1, .acq_rel);
             sess.close();
             sess.release();
@@ -625,15 +627,13 @@ pub const Tunnel = struct {
         th.detach();
     }
 
-    /// UDP of one application socket carried over one VLESS connection
-    /// (XUDP), to any number of destinations.
-    const Xudp = struct {
+    /// UDP of one application socket carried through a server (see
+    /// udp_out.zig), to any number of destinations.
+    const UdpSession = struct {
         tunnel: *Tunnel,
         app: Endpoint,
         stats: ?*AppStats,
-        snap: proxy.Snapshot,
-        up: proxy.Upstream = undefined,
-        connected: std.atomic.Value(bool) = .init(false),
+        conn: udp_out.Conn,
         closed: std.atomic.Value(bool) = .init(false),
         /// threads still using this session (the uplink, then the downlink)
         refs: std.atomic.Value(u8) = .init(1),
@@ -652,19 +652,19 @@ pub const Tunnel = struct {
 
         const Dest = struct { app_dst: Endpoint, addr: xudp.Address, name: [255]u8 = undefined };
 
-        fn ringPut(x: *Xudp, bytes: []const u8) void {
+        fn ringPut(x: *UdpSession, bytes: []const u8) void {
             for (bytes, 0..) |b, i| x.ring[(x.head + x.used + i) % x.ring.len] = b;
             x.used += bytes.len;
         }
 
-        fn ringTake(x: *Xudp, out: []u8) void {
+        fn ringTake(x: *UdpSession, out: []u8) void {
             for (out, 0..) |*b, i| b.* = x.ring[(x.head + i) % x.ring.len];
             x.head = (x.head + out.len) % x.ring.len;
             x.used -= out.len;
         }
 
-        fn enqueue(x: *Xudp, dst: Endpoint, payload: []const u8) void {
-            if (payload.len > xudp.max_payload) return;
+        fn enqueue(x: *UdpSession, dst: Endpoint, payload: []const u8) void {
+            if (payload.len > udp_out.max_payload) return;
             const io = x.tunnel.io;
             x.mutex.lockUncancelable(io);
             defer x.mutex.unlock(io);
@@ -679,7 +679,7 @@ pub const Tunnel = struct {
         }
 
         /// Next queued datagram, or null after `ms` without one.
-        fn dequeue(x: *Xudp, dst: *Endpoint, buf: []u8, ms: i64) ?usize {
+        fn dequeue(x: *UdpSession, dst: *Endpoint, buf: []u8, ms: i64) ?usize {
             const io = x.tunnel.io;
             x.mutex.lockUncancelable(io);
             defer x.mutex.unlock(io);
@@ -695,7 +695,7 @@ pub const Tunnel = struct {
             return len;
         }
 
-        fn remember(x: *Xudp, dst: Endpoint, addr: xudp.Address) void {
+        fn remember(x: *UdpSession, dst: Endpoint, addr: xudp.Address) void {
             const io = x.tunnel.io;
             x.mutex.lockUncancelable(io);
             defer x.mutex.unlock(io);
@@ -714,7 +714,7 @@ pub const Tunnel = struct {
         /// The address a reply should appear to come from: the one the
         /// application sent to (possibly a fake IP), so connected sockets
         /// accept it.
-        fn sourceFor(x: *Xudp, from: anytype) ?Endpoint {
+        fn sourceFor(x: *UdpSession, from: ?udp_out.Peer) ?Endpoint {
             const io = x.tunnel.io;
             x.mutex.lockUncancelable(io);
             defer x.mutex.unlock(io);
@@ -738,7 +738,7 @@ pub const Tunnel = struct {
             };
         }
 
-        fn close(x: *Xudp) void {
+        fn close(x: *UdpSession) void {
             if (x.closed.swap(true, .acq_rel)) return;
             const t = x.tunnel;
             x.mutex.lockUncancelable(t.io);
@@ -749,30 +749,26 @@ pub const Tunnel = struct {
                 if (cur == x) _ = t.sessions.remove(x.app);
             }
             t.udp_mutex.unlock(t.io);
-            if (x.connected.load(.acquire)) x.up.stream.shutdown(t.io, .both) catch {};
+            x.conn.close();
         }
 
-        fn release(x: *Xudp) void {
+        fn release(x: *UdpSession) void {
             if (x.refs.fetchSub(1, .acq_rel) != 1) return;
-            const t = x.tunnel;
-            if (x.connected.load(.acquire)) x.up.close(t.io);
-            t.gpa.destroy(x);
+            x.conn.deinit();
+            x.tunnel.gpa.destroy(x);
         }
 
-        fn flow(x: *Xudp) proxy.Flow {
+        fn flow(x: *UdpSession) proxy.Flow {
             const t = x.tunnel;
             return .{ .io = t.io, .dialer = t.dialer, .meters = .{ &t.meter, if (x.stats) |st| &st.meter else null, null }, .stop = &t.stopping };
         }
 
-        fn uplink(x: *Xudp) void {
+        fn uplink(x: *UdpSession) void {
             const t = x.tunnel;
             defer _ = t.workers.fetchSub(1, .acq_rel);
             defer x.release();
             const f = x.flow();
-            const ob = x.snap.get();
-            const v = &ob.vless;
-            f.dial(&ob, &x.up) catch return x.close();
-            x.connected.store(true, .release);
+            x.conn.open(&f) catch return x.close();
             _ = x.refs.fetchAdd(1, .acq_rel);
             _ = t.workers.fetchAdd(1, .acq_rel);
             const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(128 * 1024) }, downlink, .{x}) catch {
@@ -781,23 +777,14 @@ pub const Tunnel = struct {
                 return x.close();
             };
             th.detach();
-            x.sendLoop(&f, v) catch {};
+            x.sendLoop(&f) catch {};
+            x.conn.finish();
             x.close();
         }
 
-        fn sendLoop(x: *Xudp, f: *const proxy.Flow, v: *const proxy.Vless) !void {
+        fn sendLoop(x: *UdpSession, f: *const proxy.Flow) !void {
             const t = x.tunnel;
-            var hb: [37]u8 = undefined;
-            const header = xudp.header(&hb, v.uuid, v.vision);
-            var seed: [8]u8 = undefined;
-            t.io.random(&seed);
-            var prng: std.Random.DefaultPrng = .init(std.mem.readInt(u64, &seed, .little));
-            var padder: vision.Padder = .init(v.uuid);
-            var padding = v.vision;
-            var frames: u32 = 0;
-            var first = true;
-            var dg: [xudp.max_payload]u8 = undefined;
-            var frame: [xudp.max_payload + 600]u8 = undefined;
+            var dg: [udp_out.max_payload]u8 = undefined;
             while (!x.closed.load(.acquire) and !t.stopping.load(.acquire)) {
                 var dst: Endpoint = undefined;
                 const n = x.dequeue(&dst, &dg, 1000) orelse {
@@ -813,41 +800,12 @@ pub const Tunnel = struct {
                 else
                     .{ .ip6 = dst.addr };
                 x.remember(dst, addr);
-                const len = xudp.encode(&frame, first, dst.port, addr, dg[0..n]) orelse continue;
-                if (first) try x.write(header, &padding, &padder, &frames, prng.random(), true);
-                try x.write(frame[0..len], &padding, &padder, &frames, prng.random(), false);
-                try x.flush();
-                first = false;
+                try x.conn.send(.{ .addr = addr, .port = dst.port }, dg[0..n]);
                 f.up(n);
             }
-            if (!first) {
-                try x.write(&xudp.end_frame, &padding, &padder, &frames, prng.random(), false);
-                try x.flush();
-            }
         }
 
-        /// Write to the server: the VLESS header in the clear, frames inside
-        /// Vision padding for the first few, then plain.
-        fn write(x: *Xudp, bytes: []const u8, padding: *bool, padder: *vision.Padder, frames: *u32, rand: std.Random, is_header: bool) !void {
-            // inside a transport: its stream (Vision does not run there)
-            if (x.up.transportWriter()) |w| return w.writeAll(bytes);
-            if (!x.up.tls) return x.up.uw.interface.writeAll(bytes);
-            const rw = &x.up.rw;
-            if (is_header or !padding.*) return rw.write(bytes);
-            const cmd: vision.Command = if (frames.* >= 7) .end else .pad;
-            const space = try rw.writable(vision.max_frame);
-            rw.advance(padder.frame(space, bytes, cmd, false, rand));
-            frames.* += 1;
-            if (cmd == .end) padding.* = false;
-        }
-
-        fn flush(x: *Xudp) !void {
-            if (x.up.transportWriter()) |w| return w.flush();
-            if (x.up.tls) return x.up.rw.flush();
-            return x.up.uw.interface.flush();
-        }
-
-        fn downlink(x: *Xudp) void {
+        fn downlink(x: *UdpSession) void {
             const t = x.tunnel;
             defer _ = t.workers.fetchSub(1, .acq_rel);
             defer x.release();
@@ -855,45 +813,19 @@ pub const Tunnel = struct {
             x.close();
         }
 
-        const Sink = struct {
-            r: *xudp.Reader,
-            pub fn content(k: *Sink, bytes: []const u8) error{Overflow}!void {
-                if (!k.r.push(bytes)) return error.Overflow;
-            }
-        };
-
-        fn recvLoop(x: *Xudp) !void {
+        fn recvLoop(x: *UdpSession) !void {
             const t = x.tunnel;
-            const v = x.snap.outbound.vless;
-            var header: proxy.ResponseHeader = .{};
-            var unpad: vision.Unpadder = .init(v.uuid);
-            var store: [16 * 1024]u8 = undefined;
-            var reader: xudp.Reader = .{ .buf = &store };
-            var sink: Sink = .{ .r = &reader };
             const f = x.flow();
             while (!x.closed.load(.acquire)) {
-                var raw_len: usize = 0;
-                // inside a transport: its stream; else the records or the socket
-                const raw = x.up.transportReader() orelse &x.up.ur.interface;
-                const data: []const u8 = if (x.up.tls and raw == &x.up.ur.interface)
-                    (try x.up.rr.next()) orelse return
-                else blk: {
-                    const chunk = raw.peekGreedy(1) catch return;
-                    raw_len = chunk.len;
-                    break :blk chunk;
+                const d = (try x.conn.recv(1000)) orelse {
+                    // Shadowsocks has no end: only a quiet second
+                    if (x.conn.kind == .shadowsocks) continue;
+                    return;
                 };
-                const body = try header.strip(data);
-                if (v.vision) _ = try unpad.feed(body, &sink) else try sink.content(body);
-                if (raw_len > 0) raw.toss(raw_len);
-                while (try reader.next()) |ev| switch (ev) {
-                    .end => return,
-                    .data => |d| {
-                        x.last_ms.store(t.nowMs(), .monotonic);
-                        const src = x.sourceFor(d.from) orelse continue;
-                        t.stack.sendUdp(src, x.app, d.payload);
-                        f.down(d.payload.len);
-                    },
-                };
+                x.last_ms.store(t.nowMs(), .monotonic);
+                const src = x.sourceFor(d.from) orelse continue;
+                t.stack.sendUdp(src, x.app, d.payload);
+                f.down(d.payload.len);
             }
         }
     };
@@ -1023,7 +955,7 @@ test "routing: rule beats default, unknown outbound blocks" {
     try std.testing.expect(!t.decide(null).main);
 }
 
-test "tunnel: UDP to a server whose protocol carries none yet is dropped, not leaked" {
+test "tunnel: QUIC is dropped whatever the protocol, not leaked" {
     const t = try Tunnel.create(std.testing.allocator, std.testing.io, .{});
     defer t.destroy();
     const link = "trojan://pw@tj.example:443";
@@ -1036,9 +968,9 @@ test "tunnel: UDP to a server whose protocol carries none yet is dropped, not le
     try std.testing.expectEqualStrings("tj.example", t.decide(null).snap.get().trojan.host);
 
     const app: Endpoint = .{ .addr = packet.v4(.{ 198, 18, 0, 1 }), .port = 50000 };
-    const there: Endpoint = .{ .addr = packet.v4(.{ 203, 0, 113, 9 }), .port = 3478 };
-    t.udpDatagram(app, there, "stun");
-    t.udpDatagram(app, there, "stun again");
+    const there: Endpoint = .{ .addr = packet.v4(.{ 203, 0, 113, 9 }), .port = 443 };
+    t.udpDatagram(app, there, "quic initial");
+    t.udpDatagram(app, there, "quic again");
     t.udp_mutex.lockUncancelable(t.io);
     defer t.udp_mutex.unlock(t.io);
     // remembered as a drop: no socket of ours, no session to a server

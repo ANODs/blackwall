@@ -571,6 +571,28 @@ pub const Dialer = struct {
     resolver: ?*dns.Resolver = null,
     timeout_ms: i32 = 10_000,
 
+    /// The address of `host` (an IP, or a name), resolved the way
+    /// `connect` would: through `resolver` when there is one.
+    pub fn resolve(d: *const Dialer, io: Io, host: []const u8) !packet.Addr {
+        if (net.IpAddress.parse(host, 0)) |ip| {
+            const a, _ = sys.fromIpAddress(ip);
+            return a;
+        } else |_| {}
+        if (d.resolver) |r| return r.resolve(host);
+        const name = try net.HostName.init(host);
+        var results: [16]net.HostName.LookupResult = undefined;
+        var q: Io.Queue(net.HostName.LookupResult) = .init(&results);
+        try name.lookup(io, &q, .{ .port = 0 });
+        while (q.getOne(io)) |res| switch (res) {
+            .address => |ip| {
+                const a, _ = sys.fromIpAddress(ip);
+                return a;
+            },
+            .canonical_name => {},
+        } else |_| {}
+        return error.UnknownHostName;
+    }
+
     pub fn connect(d: *const Dialer, io: Io, host: []const u8, port: u16) !net.Stream {
         if (net.IpAddress.parse(host, port)) |ip| {
             const a, _ = sys.fromIpAddress(ip);
@@ -659,19 +681,31 @@ pub const Upstream = struct {
 
     /// The application's data, once `attach` put the protocol's cipher (if
     /// it has one) on the stream.
-    fn reader(u: *Upstream) *Io.Reader {
+    pub fn reader(u: *Upstream) *Io.Reader {
         const l = u.layer.?;
         return switch (l.cipher) {
             .none => l.r,
             inline else => |c| &c.reader,
         };
     }
-    fn writer(u: *Upstream) *Io.Writer {
+    pub fn writer(u: *Upstream) *Io.Writer {
         const l = u.layer.?;
         return switch (l.cipher) {
             .none => l.w,
             inline else => |c| &c.writer,
         };
+    }
+
+    /// VMess opened for UDP: its cipher with a mux request, whose frames
+    /// (XUDP) name each datagram's peer. Nothing leaves until a flush.
+    pub fn attachMux(u: *Upstream, io: Io, ob: *const Outbound) !void {
+        const v = &ob.vmess;
+        const l = u.layer orelse return error.NoLayer;
+        const p = Plan.of(ob, &ob.via().?, u.tls).?;
+        const c = l.make(vmess.Conn);
+        c.* = .init(io, v.user, v.security, l.r, l.w, l.take(p.cr), l.take(p.cw));
+        l.cipher = .{ .vmess = c };
+        try c.writeRequest(.{ .command = .mux });
     }
 
     /// VMess and Shadowsocks seal the stream themselves: put their cipher
