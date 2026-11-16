@@ -1,0 +1,1 @@
+This release changes nothing in the Android app itself: it carries the same core as the desktop apps, which now fully support Windows.
