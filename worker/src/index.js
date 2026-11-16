@@ -107,15 +107,21 @@ function normalize(releases) {
 async function releasesBody(req, env, ctx) {
   const cacheKey = new Request(new URL('/releases', req.url).toString());
   const cache = caches.default;
+  // the last good answer, kept for a week: GitHub limits requests without a token per
+  // address, and Cloudflare's addresses are shared, so a refused request is not rare
+  const staleKey = new Request(new URL('/releases-stale', req.url).toString());
   let body = await cache.match(cacheKey).then(r => r && r.text());
   if (!body) {
     const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'site-worker' };
     if (env.GITHUB_TOKEN) headers.Authorization = 'Bearer ' + env.GITHUB_TOKEN;
-    const r = await fetch(`https://api.github.com/repos/${env.REPO}/releases?per_page=100`, { headers });
-    const data = r.ok ? normalize(await r.json()) : null;
-    if (!data) return null;
+    const r = await fetch(`https://api.github.com/repos/${env.REPO}/releases?per_page=100`, { headers }).catch(() => null);
+    const data = r && r.ok ? normalize(await r.json()) : null;
+    if (!data) return await cache.match(staleKey).then(s => s && s.text());
     body = JSON.stringify(data);
-    ctx.waitUntil(cache.put(cacheKey, new Response(body, { headers: { 'Cache-Control': 'public, max-age=300' } })));
+    ctx.waitUntil(Promise.all([
+      cache.put(cacheKey, new Response(body, { headers: { 'Cache-Control': 'public, max-age=600' } })),
+      cache.put(staleKey, new Response(body, { headers: { 'Cache-Control': 'public, max-age=604800' } })),
+    ]));
   }
   return body;
 }
