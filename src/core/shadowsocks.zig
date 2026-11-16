@@ -30,9 +30,13 @@
 //!
 //! Memory: the writer seals in place inside its buffer, with room for the
 //! length chunk and the request header kept in front of the payload; tags
-//! travel in the same vectored write. The reader opens each chunk in place
-//! inside its own buffer, which is where the plaintext is read from, so
-//! that buffer must hold a whole chunk: `readBufferLen`.
+//! travel in the same vectored write. The reader takes as much ciphertext
+//! as the socket has into its own buffer (with Xray's 8 KiB chunks, several
+//! at a time) and opens every whole chunk there, each payload decrypted
+//! straight to the end of the plaintext in front of it, no copy: so one
+//! read and one write in the copy loop carry several chunks. That buffer is
+//! where the plaintext is read from, and must hold a whole chunk:
+//! `readBufferLen`. AES-GCM is aes_gcm.zig's, keyed once per direction.
 //!
 //! One thread may read while another writes: the directions share nothing
 //! that changes after `init`.
@@ -41,6 +45,7 @@ const std = @import("std");
 const Io = std.Io;
 const crypto = std.crypto;
 const proxy = @import("proxy.zig");
+const aes_gcm = @import("aes_gcm.zig");
 /// The SOCKS5 address form, which Shadowsocks shares with Trojan.
 const writeAddress = @import("trojan.zig").writeAddress;
 
@@ -66,7 +71,9 @@ pub const write_buffer_len = first_room_max + 16 * 1024;
 /// does not fit; Xray itself never sends more than 8 KiB at once, sing-box
 /// and shadowsocks-rust fill chunks to the limit. This is enough for a
 /// caller that empties the buffer before asking for more (a copy loop); one
-/// that parses with `take(n)` across chunks needs n - 1 bytes on top.
+/// that parses with `take(n)` across chunks needs n - 1 bytes on top. It is
+/// also the most one read takes from the socket: up to eight of Xray's
+/// chunks with 2022.
 pub fn readBufferLen(m: Method) usize {
     return m.maxChunk() + tag_len;
 }
@@ -121,12 +128,12 @@ pub const Method = enum {
         return if (m.is2022()) 0xffff else 0x3fff;
     }
 
+    /// std's AEAD for the ChaCha methods (the AES ones are aes_gcm.zig's).
     fn Aead(comptime m: Method) type {
         return switch (m) {
-            .aes_128_gcm, .blake3_aes_128_gcm => crypto.aead.aes_gcm.Aes128Gcm,
-            .aes_256_gcm, .blake3_aes_256_gcm => crypto.aead.aes_gcm.Aes256Gcm,
             .chacha20_poly1305, .blake3_chacha20_poly1305 => crypto.aead.chacha_poly.ChaCha20Poly1305,
             .xchacha20_poly1305 => crypto.aead.chacha_poly.XChaCha20Poly1305,
+            else => unreachable,
         };
     }
 };
@@ -317,28 +324,41 @@ fn deriveKey(context: []const u8, a: []const u8, b: []const u8, out: []u8) void 
     h.final(out);
 }
 
-/// One direction's AEAD: the subkey and the nonce counter.
+/// One direction's AEAD: the subkey, with AES its key schedule and powers
+/// of H made once (see aes_gcm.zig), and the nonce counter.
 const Cipher = struct {
-    key: [32]u8 = @splat(0),
+    aead: union {
+        aes128: aes_gcm.Aes128Gcm,
+        aes256: aes_gcm.Aes256Gcm,
+        /// ChaCha20 and XChaCha20, which std's AEADs take as a key
+        key: [32]u8,
+    } = .{ .key = @splat(0) },
     nonce: [24]u8 = @splat(0),
 
     fn init(m: Method, key: *const [32]u8, salt: []const u8) Cipher {
-        var c: Cipher = .{};
+        var sub: [32]u8 = @splat(0);
+        defer crypto.secureZero(u8, &sub);
         const n = m.keyLen();
         if (m.is2022()) {
-            deriveKey("shadowsocks 2022 session subkey", key[0..n], salt, c.key[0..n]);
+            deriveKey("shadowsocks 2022 session subkey", key[0..n], salt, sub[0..n]);
         } else {
-            HkdfSha1.expand(c.key[0..n], "ss-subkey", HkdfSha1.extract(salt, key[0..n]));
+            HkdfSha1.expand(sub[0..n], "ss-subkey", HkdfSha1.extract(salt, key[0..n]));
         }
-        return c;
+        return .{ .aead = switch (m) {
+            .aes_128_gcm, .blake3_aes_128_gcm => .{ .aes128 = .init(sub[0..16].*) },
+            .aes_256_gcm, .blake3_aes_256_gcm => .{ .aes256 = .init(sub) },
+            else => .{ .key = sub },
+        } };
     }
 
     /// Seal `buf` in place.
     fn seal(c: *Cipher, m: Method, buf: []u8, tag: *[tag_len]u8) void {
         switch (m) {
+            .aes_128_gcm, .blake3_aes_128_gcm => c.aead.aes128.encrypt(buf, tag, buf, c.nonce[0..12].*),
+            .aes_256_gcm, .blake3_aes_256_gcm => c.aead.aes256.encrypt(buf, tag, buf, c.nonce[0..12].*),
             inline else => |mm| {
                 const A = mm.Aead();
-                A.encrypt(buf, tag, buf, "", c.nonce[0..A.nonce_length].*, c.key[0..A.key_length].*);
+                A.encrypt(buf, tag, buf, "", c.nonce[0..A.nonce_length].*, c.aead.key);
             },
         }
         c.next();
@@ -347,15 +367,19 @@ const Cipher = struct {
     /// Open a chunk (ciphertext, then tag) in place; returns the plaintext.
     fn open(c: *Cipher, m: Method, chunk: []u8) error{SsAuthFailed}![]u8 {
         const n = chunk.len - tag_len;
-        switch (m) {
-            inline else => |mm| {
-                const A = mm.Aead();
-                A.decrypt(chunk[0..n], chunk[0..n], chunk[n..][0..tag_len].*, "", c.nonce[0..A.nonce_length].*, c.key[0..A.key_length].*) catch
-                    return error.SsAuthFailed;
-            },
-        }
-        c.next();
+        try c.openTo(m, chunk[0..n], chunk[0..n], chunk[n..][0..tag_len].*);
         return chunk[0..n];
+    }
+
+    /// Open `src` into `dst`, which is `src` itself or starts before it in
+    /// the same buffer.
+    fn openTo(c: *Cipher, m: Method, dst: []u8, src: []const u8, tag: [tag_len]u8) error{SsAuthFailed}!void {
+        (switch (m) {
+            .aes_128_gcm, .blake3_aes_128_gcm => c.aead.aes128.decrypt(dst, src, tag, c.nonce[0..12].*),
+            .aes_256_gcm, .blake3_aes_256_gcm => c.aead.aes256.decrypt(dst, src, tag, c.nonce[0..12].*),
+            inline else => |mm| mm.Aead().decrypt(dst, src, tag, "", c.nonce[0..mm.Aead().nonce_length].*, c.aead.key),
+        }) catch return error.SsAuthFailed;
+        c.next();
     }
 
     fn next(c: *Cipher) void {
@@ -417,6 +441,15 @@ pub const Conn = struct {
     // the reader's own
     recv: Cipher = .{},
     rstate: enum { head, chunks, eof, failed } = .head,
+    /// ciphertext read but not opened yet: `reader.buffer[raw_start..raw_end]`,
+    /// always behind the plaintext (`reader.end <= raw_start`)
+    raw_start: usize = 0,
+    raw_end: usize = 0,
+    /// the length of the payload chunk next in the ciphertext, once known
+    /// (its length chunk opened, or the 2022 header gave it)
+    next_len: ?u16 = null,
+    /// AEAD: the server's empty chunk came, the stream ends after what is open
+    ended: bool = false,
 
     /// `rbuf` holds a whole chunk (see `readBufferLen`); `wbuf` is best
     /// `write_buffer_len` and must exceed the request's room by a byte.
@@ -578,40 +611,39 @@ pub const Conn = struct {
         return 0;
     }
 
-    /// Open the next chunk into `reader.buffer`, after what is unread.
+    /// Open the next chunks into `reader.buffer`, after what is unread.
     fn fillChunk(c: *Conn) Io.Reader.Error!void {
         switch (c.rstate) {
             .eof => return error.EndOfStream,
             .failed => return error.ReadFailed,
             .head, .chunks => {},
         }
-        c.nextChunk() catch |e| {
+        c.nextChunks() catch |e| {
             c.rstate = if (e == error.EndOfStream) .eof else .failed;
             return e;
         };
     }
 
-    fn nextChunk(c: *Conn) Io.Reader.Error!void {
-        const m = c.method;
+    /// Every chunk the ciphertext read so far holds whole, opened end to
+    /// end behind the unread plaintext; with none whole, read first. One
+    /// read takes what the socket has, often several chunks (Xray sends 8
+    /// KiB ones), so the bytes cost one read here and one write in the
+    /// copy loop above, not two reads and a write per chunk.
+    fn nextChunks(c: *Conn) Io.Reader.Error!void {
         if (c.rstate == .head) {
-            const got_data = try c.readHead();
+            try c.readHead();
             c.rstate = .chunks;
-            if (got_data) return;
         }
-        var lc: [len_chunk]u8 = undefined;
-        const got = try c.r.readSliceShort(&lc);
-        if (got == 0) return error.EndOfStream;
-        if (got < lc.len) return c.fail(error.SsTruncated);
-        const len = std.mem.readInt(u16, (c.recv.open(m, &lc) catch return c.fail(error.SsAuthFailed))[0..2], .big);
-        // Xray's own AEAD stream ends with an empty chunk; 2022 has none
-        if (len == 0) return if (m.is2022()) c.fail(error.SsBadLength) else error.EndOfStream;
-        if (len > m.maxChunk()) return c.fail(error.SsBadLength);
-        try c.readPayload(len);
+        while (true) {
+            if (try c.openWhole()) return;
+            if (c.ended) return error.EndOfStream;
+            try c.readRaw();
+        }
     }
 
-    /// The server's salt, and with 2022 its fixed header (and the payload
-    /// chunk that follows it). True if that put data into the buffer.
-    fn readHead(c: *Conn) Io.Reader.Error!bool {
+    /// The server's salt, and with 2022 its fixed header, which gives the
+    /// length of the first payload chunk.
+    fn readHead(c: *Conn) Io.Reader.Error!void {
         const m = c.method;
         const kl = m.keyLen();
         var salt: [32]u8 = undefined;
@@ -622,7 +654,7 @@ pub const Conn = struct {
         // every chunk we sent would pass as the server's answer
         if (std.mem.eql(u8, salt[0..kl], c.salt[0..kl])) return c.fail(error.SsBadResponse);
         c.recv = .init(m, &c.key, salt[0..kl]);
-        if (!m.is2022()) return false;
+        if (!m.is2022()) return;
 
         // type, timestamp, our salt, length of the first payload chunk
         var buf: [1 + 8 + 32 + 2 + tag_len]u8 = undefined;
@@ -633,30 +665,99 @@ pub const Conn = struct {
         const skew = @as(i128, Io.Clock.real.now(c.io).toSeconds()) - std.mem.readInt(u64, h[1..9], .big);
         if (skew > 30 or skew < -30) return c.fail(error.SsClockSkew);
         const first = std.mem.readInt(u16, h[9 + kl ..][0..2], .big);
-        if (first == 0) return false;
-        try c.readPayload(first);
-        return true;
+        if (first > 0) c.next_len = first;
     }
 
-    /// Read a payload chunk of `len` bytes (and its tag) behind what is
-    /// buffered and open it there.
-    fn readPayload(c: *Conn, len: usize) Io.Reader.Error!void {
+    /// Open the chunks that are whole in the ciphertext read so far, each
+    /// payload to the end of the plaintext (no copy: the decryption itself
+    /// moves it there). True if that added any.
+    fn openWhole(c: *Conn) Io.Reader.Error!bool {
+        const m = c.method;
         const r = &c.reader;
-        const need = len + tag_len;
-        if (r.seek == r.end) {
+        const buf = r.buffer;
+        var any = false;
+        while (!c.ended) {
+            const len = c.next_len orelse len: {
+                if (c.raw_end - c.raw_start < len_chunk) break;
+                const lc = buf[c.raw_start..][0..len_chunk];
+                const n = std.mem.readInt(u16, (c.recv.open(m, lc) catch return c.fail(error.SsAuthFailed))[0..2], .big);
+                c.raw_start += len_chunk;
+                // Xray's own AEAD stream ends with an empty chunk; 2022 has none
+                if (n == 0) {
+                    if (m.is2022()) return c.fail(error.SsBadLength);
+                    c.ended = true;
+                    break;
+                }
+                if (n > m.maxChunk()) return c.fail(error.SsBadLength);
+                c.next_len = n;
+                break :len n;
+            };
+            if (c.raw_end - c.raw_start < len + tag_len) break;
+            if (r.seek == r.end) {
+                r.seek = 0;
+                r.end = 0;
+            }
+            const src = buf[c.raw_start..][0..len];
+            c.recv.openTo(m, buf[r.end..][0..len], src, buf[c.raw_start + len ..][0..tag_len].*) catch
+                return c.fail(error.SsAuthFailed);
+            r.end += len;
+            c.raw_start += len + tag_len;
+            c.next_len = null;
+            any = true;
+        }
+        if (c.raw_start == c.raw_end) {
+            c.raw_start = r.end;
+            c.raw_end = r.end;
+        }
+        return any;
+    }
+
+    /// Read more ciphertext behind what is there: what the stream below
+    /// has buffered, else one read of as much as it has, into all the room
+    /// left. (Not `readVec` with buffered bytes there: after copying them
+    /// it reads again, and waits for bytes the server may only send once
+    /// these are answered.)
+    fn readRaw(c: *Conn) Io.Reader.Error!void {
+        const r = &c.reader;
+        const buf = r.buffer;
+        if (r.seek == r.end and c.raw_start == c.raw_end) {
             r.seek = 0;
             r.end = 0;
+            c.raw_start = 0;
+            c.raw_end = 0;
         }
-        if (r.buffer.len - r.end < need) {
-            const left = r.end - r.seek;
-            if (r.buffer.len - left < need) return c.fail(error.SsBufferTooSmall);
-            std.mem.copyForwards(u8, r.buffer[0..left], r.buffer[r.seek..r.end]);
+        // the rest of the next chunk must fit behind what is read of it
+        const need = if (c.next_len) |n| @as(usize, n) + tag_len else len_chunk;
+        if (buf.len - c.raw_start < need) {
+            // move the unread plaintext to the front, the ciphertext behind it
+            const keep = r.end - r.seek;
+            const have = c.raw_end - c.raw_start;
+            if (keep + need > buf.len) return c.fail(error.SsBufferTooSmall);
+            std.mem.copyForwards(u8, buf[0..keep], buf[r.seek..r.end]);
             r.seek = 0;
-            r.end = left;
+            r.end = keep;
+            std.mem.copyForwards(u8, buf[keep..][0..have], buf[c.raw_start..c.raw_end]);
+            c.raw_start = keep;
+            c.raw_end = keep + have;
         }
-        const chunk = r.buffer[r.end..][0..need];
-        if (try c.r.readSliceShort(chunk) < need) return c.fail(error.SsTruncated);
-        r.end += (c.recv.open(c.method, chunk) catch return c.fail(error.SsAuthFailed)).len;
+        const room = buf[c.raw_end..];
+        const below = c.r.buffered();
+        if (below.len > 0) {
+            const k = @min(below.len, room.len);
+            @memcpy(room[0..k], below[0..k]);
+            c.r.toss(k);
+            c.raw_end += k;
+            return;
+        }
+        var vec = [_][]u8{room};
+        const n = c.r.readVec(&vec) catch |e| switch (e) {
+            error.EndOfStream => return if (c.raw_start == c.raw_end and c.next_len == null)
+                error.EndOfStream
+            else
+                c.fail(error.SsTruncated),
+            else => |ee| return ee,
+        };
+        c.raw_end += n;
     }
 
     fn fail(c: *Conn, e: Error) error{ReadFailed} {
@@ -1026,6 +1127,206 @@ test "2022: the answer is checked, then read" {
     c.r = &rr;
     try testing.expectError(error.ReadFailed, c.reader.peekGreedy(1));
     try testing.expectEqual(error.SsAuthFailed, c.err.?);
+}
+
+/// A stream below that hands out `parts`, at most one per read, and fails
+/// a read past the first `allowed` of them: as a socket would wait there,
+/// when the server has nothing more to say until it is answered.
+const Parts = struct {
+    parts: []const []const u8,
+    allowed: usize,
+    next: usize = 0,
+    at: usize = 0,
+    starved: bool = false,
+    interface: Io.Reader,
+
+    fn init(parts: []const []const u8, allowed: usize, buf: []u8) Parts {
+        return .{ .parts = parts, .allowed = allowed, .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buf, .seek = 0, .end = 0 } };
+    }
+
+    fn stream(io_r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const p: *Parts = @alignCast(@fieldParentPtr("interface", io_r));
+        if (p.next == p.allowed) {
+            p.starved = true;
+            return error.ReadFailed;
+        }
+        const part = p.parts[p.next][p.at..];
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const n = @min(dest.len, part.len);
+        @memcpy(dest[0..n], part[0..n]);
+        w.advance(n);
+        p.at += n;
+        if (p.at == p.parts[p.next].len) {
+            p.next += 1;
+            p.at = 0;
+        }
+        return n;
+    }
+};
+
+test "an answer is given out as soon as it is whole, without waiting for more" {
+    const io = testing.io;
+    const target = Target.fromDomain("example.com", 80);
+    const m = Method.blake3_aes_128_gcm;
+    const ss: Shadowsocks = try .init(m, "AAECAwQFBgcICQoLDA0ODw==", "h", 1);
+    var wbuf: [write_buffer_len]u8 = undefined;
+    var rbuf: [readBufferLen(m)]u8 = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: Io.Writer = .fixed(&sink_buf);
+    // salt 16, fixed header 43, "server hello" 12 + 16: whole at 87;
+    // then a length chunk 18 and "and more" 8 + 16
+    const whole = 87;
+    // where the reads end: all in one, the salt cut, a byte short, the
+    // next length chunk begun
+    const cuts = [_][]const usize{ &.{whole}, &.{ 10, whole }, &.{ whole - 1, whole }, &.{100} };
+    for (cuts) |ends| {
+        var c: Conn = .init(io, &ss, &target, undefined, &sink, &rbuf, &wbuf);
+        var resp_buf: [512]u8 = undefined;
+        var resp: Io.Writer = .fixed(&resp_buf);
+        try sealedResponse2022(&resp, m, &ss.key, 1, Io.Clock.real.now(io).toSeconds(), &c.salt, &.{ "server hello", "and more" });
+        const all = resp.buffered();
+        var parts: [3][]const u8 = undefined;
+        var from: usize = 0;
+        for (ends, 0..) |e, i| {
+            parts[i] = all[from..e];
+            from = e;
+        }
+        parts[ends.len] = all[from..];
+        var pbuf: [4096]u8 = undefined;
+        var below: Parts = .init(parts[0 .. ends.len + 1], ends.len, &pbuf);
+        c.r = &below.interface;
+        try testing.expectEqualStrings("server hello", try c.reader.peekGreedy(1));
+        try testing.expect(!below.starved);
+        c.reader.tossBuffered();
+        below.allowed += 1;
+        try testing.expectEqualStrings("and more", try c.reader.peekGreedy(1));
+    }
+}
+
+/// What a server sends: its salt, with 2022 the fixed header (echoing
+/// `echo`, giving the first chunk's length), then the chunks.
+fn sealedStream(gpa: std.mem.Allocator, m: Method, key: *const [32]u8, echo: []const u8, chunks: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const kl = m.keyLen();
+    const salt: [32]u8 = @splat(0x33);
+    try out.appendSlice(gpa, salt[0..kl]);
+    var tx: Cipher = .init(m, key, salt[0..kl]);
+    var tag: [tag_len]u8 = undefined;
+    if (m.is2022()) {
+        var f: [1 + 8 + 32 + 2]u8 = undefined;
+        const h = f[0 .. 1 + 8 + kl + 2];
+        h[0] = 1;
+        std.mem.writeInt(i64, h[1..9], Io.Clock.real.now(testing.io).toSeconds(), .big);
+        @memcpy(h[9..][0..kl], echo[0..kl]);
+        std.mem.writeInt(u16, h[9 + kl ..][0..2], @intCast(chunks[0].len), .big);
+        tx.seal(m, h, &tag);
+        try out.appendSlice(gpa, h);
+        try out.appendSlice(gpa, &tag);
+    }
+    for (chunks, 0..) |p, i| {
+        if (i > 0 or !m.is2022()) {
+            var lc: [2]u8 = undefined;
+            std.mem.writeInt(u16, &lc, @intCast(p.len), .big);
+            tx.seal(m, &lc, &tag);
+            try out.appendSlice(gpa, &lc);
+            try out.appendSlice(gpa, &tag);
+        }
+        const at = out.items.len;
+        try out.appendSlice(gpa, p);
+        tx.seal(m, out.items[at..], &tag);
+        try out.appendSlice(gpa, &tag);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// A stream below that gives out `data` in reads of random length.
+const Trickle = struct {
+    data: []const u8,
+    rand: std.Random,
+    max: usize,
+    interface: Io.Reader,
+
+    fn stream(io_r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const t: *Trickle = @alignCast(@fieldParentPtr("interface", io_r));
+        if (t.data.len == 0) return error.EndOfStream;
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const n = @min(dest.len, t.data.len, t.rand.intRangeAtMost(usize, 1, t.max));
+        @memcpy(dest[0..n], t.data[0..n]);
+        w.advance(n);
+        t.data = t.data[n..];
+        return n;
+    }
+};
+
+test "chunks of any size come out whole, however they are read and taken" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const target = Target.fromDomain("example.com", 80);
+    var prng: std.Random.DefaultPrng = .init(0xc0ffee);
+    const rand = prng.random();
+    const plain = try gpa.alloc(u8, 600_000);
+    defer gpa.free(plain);
+    rand.bytes(plain);
+    inline for (.{ Method.blake3_aes_128_gcm, Method.blake3_chacha20_poly1305, Method.aes_256_gcm, Method.chacha20_poly1305 }) |m| {
+        const ss: Shadowsocks = try .init(m, if (m == .blake3_aes_128_gcm) "AAECAwQFBgcICQoLDA0ODw==" else if (m.is2022()) "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" else "pw", "h", 1);
+        for (0..4) |round| {
+            // chunks: tiny, Xray's 8 KiB, or up to the limit
+            var chunks: std.ArrayList([]const u8) = .empty;
+            defer chunks.deinit(gpa);
+            var at: usize = 0;
+            while (at < plain.len) {
+                const want: usize = switch (rand.uintLessThan(u8, 3)) {
+                    0 => rand.intRangeAtMost(usize, 1, 40),
+                    1 => 8192,
+                    else => rand.intRangeAtMost(usize, 1, m.maxChunk()),
+                };
+                const n = @min(want, plain.len - at);
+                try chunks.append(gpa, plain[at..][0..n]);
+                at += n;
+            }
+            var wbuf: [write_buffer_len]u8 = undefined;
+            const rbuf = try gpa.alloc(u8, readBufferLen(m) + 4096);
+            defer gpa.free(rbuf);
+            var sink_buf: [64]u8 = undefined;
+            var sink: Io.Writer = .fixed(&sink_buf);
+            var c: Conn = .init(io, &ss, &target, undefined, &sink, rbuf, &wbuf);
+            const wire = try sealedStream(gpa, m, &ss.key, &c.salt, chunks.items);
+            defer gpa.free(wire);
+            var below_buf: [16 * 1024 + 261]u8 = undefined;
+            var below: Trickle = .{
+                .data = wire,
+                .rand = rand,
+                .max = if (round % 2 == 0) 100 else 70_000,
+                .interface = .{ .vtable = &.{ .stream = Trickle.stream }, .buffer = &below_buf, .seek = 0, .end = 0 },
+            };
+            c.r = &below.interface;
+            // the copy loop's way (all that is there), or a parser's (a few at a time)
+            var got: usize = 0;
+            while (true) {
+                if (rand.boolean()) {
+                    const b = c.reader.peekGreedy(1) catch |e| switch (e) {
+                        error.EndOfStream => break,
+                        else => return e,
+                    };
+                    const n = rand.intRangeAtMost(usize, 1, b.len);
+                    try testing.expectEqualSlices(u8, plain[got..][0..n], b[0..n]);
+                    c.reader.toss(n);
+                    got += n;
+                } else {
+                    const n = @min(rand.intRangeAtMost(usize, 1, 4096), plain.len - got);
+                    if (n == 0) {
+                        try testing.expectError(error.EndOfStream, c.reader.peekGreedy(1));
+                        break;
+                    }
+                    try testing.expectEqualSlices(u8, plain[got..][0..n], try c.reader.take(n));
+                    got += n;
+                }
+            }
+            try testing.expectEqual(plain.len, got);
+            try testing.expect(c.err == null);
+        }
+    }
 }
 
 test "ss links" {
