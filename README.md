@@ -386,7 +386,6 @@ docs/                      updates, Android, release notes
 - **0.2** — UDP over Trojan, VMess and Shadowsocks; rules by domain; a local DPI bypass
   route.
 - **0.4** — Windows: capture through Wintun, routes per application, a kill switch on WFP.
-  The network layer already runs on Windows; the rest is in progress.
 - **0.5** — WireGuard.
 - **0.6** — QUIC and Hysteria2.
 - **0.7** — TUIC.

@@ -811,7 +811,7 @@ pub const Session = struct {
             break :blk a;
         } else |_| resolver.resolve(host) catch return null;
         const began = Io.Clock.awake.now(io).toMilliseconds();
-        const stream = core.sys.connectTcp(io, &addr, port, .none, probe_timeout_ms) catch return null;
+        const stream = core.sys.connectTcp(&addr, port, .none, probe_timeout_ms) catch return null;
         stream.close(io);
         const ms = Io.Clock.awake.now(io).toMilliseconds() - began;
         return @intCast(std.math.clamp(ms, 1, 9999));
