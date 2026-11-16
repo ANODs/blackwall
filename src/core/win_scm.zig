@@ -7,7 +7,7 @@
 //!   blackwall-service uninstall                         (as an administrator)
 //!   blackwall-service --scm                             (by the SCM)
 //!
-//! `install` copies the executable and wintun.dll from its own folder to
+//! `install` copies the executable from its own folder to
 //! %ProgramFiles%\BLACKWALL, where only administrators may write (the
 //! system runs this file), registers the service with the user's
 //! configuration folder fixed in its command line, and lets that user
@@ -188,7 +188,8 @@ pub fn install(env: *std.process.Environ.Map, self_exe: []const u8, config_dir: 
     stopAndWait();
 
     const src_dir = std.fs.path.dirname(self_exe) orelse ".";
-    for ([_][]const u8{ "blackwall-service.exe", "wintun.dll" }) |name| {
+    // wintun.dll the service puts next to itself when it starts
+    for ([_][]const u8{"blackwall-service.exe"}) |name| {
         var from_buf: [1024]u8 = undefined;
         var to_buf: [1024]u8 = undefined;
         const from = try std.fmt.bufPrint(&from_buf, "{s}\\{s}", .{ src_dir, name });
@@ -203,12 +204,7 @@ pub fn install(env: *std.process.Environ.Map, self_exe: []const u8, config_dir: 
             return error.CopyFailed;
         }
     }
-    {
-        var p_buf: [1024]u8 = undefined;
-        const p = try std.fmt.bufPrint(&p_buf, "{s}\\build", .{dir});
-        var pw: [1024]u16 = undefined;
-        try writeSmallFile(wide(&pw, p), build);
-    }
+    try writeBuild(env, build);
 
     var cmd_buf: [2048]u8 = undefined;
     const cmd = try std.fmt.bufPrint(&cmd_buf, "\"{s}\\blackwall-service.exe\" --scm --config \"{s}\"", .{ dir, config_dir });
@@ -232,6 +228,43 @@ pub fn install(env: *std.process.Environ.Map, self_exe: []const u8, config_dir: 
     if (ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(&sw, sddl), 1, &sd, null) == 0) return error.BadSid;
     defer _ = LocalFree(sd);
     if (SetServiceObjectSecurity(svc.?, DACL_SECURITY_INFORMATION, sd.?) == 0) return error.SecurityFailed;
+}
+
+fn writeBuild(env: *std.process.Environ.Map, build: []const u8) !void {
+    var dir_buf: [512]u8 = undefined;
+    var p_buf: [1024]u8 = undefined;
+    const p = try std.fmt.bufPrint(&p_buf, "{s}\\build", .{installDir(env, &dir_buf)});
+    var pw: [1024]u16 = undefined;
+    try writeSmallFile(wide(&pw, p), build);
+}
+
+/// Run by the installed service (as LocalSystem) for the window: replaces
+/// its own executable with `bytes` of release `release`, checked by the
+/// caller. The running file is moved aside (Windows allows that) and
+/// removed at the next start of Windows.
+pub fn replaceSelf(env: *std.process.Environ.Map, bytes: []const u8, release: []const u8) !void {
+    if (comptime builtin.os.tag != .windows) return error.Unsupported;
+    var dir_buf: [512]u8 = undefined;
+    const dir = installDir(env, &dir_buf);
+    var exe_buf: [1024]u8 = undefined;
+    var old_buf: [1024]u8 = undefined;
+    var new_buf: [1024]u8 = undefined;
+    const exe = try std.fmt.bufPrint(&exe_buf, "{s}\\blackwall-service.exe", .{dir});
+    const old = try std.fmt.bufPrint(&old_buf, "{s}\\blackwall-service.old", .{dir});
+    const new = try std.fmt.bufPrint(&new_buf, "{s}\\blackwall-service.new", .{dir});
+    var ew: [1024]u16 = undefined;
+    var ow: [1024]u16 = undefined;
+    var nw: [1024]u16 = undefined;
+    try writeSmallFile(wide(&nw, new), bytes);
+    _ = MoveFileExW(wide(&ow, old), null, MOVEFILE_DELAY_UNTIL_REBOOT);
+    if (MoveFileExW(wide(&ew, exe), wide(&ow, old), MOVEFILE_REPLACE_EXISTING) == 0) return error.ReplaceFailed;
+    if (MoveFileExW(wide(&nw, new), wide(&ew, exe), MOVEFILE_REPLACE_EXISTING) == 0) {
+        // put the old one back
+        _ = MoveFileExW(wide(&ow, old), wide(&ew, exe), MOVEFILE_REPLACE_EXISTING);
+        return error.ReplaceFailed;
+    }
+    _ = MoveFileExW(wide(&ow, old), null, MOVEFILE_DELAY_UNTIL_REBOOT);
+    try writeBuild(env, release);
 }
 
 pub fn uninstall() !void {

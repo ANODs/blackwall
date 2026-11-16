@@ -486,29 +486,48 @@ pub const Link = struct {
         return std.mem.eql(u8, have, l.build);
     }
 
-    /// Puts this release's service in place, after the administrator's
-    /// consent (UAC). Once per release: the service then starts and stops
-    /// at the window's word without asking.
+    /// Puts this release's service in place. An installed service of an
+    /// earlier release replaces itself with this one when it is signed (a
+    /// release); otherwise, and the first time, the administrator's consent
+    /// (UAC). The service then starts and stops at the window's word
+    /// without asking.
     fn ensureWinService(l: *Link, interactive: bool) anyerror!void {
         if (comptime !on_windows) return error.Unsupported;
         if (l.winServiceCurrent()) return;
-        if (!interactive) return error.NeedsAdministrator;
-        if (win_embed.wintun.len == 0) return error.WintunMissing;
-        // the service and wintun.dll, unpacked for the installer to copy
+        // the service, unpacked where the installer or the old service reads it
         var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir = try std.fmt.bufPrint(&dir_buf, "{s}\\setup", .{l.config_dir});
         const cwd = std.Io.Dir.cwd();
         try cwd.createDirPath(l.io, dir);
         var p_buf: [std.fs.max_path_bytes]u8 = undefined;
-        try cwd.writeFile(l.io, .{ .sub_path = try std.fmt.bufPrint(&p_buf, "{s}\\wintun.dll", .{dir}), .data = win_embed.wintun });
         const exe = try std.fmt.bufPrint(&p_buf, "{s}\\blackwall-service.exe", .{dir});
         try cwd.writeFile(l.io, .{ .sub_path = exe, .data = win_embed.service });
+        if (scm.query() != null and win_embed.service_sig.len > 0) {
+            var s_buf: [std.fs.max_path_bytes]u8 = undefined;
+            try cwd.writeFile(l.io, .{ .sub_path = try std.fmt.bufPrint(&s_buf, "{s}\\blackwall-service.sig", .{dir}), .data = win_embed.service_sig });
+            if (scm.query() != .stopped) scm.stop();
+            l.waitStopped();
+            if (scm.start(&.{ "--upgrade", dir })) {
+                l.waitStopped();
+                if (l.winServiceCurrent()) return;
+                log.info("the service keeps its release", .{});
+            } else |err| log.info("service upgrade: {t}", .{err});
+        }
+        if (!interactive) return error.NeedsAdministrator;
         var sid_buf: [128]u8 = undefined;
         const sid = win.userSid(&sid_buf) orelse return error.NoUser;
         var params_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
         const params = try std.fmt.bufPrint(&params_buf, "install --config \"{s}\" --user {s}", .{ l.config_dir, sid });
         try win.runElevated(exe, params);
         if (!l.winServiceCurrent()) return error.InstallFailed;
+    }
+
+    fn waitStopped(l: *Link) void {
+        for (0..100) |_| {
+            const st = scm.query() orelse return;
+            if (st == .stopped) return;
+            l.io.sleep(.fromMilliseconds(200), .awake) catch {};
+        }
     }
 
     fn spawnWin(l: *Link, o: Options) !void {

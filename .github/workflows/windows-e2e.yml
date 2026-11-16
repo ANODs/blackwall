@@ -1,22 +1,27 @@
-name: Windows probe
+name: Windows end-to-end
 
-# The Windows work in progress: quick runs of the parts being built, on a
-# real Windows machine, from the windows branch only.
+# On a real Windows machine of CI (an administrator, nothing of value on it):
+# the socket layer, the whole suite, then tools/windows/e2e.ps1 with the
+# Wintun adapter, routes per application, the system service and the kill
+# switch on WFP.
 
 on:
   push:
-    branches: [windows]
+    branches: [main, windows]
+    paths-ignore: ['site/**', 'worker/**', 'docs/**', '**.md']
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-probe
+  group: windows-e2e-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  probe:
+  e2e:
+    name: Windows end-to-end
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -35,3 +40,4 @@ jobs:
       - run: zig build -Doptimize=ReleaseSafe "-Dwintun=$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll"
       - run: Copy-Item $env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll zig-out\bin\
       - run: pwsh tools/windows/e2e.ps1 -Bin zig-out\bin
+      - run: pwsh tools/windows/upgrade.ps1 -Wintun $env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll

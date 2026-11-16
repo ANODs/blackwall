@@ -119,16 +119,35 @@ pub fn build(b: *std.Build) void {
             },
         }),
     }) else null;
-    // Windows: the app carries the service and wintun.dll, and puts them in
-    // place when the user first connects (src/link.zig, core/win_scm.zig)
-    const wintun_dll = b.option([]const u8, "wintun", "Windows: wintun.dll (amd64, from www.wintun.net) for the app to carry");
+    // Windows: the service carries wintun.dll and puts it next to itself; the
+    // app carries the service (and, in a release, its signature, so an
+    // installed service can replace itself with it: core/win_scm.zig)
+    const wintun_dll = b.option([]const u8, "wintun", "Windows: wintun.dll (amd64, from www.wintun.net) for the service to carry");
     if (os == .windows) if (service) |sv| {
+        const dll = b.addWriteFiles();
+        if (wintun_dll) |p| _ = dll.addCopyFile(.{ .cwd_relative = p }, "wintun.dll") else _ = dll.add("wintun.dll", "");
+        sv.root_module.addAnonymousImport("wintun_dll", .{ .root_source_file = dll.getDirectory().path(b, "wintun.dll") });
+
         const files = b.addWriteFiles();
         _ = files.addCopyFile(sv.getEmittedBin(), "blackwall-service.exe");
-        if (wintun_dll) |p| _ = files.addCopyFile(.{ .cwd_relative = p }, "wintun.dll") else _ = files.add("wintun.dll", "");
+        if (update_pubkey.len > 0 and b.graph.environ_map.get("BLACKWALL_UPDATE_KEY") != null) {
+            // the signing tool runs here, on the build machine
+            const host_core = b.createModule(.{ .root_source_file = b.path("src/core/core.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
+            const host_update = b.createModule(.{ .root_source_file = b.path("src/core/update.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+            const host_sign = b.addExecutable(.{ .name = "blackwall-sign-host", .root_module = b.createModule(.{
+                .root_source_file = b.path("src/tools/sign.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+                .imports = &.{ .{ .name = "update", .module = host_update }, .{ .name = "core", .module = host_core } },
+            }) });
+            const sig = b.addRunArtifact(host_sign);
+            sig.addArgs(&.{ "sign-helper", version });
+            sig.addFileArg(sv.getEmittedBin());
+            _ = files.addCopyFile(sig.addOutputFileArg("blackwall-service.sig"), "blackwall-service.sig");
+        } else _ = files.add("blackwall-service.sig", "");
         const embed = files.add("embed.zig",
             \\pub const service = @embedFile("blackwall-service.exe");
-            \\pub const wintun = @embedFile("wintun.dll");
+            \\pub const service_sig = @embedFile("blackwall-service.sig");
             \\
         );
         exe.root_module.addAnonymousImport("win_embed", .{ .root_source_file = embed });

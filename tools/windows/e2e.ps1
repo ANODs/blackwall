@@ -103,7 +103,7 @@ Config 'direct'
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 & (Join-Path $Bin 'blackwall-service.exe') install --config $cfg --user $sid
 Check "installed (exit $LASTEXITCODE)" ($LASTEXITCODE -eq 0)
-Check 'its files are in Program Files' ((Test-Path "$env:ProgramFiles\BLACKWALL\blackwall-service.exe") -and (Test-Path "$env:ProgramFiles\BLACKWALL\wintun.dll"))
+Check 'it is in Program Files' (Test-Path "$env:ProgramFiles\BLACKWALL\blackwall-service.exe")
 & sc.exe sdshow BLACKWALL | Write-Host
 & sc.exe start BLACKWALL --tun wintun | Out-Null
 Start-Sleep -Seconds 6

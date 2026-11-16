@@ -349,6 +349,7 @@ const Service = struct {
         const dir_len = std.process.executableDirPath(s.io, &dll_buf) catch return error.WintunMissing;
         const dll = std.fmt.bufPrint(dll_buf[dir_len..], "\\wintun.dll", .{}) catch return error.WintunMissing;
         const path = dll_buf[0 .. dir_len + dll.len];
+        placeWintun(s.io, s.gpa, path);
         s.lease = win.up(.{ .mtu = s.args.mtu, .ipv6 = s.settings.ipv6 != .system, .dll = path }) catch |err| {
             s.writeError(err);
             return err;
@@ -808,6 +809,41 @@ fn installWindows(init: std.process.Init, argv: []const []const u8) !void {
     log.info("installed", .{});
 }
 
+/// Windows: the installed service replaces itself with the one in `dir`
+/// (unpacked there by the window) when the release key signed it and it is
+/// not older. Nothing else may replace a file the system runs.
+fn upgradeWindows(init: std.process.Init, dir: []const u8) !void {
+    const gpa = init.gpa;
+    var p_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.Io.Dir.cwd();
+    const bytes = try cwd.readFileAlloc(init.io, try std.fmt.bufPrint(&p_buf, "{s}\\blackwall-service.exe", .{dir}), gpa, .limited(64 << 20));
+    defer gpa.free(bytes);
+    const sig = try cwd.readFileAlloc(init.io, try std.fmt.bufPrint(&p_buf, "{s}\\blackwall-service.sig", .{dir}), gpa, .limited(1024));
+    defer gpa.free(sig);
+    const key = build_options.update_pubkey;
+    if (key.len == 0) return log.err("upgrade: this build trusts no signature", .{});
+    const signed = core.helper_ipc.Signed.parse(sig) orelse return log.err("upgrade: no signature", .{});
+    core.helper_ipc.verifyHelper(key, signed, bytes) catch return log.err("upgrade: the signature does not match", .{});
+    const theirs = std.SemanticVersion.parse(signed.version) catch return log.err("upgrade: bad release", .{});
+    const ours = std.SemanticVersion.parse(build_options.version) catch return;
+    if (theirs.order(ours) == .lt) return log.err("upgrade: {s} is older than {s}", .{ signed.version, build_options.version });
+    core.win_scm.replaceSelf(init.environ_map, bytes, signed.version) catch |err| return log.err("upgrade: {t}", .{err});
+    log.info("replaced by {s}", .{signed.version});
+}
+
+/// Windows: wintun.dll, which this executable carries, next to it.
+fn placeWintun(io: Io, gpa: std.mem.Allocator, path: []const u8) void {
+    if (comptime !on_windows) return;
+    const dll = @embedFile("wintun_dll");
+    if (dll.len == 0) return; // a build without it: the file must be there
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.readFileAlloc(io, path, gpa, .limited(4 << 20))) |have| {
+        defer gpa.free(have);
+        if (std.mem.eql(u8, have, dll)) return;
+    } else |_| {}
+    cwd.writeFile(io, .{ .sub_path = path, .data = dll }) catch |err| log.err("wintun.dll: {t}", .{err});
+}
+
 var scm_init: std.process.Init = undefined;
 var scm_config: ?[]const u8 = null;
 
@@ -846,6 +882,8 @@ fn serve(init: std.process.Init, argv: []const []const u8) !void {
                 args.tun = .{ .fd = try std.fmt.parseInt(i32, val[3..], 10) };
             } else return usage();
             i += 1;
+        } else if (on_windows and std.mem.eql(u8, arg, "--upgrade")) {
+            return upgradeWindows(init, val);
         } else if (std.mem.eql(u8, arg, "--release")) {
             // let go of what a service that is gone still holds
             linux.remove();
