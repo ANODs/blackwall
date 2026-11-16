@@ -586,7 +586,7 @@ pub const Dialer = struct {
 /// address once `Flow.dial` has filled it.
 pub const Upstream = struct {
     stream: net.Stream,
-    ur: if (sys.supported) sys.SockReader else net.Stream.Reader,
+    ur: sys.SockReader,
     uw: net.Stream.Writer,
     rr: tls13.RecordReader,
     rw: tls13.RecordWriter,
@@ -942,7 +942,7 @@ pub const Local = struct {
     pub fn waitReadable(l: *Local, ms: u32) bool {
         if (l.r.buffered().len > 0) return true;
         return switch (l.end) {
-            .socks => |s| if (builtin.os.tag == .windows) false else sys.waitFd(s.socket.handle, false, @intCast(ms)),
+            .socks => |s| sys.waitFd(s.socket.handle, false, @intCast(ms)),
             .tun => |c| c.waitReadable(ms),
         };
     }
@@ -1124,14 +1124,10 @@ pub const Flow = struct {
             return err;
         };
         errdefer u.stream.close(io);
-        if (comptime sys.supported) {
-            u.ur = .init(u.stream.socket.handle, io, &u.urb);
-            // the handshakes below must finish in time; data may idle forever
-            u.ur.setDeadline(handshake_timeout_ms);
-        } else {
-            u.ur = u.stream.reader(io, &u.urb);
-        }
-        defer if (comptime sys.supported) u.ur.noDeadline();
+        u.ur = .init(u.stream.socket.handle, io, &u.urb);
+        // the handshakes below must finish in time; data may idle forever
+        u.ur.setDeadline(handshake_timeout_ms);
+        defer u.ur.noDeadline();
         u.uw = u.stream.writer(io, &u.uwb);
         u.tls = v.reality != null or v.tls != null;
         if (v.reality) |re| {

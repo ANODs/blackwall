@@ -508,7 +508,7 @@ pub const Tunnel = struct {
         } else dst.addr;
         const flow = t.gpa.create(UdpFlow) catch return;
         flow.* = .{ .tunnel = t, .key = key, .sock = null, .stats = stats };
-        flow.sock = sys.Udp.open(&addr, dst.port, t.dialer.bind) catch return t.gpa.destroy(flow);
+        flow.sock = sys.Udp.open(t.io, &addr, dst.port, t.dialer.bind) catch return t.gpa.destroy(flow);
         flow.last_ms.store(t.nowMs(), .monotonic);
         t.udp_mutex.lockUncancelable(t.io);
         t.udp.put(t.gpa, key, flow) catch {

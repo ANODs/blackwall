@@ -24,3 +24,4 @@ jobs:
         with:
           version: 0.17.1
       - run: zig test src/core/afd.zig
+      - run: zig build test --summary failures

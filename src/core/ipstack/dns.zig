@@ -385,7 +385,7 @@ pub const Resolver = struct {
             for (0..total) |k| {
                 const i = (first + k) % total;
                 const srv = r.server(i);
-                const u = sys.Udp.open(&srv.addr, srv.port, r.bind) catch continue;
+                const u = sys.Udp.open(r.io, &srv.addr, srv.port, r.bind) catch continue;
                 defer u.close();
                 u.send(query) catch continue;
                 while (true) {
@@ -675,29 +675,23 @@ test "the resolver cache stays bounded and drops what expires first" {
 }
 
 test "resolver forwards to a real server and caches the answer" {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sockets and pipes
     // a tiny DNS server on loopback answering every A query with 10.1.2.3
-    const c = std.c;
+    const io = std.testing.io;
     const lo = packet.v4(.{ 127, 0, 0, 1 });
-    const srv = c.socket(c.AF.INET, c.SOCK.DGRAM, 0);
-    defer _ = c.close(srv);
-    var sa: c.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
-    try std.testing.expectEqual(0, c.bind(srv, @ptrCast(&sa), @sizeOf(c.sockaddr.in)));
-    var len: c.socklen_t = @sizeOf(c.sockaddr.in);
-    _ = c.getsockname(srv, @ptrCast(&sa), &len);
-    const port = std.mem.bigToNative(u16, sa.port);
+    const here: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const srv = try here.bind(io, .{ .mode = .dgram });
+    defer srv.close(io);
+    const port = srv.address.getPort();
 
     const T = struct {
-        fn serve(fd: c.fd_t) void {
+        fn serve(sock: Io.net.Socket) void {
             var buf: [512]u8 = undefined;
-            var from: c.sockaddr.in = undefined;
-            var flen: c.socklen_t = @sizeOf(c.sockaddr.in);
-            const n = c.recvfrom(fd, &buf, buf.len, 0, @ptrCast(&from), &flen);
-            if (n <= 0) return;
-            const q = parseQuery(buf[0..@intCast(n)]).?;
+            if (!sys.waitFd(sock.handle, false, 5000)) return;
+            const msg = sock.receive(std.testing.io, &buf) catch return;
+            const q = parseQuery(msg.data).?;
             var out: [512]u8 = undefined;
-            const m = respond(&out, buf[0..@intCast(n)], &q, 0, &.{.{ .rtype = type_a, .ttl = 60, .data = &.{ 10, 1, 2, 3 } }});
-            _ = c.sendto(fd, &out, m, 0, @ptrCast(&from), flen);
+            const m = respond(&out, msg.data, &q, 0, &.{.{ .rtype = type_a, .ttl = 60, .data = &.{ 10, 1, 2, 3 } }});
+            sock.send(std.testing.io, &msg.from, out[0..m]) catch {};
         }
     };
     const th = try std.Thread.spawn(.{}, T.serve, .{srv});
@@ -728,42 +722,32 @@ test "resolver forwards to a real server and caches the answer" {
 }
 
 test "resolver: a silent first server, the next one answers; lookups of one name share a query" {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sockets and pipes
-    const c = std.c;
+    const io = std.testing.io;
     const lo = packet.v4(.{ 127, 0, 0, 1 });
     // a socket nobody reads stands for the resolver that stopped answering
-    const silent = c.socket(c.AF.INET, c.SOCK.DGRAM, 0);
-    defer _ = c.close(silent);
-    const srv = c.socket(c.AF.INET, c.SOCK.DGRAM, 0);
-    defer _ = c.close(srv);
-    var ports: [2]u16 = undefined;
-    for ([_]c.fd_t{ silent, srv }, &ports) |fd, *port| {
-        var sa: c.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
-        try std.testing.expectEqual(0, c.bind(fd, @ptrCast(&sa), @sizeOf(c.sockaddr.in)));
-        var len: c.socklen_t = @sizeOf(c.sockaddr.in);
-        _ = c.getsockname(fd, @ptrCast(&sa), &len);
-        port.* = std.mem.bigToNative(u16, sa.port);
-    }
+    const here: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const silent = try here.bind(io, .{ .mode = .dgram });
+    defer silent.close(io);
+    const srv = try here.bind(io, .{ .mode = .dgram });
+    defer srv.close(io);
+    const ports = [2]u16{ silent.address.getPort(), srv.address.getPort() };
     const T = struct {
         var queries: std.atomic.Value(u32) = .init(0);
         var stop: std.atomic.Value(bool) = .init(false);
         /// Answers every query until told to stop, so a slow machine that
         /// makes the resolver ask twice still gets its answer.
-        fn serve(fd: c.fd_t) void {
+        fn serve(sock: Io.net.Socket) void {
             var buf: [512]u8 = undefined;
             while (!stop.load(.acquire)) {
-                if (!sys.waitFd(fd, false, 50)) continue;
-                var from: c.sockaddr.in = undefined;
-                var flen: c.socklen_t = @sizeOf(c.sockaddr.in);
-                const n = c.recvfrom(fd, &buf, buf.len, 0, @ptrCast(&from), &flen);
-                if (n <= 0) return;
+                if (!sys.waitFd(sock.handle, false, 50)) continue;
+                const msg = sock.receive(std.testing.io, &buf) catch return;
                 _ = queries.fetchAdd(1, .monotonic);
                 // slow enough for the other lookups to arrive meanwhile
                 std.Io.sleep(std.testing.io, .fromMilliseconds(40), .awake) catch {};
-                const q = parseQuery(buf[0..@intCast(n)]).?;
+                const q = parseQuery(msg.data).?;
                 var out: [512]u8 = undefined;
-                const m = respond(&out, buf[0..@intCast(n)], &q, 0, &.{.{ .rtype = type_a, .ttl = 60, .data = &.{ 10, 9, 8, 7 } }});
-                _ = c.sendto(fd, &out, m, 0, @ptrCast(&from), flen);
+                const m = respond(&out, msg.data, &q, 0, &.{.{ .rtype = type_a, .ttl = 60, .data = &.{ 10, 9, 8, 7 } }});
+                sock.send(std.testing.io, &msg.from, out[0..m]) catch {};
             }
         }
         fn lookup(r: *Resolver, ok: *std.atomic.Value(u32)) void {

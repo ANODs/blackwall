@@ -210,16 +210,12 @@ pub fn wait(h: Handle, for_write: bool, ms: i32) bool {
     // the event wait is only a guard should the driver's timer not fire
     const guard: ?u32 = if (ms < 0) null else @as(u32, @intCast(ms)) + 1000;
     const r = call(h, w.IOCTL.AFD.POLL, @ptrCast(&info), @ptrCast(&info), guard) catch return false;
-    last_poll = .{ .status = @intFromEnum(r.status), .count = info.count, .events = info.handles[0].events };
     return switch (r.status) {
         .SUCCESS => info.count > 0 and info.handles[0].events != 0,
         .TIMEOUT => false,
         else => true,
     };
 }
-
-/// What the last wait got back from the driver, for tests.
-pub threadlocal var last_poll: struct { status: u32 = 0, count: u32 = 0, events: u32 = 0 } = .{};
 
 /// Bytes from a connected TCP socket; 0 at its end.
 pub fn recv(h: Handle, buf: []u8) Error!usize {
@@ -249,9 +245,7 @@ test "connect with a timeout, wait for data, read it" {
     const peer = try server.accept(io);
     defer peer.close(io);
     // nothing sent yet
-    const early = wait(s.socket.handle, false, 50);
-    if (early) std.debug.print("poll: status {x} count {d} events {x}\n", .{ last_poll.status, last_poll.count, last_poll.events });
-    try std.testing.expect(!early);
+    try std.testing.expect(!wait(s.socket.handle, false, 50));
     try std.testing.expect(wait(s.socket.handle, true, 50));
     var wb: [64]u8 = undefined;
     var pw = peer.writer(io, &wb);

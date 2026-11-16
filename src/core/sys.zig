@@ -3,30 +3,36 @@
 //! with a timeout, and UDP request/response with a timeout.
 //!
 //! Sockets made here are plain file descriptors; a TCP one is wrapped into
-//! `std.Io.net.Stream` and used with the normal readers and writers.
+//! `std.Io.net.Stream` and used with the normal readers and writers. On
+//! Windows they are AFD handles of the kind std.Io.net opens (afd.zig).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
 const net = std.Io.net;
 const packet = @import("ipstack/packet.zig");
+const afd = @import("afd.zig");
+const windows = builtin.os.tag == .windows;
 
 pub const Addr = packet.Addr;
 
-/// Windows has no TUN data plane yet: these calls exist there but refuse.
-pub const supported = builtin.os.tag != .windows;
+/// POSIX calls (pipes, socket pairs, peer credentials). The sockets below
+/// work everywhere; on Windows through afd.zig.
+pub const supported = !windows;
 
 /// How outbound sockets leave the machine.
 pub const Bind = union(enum) {
     /// normal routing
     none,
-    /// macOS: IP_BOUND_IF / IPV6_BOUND_IF with this interface index
+    /// macOS: IP_BOUND_IF / IPV6_BOUND_IF with this interface index;
+    /// Windows: IP_UNICAST_IF / IPV6_UNICAST_IF
     index: u32,
     /// Linux: SO_BINDTODEVICE with this interface name (needs CAP_NET_RAW)
     name: [16:0]u8,
 
     pub fn interface(name: []const u8) Bind {
-        if (comptime !supported) return .none;
+        // Windows names interfaces by index only (the service has it)
+        if (comptime windows) return .none;
         if (builtin.os.tag == .linux) {
             var n: [16:0]u8 = @splat(0);
             @memcpy(n[0..@min(name.len, 15)], name[0..@min(name.len, 15)]);
@@ -73,7 +79,7 @@ fn sockaddr(addr: *const Addr, port: u16) struct { Sockaddr, c.socklen_t, u32 } 
 }
 
 pub fn closeFd(fd: c.fd_t) void {
-    if (comptime !supported) return;
+    if (comptime windows) return afd.close(fd);
     _ = c.close(fd);
 }
 
@@ -135,7 +141,7 @@ pub fn stackSize(want: usize) usize {
 
 /// Wait until `fd` is readable (or writable); false on timeout.
 pub fn waitFd(fd: c.fd_t, for_write: bool, ms: i32) bool {
-    if (comptime !supported) return false;
+    if (comptime windows) return afd.wait(fd, for_write, ms);
     var fds = [1]c.pollfd{.{ .fd = fd, .events = if (for_write) c.POLL.OUT else c.POLL.IN, .revents = 0 }};
     while (true) {
         const rc = c.poll(&fds, 1, ms);
@@ -170,7 +176,6 @@ pub const SockReader = struct {
 
     fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const r: *SockReader = @alignCast(@fieldParentPtr("interface", io_r));
-        if (comptime !supported) return error.ReadFailed;
         const dest = limit.slice(try w.writableSliceGreedy(1));
         while (true) {
             if (r.deadline_ms != 0) {
@@ -179,6 +184,12 @@ pub const SockReader = struct {
                     r.timed_out = true;
                     return error.ReadFailed;
                 }
+            }
+            if (comptime windows) {
+                const n = afd.recv(r.fd, dest) catch return error.ReadFailed;
+                if (n == 0) return error.EndOfStream;
+                w.advance(n);
+                return n;
             }
             const n = c.recv(r.fd, dest.ptr, dest.len, 0);
             if (n < 0) {
@@ -212,7 +223,16 @@ pub fn peerUid(fd: c.fd_t) ?u32 {
 
 /// TCP connection to `addr` leaving through `bind`, within `timeout_ms`.
 pub fn connectTcp(addr: *const Addr, port: u16, bind: Bind, timeout_ms: i32) Error!net.Stream {
-    if (comptime !supported) return error.SocketFailed;
+    if (comptime windows) {
+        const index: u32 = switch (bind) {
+            .index => |i| i,
+            else => 0,
+        };
+        return afd.connectTcp(toIpAddress(addr, port), index, @intCast(@max(timeout_ms, 1))) catch |err| switch (err) {
+            error.RecvFailed => error.ConnectFailed,
+            else => |e| e,
+        };
+    }
     const sa, const len, const family = sockaddr(addr, port);
     const fd = c.socket(family, c.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
@@ -263,11 +283,57 @@ pub fn fromIpAddress(a: net.IpAddress) struct { Addr, u16 } {
 }
 
 /// One UDP socket aimed at a single peer.
-pub const Udp = struct {
+pub const Udp = if (windows) WinUdp else PosixUdp;
+
+/// Windows: a socket of afd.zig, sent and received through std.Io.net.
+const WinUdp = struct {
+    io: std.Io,
+    sock: net.Socket,
+    peer: net.IpAddress,
+
+    pub fn open(io: std.Io, peer: *const Addr, port: u16, bind: Bind) Error!WinUdp {
+        const to = toIpAddress(peer, port);
+        const index: u32 = switch (bind) {
+            .index => |i| i,
+            else => 0,
+        };
+        const sock = afd.openUdp(to, index) catch |err| return switch (err) {
+            error.BindFailed => error.BindFailed,
+            else => error.SocketFailed,
+        };
+        return .{ .io = io, .sock = sock, .peer = to };
+    }
+
+    pub fn close(u: WinUdp) void {
+        afd.close(u.sock.handle);
+    }
+
+    pub fn send(u: WinUdp, data: []const u8) Error!void {
+        u.sock.send(u.io, &u.peer, data) catch return error.SendFailed;
+    }
+
+    /// Next datagram from the peer, or Timeout.
+    pub fn recv(u: WinUdp, buf: []u8, timeout_ms: i32) Error!usize {
+        const deadline = std.Io.Clock.awake.now(u.io).toMilliseconds() + timeout_ms;
+        while (true) {
+            const left = deadline - std.Io.Clock.awake.now(u.io).toMilliseconds();
+            if (left <= 0 or !afd.wait(u.sock.handle, false, @intCast(left))) return error.Timeout;
+            const msg = u.sock.receive(u.io, buf) catch |err| switch (err) {
+                // an ICMP "port unreachable" from an earlier send
+                error.PortUnreachable => continue,
+                else => return error.RecvFailed,
+            };
+            // an unconnected socket hears anyone: keep only the peer's answers
+            if (msg.from.eql(&u.peer)) return msg.data.len;
+        }
+    }
+};
+
+const PosixUdp = struct {
     fd: c.fd_t,
 
-    pub fn open(peer: *const Addr, port: u16, bind: Bind) Error!Udp {
-        if (comptime !supported) return error.SocketFailed;
+    pub fn open(io: std.Io, peer: *const Addr, port: u16, bind: Bind) Error!PosixUdp {
+        _ = io;
         const sa, const len, const family = sockaddr(peer, port);
         const fd = c.socket(family, c.SOCK.DGRAM, 0);
         if (fd < 0) return error.SocketFailed;
@@ -277,19 +343,17 @@ pub const Udp = struct {
         return .{ .fd = fd };
     }
 
-    pub fn close(u: Udp) void {
+    pub fn close(u: PosixUdp) void {
         closeFd(u.fd);
     }
 
-    pub fn send(u: Udp, data: []const u8) Error!void {
-        if (comptime !supported) return error.SendFailed;
+    pub fn send(u: PosixUdp, data: []const u8) Error!void {
         const rc = c.send(u.fd, data.ptr, data.len, 0);
         if (rc < 0) return error.SendFailed;
     }
 
     /// Next datagram, or Timeout.
-    pub fn recv(u: Udp, buf: []u8, timeout_ms: i32) Error!usize {
-        if (comptime !supported) return error.RecvFailed;
+    pub fn recv(u: PosixUdp, buf: []u8, timeout_ms: i32) Error!usize {
         if (!waitFd(u.fd, false, timeout_ms)) return error.Timeout;
         const rc = c.recv(u.fd, buf.ptr, buf.len, 0);
         if (rc < 0) return error.RecvFailed;
@@ -298,7 +362,6 @@ pub const Udp = struct {
 };
 
 test "connect with timeout to a closed and an open port" {
-    if (comptime !supported) return error.SkipZigTest; // connectTcp is for the systems the service runs on
     const io = std.testing.io;
     const lo = packet.v4(.{ 127, 0, 0, 1 });
     // an open port
@@ -313,29 +376,27 @@ test "connect with timeout to a closed and an open port" {
 }
 
 test "udp request and reply over loopback" {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sockets and pipes
+    const io = std.testing.io;
     const lo = packet.v4(.{ 127, 0, 0, 1 });
     // echo peer: a bound UDP socket
-    const sa, const len, const family = sockaddr(&lo, 0);
-    const srv = c.socket(family, c.SOCK.DGRAM, 0);
-    try std.testing.expect(srv >= 0);
-    defer closeFd(srv);
-    try std.testing.expectEqual(0, c.bind(srv, &sa.any, len));
-    var bound: Sockaddr = undefined;
-    var blen: c.socklen_t = @sizeOf(Sockaddr);
-    try std.testing.expectEqual(0, c.getsockname(srv, &bound.any, &blen));
-    const port = std.mem.bigToNative(u16, bound.in.port);
+    const here: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const srv = try here.bind(io, .{ .mode = .dgram });
+    defer srv.close(io);
+    const port = srv.address.getPort();
 
-    const u = try Udp.open(&lo, port, .none);
+    const u = try Udp.open(io, &lo, port, .none);
     defer u.close();
     try u.send("ping");
     var buf: [16]u8 = undefined;
-    var from: Sockaddr = undefined;
-    var flen: c.socklen_t = @sizeOf(Sockaddr);
-    const n = c.recvfrom(srv, &buf, buf.len, 0, &from.any, &flen);
-    try std.testing.expectEqual(4, n);
-    _ = c.sendto(srv, "pong", 4, 0, &from.any, flen);
-    const m = try u.recv(&buf, 1000);
+    try std.testing.expect(waitFd(srv.handle, false, 2000));
+    const got = try srv.receive(io, &buf);
+    try std.testing.expectEqualStrings("ping", got.data);
+    try srv.send(io, &got.from, "pong");
+    const m = try u.recv(&buf, 2000);
     try std.testing.expectEqualStrings("pong", buf[0..m]);
     try std.testing.expectError(error.Timeout, u.recv(&buf, 10));
+}
+
+test {
+    _ = afd;
 }
