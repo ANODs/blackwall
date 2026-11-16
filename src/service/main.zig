@@ -35,6 +35,7 @@ const fdpass = @import("fdpass");
 const linux = @import("linux.zig");
 const linux_proc = @import("linux_proc.zig");
 const win = @import("windows.zig");
+const win_owner = @import("win_owner.zig");
 const on_windows = builtin.os.tag == .windows;
 const darwin = if (builtin.os.tag.isDarwin()) struct {
     const process = @import("darwin/process.zig");
@@ -172,7 +173,7 @@ const Service = struct {
     dns4: [8][4]u8 = undefined,
     dns4_len: usize = 0,
     /// who owns a connection (Linux, `--tun auto`)
-    owners: if (builtin.os.tag == .linux) linux_proc.Searcher else void = undefined,
+    owners: if (builtin.os.tag == .linux) linux_proc.Searcher else if (on_windows) win_owner.Searcher else void = undefined,
     stopping: std.atomic.Value(bool) = .init(false),
 
     /// The kill switch the helper holds. In standby direct traffic must
@@ -363,7 +364,9 @@ const Service = struct {
         for (lease.dns[0..lease.dns_len]) |ip| s.addDns(ip);
         for (core.ipstack.dns.Resolver.public_servers) |e| s.addDns(e.addr[12..16].*);
         log.info("adapter {d}, own traffic on interface {d}, {d} resolvers captured", .{ lease.index, lease.bind_index, lease.dns_len });
-        const t = try tunnel.Tunnel.create(s.gpa, s.io, .{ .mtu = s.args.mtu, .bind = .{ .index = lease.bind_index }, .upstream_dns = dns_servers });
+        s.owners = .init(s.gpa, s.io);
+        const lookup: tunnel.AppLookup = .{ .ctx = &s.owners, .find = findWinApp };
+        const t = try tunnel.Tunnel.create(s.gpa, s.io, .{ .mtu = s.args.mtu, .bind = .{ .index = lease.bind_index }, .upstream_dns = dns_servers, .lookup = lookup });
         errdefer t.destroy();
         try t.setConfig(s.built.?.cfg);
         s.t = t;
@@ -385,6 +388,7 @@ const Service = struct {
                 if (s.lease) |*l| {
                     l.device.deinit();
                     win.down(l);
+                    s.owners.deinit();
                 }
                 s.lease = null;
             } else s.device.deinit();
@@ -605,6 +609,12 @@ fn findApp(ctx: *anyopaque, udp: bool, local: packet.Endpoint, remote: packet.En
     return searcher.find(udp, local.addr, local.port, remote.addr, remote.port, buf);
 }
 
+fn findWinApp(ctx: *anyopaque, udp: bool, local: packet.Endpoint, remote: packet.Endpoint, buf: []u8) ?[]u8 {
+    if (comptime !on_windows) return null;
+    const owners: *win_owner.Searcher = @ptrCast(@alignCast(ctx));
+    return owners.find(udp, !packet.isV4(&local.addr), local.port, remote.port, buf);
+}
+
 fn tunToolPath(out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = c.readlink("/proc/self/exe", &self_buf, self_buf.len);
@@ -820,5 +830,6 @@ test {
     _ = linux_proc;
     _ = @import("nft.zig");
     _ = win;
+    _ = win_owner;
     if (builtin.os.tag.isDarwin()) _ = darwin.process;
 }

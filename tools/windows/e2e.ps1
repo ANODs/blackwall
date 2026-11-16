@@ -10,9 +10,18 @@ $cfg = Join-Path $env:RUNNER_TEMP 'bwcfg'
 New-Item -ItemType Directory -Force $cfg | Out-Null
 $failed = $false
 
-function Config([string]$route) {
-    $json = '{"version":1,"next_id":1,"settings":{"default_route":{"' + $route + '":{}},"kill_switch":"off","ipv6":"block"},"subs":[],"servers":[],"rules":[]}'
+function Config([string]$route, [string]$rules = '') {
+    $json = '{"version":1,"next_id":1,"settings":{"default_route":{"' + $route + '":{}},"kill_switch":"off","ipv6":"block"},"subs":[],"servers":[],"rules":[' + $rules + ']}'
     Set-Content -Path (Join-Path $cfg 'config.json') -Value $json -Encoding ascii
+}
+
+function Rule([string]$path, [string]$route) {
+    $id = $path.ToLower().Replace('\', '\\')
+    return '{"app_id":"' + $id + '","name":"x","route":{"' + $route + '":{}}}'
+}
+
+function FetchPwsh {
+    try { return [string](Invoke-WebRequest -Uri http://example.com -TimeoutSec 10 -UseBasicParsing).StatusCode } catch { return 'fail' }
 }
 
 function Fetch {
@@ -58,6 +67,32 @@ $p = Start-Service 'block'
 $code = Fetch
 Check "curl is stopped ($code)" ($code -ne '200')
 Get-Content (Join-Path $cfg 'block.err') -Tail 15 | Write-Host
+Stop-Process -Id $p.Id -Force
+Start-Sleep -Seconds 3
+$code = Fetch
+Check "the network is back ($code)" ($code -eq '200')
+
+Write-Host "== a rule for one application"
+$curl = (Get-Command curl.exe).Source
+$pwsh = (Get-Process -Id $PID).Path
+Write-Host "curl: $curl; pwsh: $pwsh"
+Config 'direct' (Rule $curl 'block')
+$p = Start-Service 'rule'
+$code = Fetch
+Check "curl has its own rule and is stopped ($code)" ($code -ne '200')
+$code = FetchPwsh
+Check "PowerShell follows the default route ($code)" ($code -eq '200')
+Stop-Process -Id $p.Id -Force
+Start-Sleep -Seconds 3
+
+Write-Host "== a rule for the application that started it"
+Config 'direct' (Rule $pwsh 'block')
+$p = Start-Service 'parent'
+$code = FetchPwsh
+Check "PowerShell is stopped ($code)" ($code -ne '200')
+$code = Fetch
+Check "curl started by it is stopped too ($code)" ($code -ne '200')
+Get-Content (Join-Path $cfg 'parent.err') -Tail 15 | Write-Host
 Stop-Process -Id $p.Id -Force
 Start-Sleep -Seconds 3
 $code = Fetch
