@@ -371,8 +371,10 @@ test "connect with timeout to a closed and an open port" {
     const port = server.socket.address.getPort();
     const s = try connectTcp(&lo, port, .none, 1000);
     s.close(io);
-    // a closed one (the listener's port after closing the listener is racy; use port 1)
-    try std.testing.expectError(error.ConnectionRefused, connectTcp(&lo, 1, .none, 1000));
+    // a closed one (the listener's port after closing the listener is racy;
+    // use port 1). Windows tries a refused connect again for about two
+    // seconds before it gives up, so the deadline is above that.
+    try std.testing.expectError(error.ConnectionRefused, connectTcp(&lo, 1, .none, 5000));
 }
 
 test "udp request and reply over loopback" {
