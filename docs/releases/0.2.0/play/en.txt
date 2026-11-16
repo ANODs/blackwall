@@ -1,0 +1,1 @@
+Routes for sites (youtube.com and everything under it), a working DPI bypass route, UDP through every protocol, and adding a subscription by scanning a QR code with the camera or from a picture.
