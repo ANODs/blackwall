@@ -116,6 +116,42 @@ On Google Play the app is signed by a key Google keeps (Play App Signing); the k
 above only signs what is uploaded. So the app from Play and the APK from the releases
 page carry different signatures, and one does not update the other.
 
+## Google Play
+
+Every release goes to Google Play by itself: the `android` job of `release.yml` builds the
+App Bundle beside the APK (bundletool is downloaded at a pinned version and checksum), and
+the `play` job hands it to the Android Publisher API (`tools/play_upload.py`, standard
+library and openssl): one edit uploads the bundle, gives the track a release of it and
+commits. The GitHub releases do not wait for it; a Play failure fails only its own job.
+
+- **Track**: `PLAY_TRACK` at the top of `release.yml`, now `alpha` ("Closed testing -
+  Alpha"). `production` once Play has opened production for the account.
+- **Release notes**: the first section's bullet points of `docs/releases/<version>/en.md`
+  and `ru.md` → en-US and ru-RU, plain text, as many whole points as fit Play's 500
+  characters. A `docs/releases/<version>/play/<en|ru>.txt` replaces them when present. A
+  language the store listing does not have is left out.
+- **versionCode** = major·10000 + minor·100 + patch, from `build.zig.zon`. Play refuses a
+  code it has seen, so re-running a release's Play job fails: upload the bundle by hand, or
+  make a new version.
+- While Play still counts the app as a draft, the release is saved as a draft (a warning
+  says so) and is rolled out in Play Console. If Play will not send changes for review on
+  its own, they are committed without it and wait for **Send for review**.
+
+One-time setup (done for `dev.blackwall`: project `blackwall-play`, account
+`play-release@blackwall-play.iam.gserviceaccount.com`): a Google Cloud project with the **Google Play
+Android Developer API** on; a service account in it, no Cloud roles; in Play Console →
+**Users and permissions**, that account's email invited with release rights for BLACKWALL
+only. Its JSON key (Cloud Console → IAM → Service accounts → the account → Keys → Add key →
+JSON) goes into the repository secret:
+
+```sh
+gh secret set PLAY_SERVICE_ACCOUNT_JSON --repo ANODs/blackwall < key.json
+rm key.json
+```
+
+Without that secret the `play` job only warns. A leaked key can push releases of this app
+only: delete it under Keys and make a new one.
+
 ## Not there yet
 
 - Automatic updates (Android does not let an app replace itself silently).
