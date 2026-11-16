@@ -1,0 +1,26 @@
+name: Windows probe
+
+# The Windows work in progress: quick runs of the parts being built, on a
+# real Windows machine, from the windows branch only.
+
+on:
+  push:
+    branches: [windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: zig test src/core/afd.zig
