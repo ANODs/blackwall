@@ -533,6 +533,26 @@ fn noteDialFailure(io: Io, host: []const u8, err: anyerror, http_status: ?u16) v
 /// handshakes within this time, or the dial fails.
 pub const handshake_timeout_ms = 10_000;
 
+/// A transport request answered with 5xx came from a front that is up but
+/// could not reach its backend at that moment (502 Bad Gateway, 503, 504,
+/// a CDN's 52x). Some servers do that now and then, and a new connection
+/// a moment later usually gets through. Xray dials again after any
+/// failure, up to five times with waits of 0.2, 0.4, 0.8 and 1.6 s, so its
+/// users never see those answers; we wait the same way, but for this case
+/// only. Any other failure ends the dial at once: a server that is down or
+/// turns us away is found out (and the reserve taken) without delay. With
+/// early data the answer comes after the dial, the application's first
+/// bytes already in the request: such a refusal still fails the flow.
+const redial_attempts = 5;
+const redial_first_ms = 200;
+
+fn redialable(err: anyerror, http_status: u16) bool {
+    return switch (err) {
+        error.WsUpgradeRefused, error.HttpUpgradeRefused => http_status >= 500 and http_status <= 599,
+        else => false,
+    };
+}
+
 /// Stack of a thread that dials a server. The TLS handshake (its ML-KEM key
 /// pair above all) goes about 175 KiB deep in a release build and 260 KiB
 /// in a debug one, under the thread's own buffers. Only pages that are
@@ -599,6 +619,9 @@ pub const Upstream = struct {
     layer: ?*Layer = null,
     /// HTTP status of a transport request the server refused, for the log
     layer_status: u16 = 0,
+    /// Why the last attempt to dial failed. The meters get it only when
+    /// `Flow.dial` gives up: a redial that works is no fault to report.
+    fault: Fault = .none,
 
     /// The download ended badly while the upload may still be running:
     /// make sure the upload notices. Over HTTP/2 it may be waiting for
@@ -1082,8 +1105,7 @@ pub const Flow = struct {
                 seen = now;
                 quiet_ms = 0;
             } else quiet_ms += linger_step_ms;
-            const stopping = if (f.stop) |st| st.load(.acquire) else false;
-            if (quiet_ms >= limit_ms or stopping) {
+            if (quiet_ms >= limit_ms or f.stopping()) {
                 upstream.shutdown(f.io, .both) catch {};
                 return;
             }
@@ -1106,21 +1128,49 @@ pub const Flow = struct {
 
     /// Connect to the server of `ob`, run the TLS or REALITY handshake if
     /// it has one, and open its transport. The protocol's request is the
-    /// caller's to send.
+    /// caller's to send. A transport request answered with 5xx is dialed
+    /// again (see `redialable`); the application waits meanwhile.
     pub fn dial(f: *const Flow, ob: *const Outbound, u: *Upstream) !void {
         const v = ob.via() orelse return error.NoServer;
-        f.dialInner(ob, &v, u) catch |err| {
-            noteDialFailure(f.io, v.host, err, if (u.layer_status != 0) u.layer_status else null);
-            return err;
-        };
+        var wait_ms: u32 = redial_first_ms;
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            f.dialInner(ob, &v, u) catch |err| {
+                if (attempt < redial_attempts and redialable(err, u.layer_status) and f.pause(wait_ms)) {
+                    wait_ms *= 2;
+                    continue;
+                }
+                if (u.fault != .none) f.fault(u.fault);
+                noteDialFailure(f.io, v.host, err, if (u.layer_status != 0) u.layer_status else null);
+                return err;
+            };
+            return;
+        }
+    }
+
+    /// Sleep `ms`, or less if whoever runs the flows is stopping: false then.
+    fn pause(f: *const Flow, ms: u32) bool {
+        var left = ms;
+        while (left > 0) {
+            if (f.stopping()) return false;
+            const step = @min(left, linger_step_ms);
+            f.io.sleep(.fromMilliseconds(step), .awake) catch return false;
+            left -= step;
+        }
+        return !f.stopping();
+    }
+
+    fn stopping(f: *const Flow) bool {
+        return if (f.stop) |st| st.load(.acquire) else false;
     }
 
     fn dialInner(f: *const Flow, ob: *const Outbound, v: *const Via, u: *Upstream) !void {
         const io = f.io;
         u.layer = null;
         u.layer_status = 0;
+        u.fault = .none;
         u.stream = f.dialer.connect(io, v.host, v.port) catch |err| {
-            f.fault(.unreachable_server);
+            u.fault = .unreachable_server;
             return err;
         };
         errdefer u.stream.close(io);
@@ -1135,12 +1185,12 @@ pub const Flow = struct {
                 .server_name = re.server_name,
                 .reality = .{ .public_key = re.public_key, .short_id = re.short_id },
             }, &u.rr, &u.rw) catch |err| {
-                f.fault(if (err == error.RealityAuthFailed) .reality_rejected else .handshake);
+                u.fault = if (err == error.RealityAuthFailed) .reality_rejected else .handshake;
                 return err;
             };
         } else if (v.tls) |t| {
             const roots = tls13.systemRoots(io) catch |err| {
-                f.fault(.handshake);
+                u.fault = .handshake;
                 return err;
             };
             _ = tls13.handshake(io, &u.ur.interface, &u.uw.interface, .{
@@ -1148,7 +1198,7 @@ pub const Flow = struct {
                 .roots = roots,
                 .alpn = t.alpn,
             }, &u.rr, &u.rw) catch |err| {
-                f.fault(.handshake);
+                u.fault = .handshake;
                 return err;
             };
         }
@@ -1180,7 +1230,7 @@ pub const Flow = struct {
                 l.transport = .{ .ws = c };
                 c.handshake(.{ .path = h.path.slice(), .host = h.host.slice() }) catch |err| {
                     u.layer_status = c.status;
-                    f.fault(.handshake);
+                    u.fault = .handshake;
                     return err;
                 };
                 r = &c.reader;
@@ -1192,7 +1242,7 @@ pub const Flow = struct {
                 l.transport = .{ .httpupgrade = c };
                 c.handshake(.{ .path = h.path.slice(), .host = h.host.slice(), .tls = u.tls }) catch |err| {
                     u.layer_status = c.status;
-                    f.fault(.handshake);
+                    u.fault = .handshake;
                     return err;
                 };
                 r = &c.reader;
@@ -1208,7 +1258,7 @@ pub const Flow = struct {
                     .authority = grpc.authority(&ab, g.authority.slice(), if (v.tls) |t| t.server_name.slice() else "", v.reality != null, v.host, v.port),
                     .mode = if (g.multi) .multi else .gun,
                 }) catch |err| {
-                    f.fault(.handshake);
+                    u.fault = .handshake;
                     return err;
                 };
                 l.transport = .{ .grpc = c };
@@ -1218,7 +1268,7 @@ pub const Flow = struct {
             .xhttp => |*x| {
                 const c = l.make(xhttp.Conn);
                 c.open(io, r, w, l.take(p.tr), l.take(p.tw), xhttpOptions(x, v)) catch |err| {
-                    f.fault(.handshake);
+                    u.fault = .handshake;
                     return err;
                 };
                 l.transport = .{ .xhttp = c };
@@ -2130,6 +2180,149 @@ test "socks5 -> vless inside HTTPUpgrade: the transport's layer carries the flow
     try std.testing.expect(peer.upgrade_ok and peer.header_ok);
     try std.testing.expectEqual(25, p.meter.down.load(.monotonic));
     try std.testing.expectEqual(Fault.none, p.meter.fault.load(.monotonic));
+}
+
+test "only a transport request answered with 5xx is dialed again" {
+    try std.testing.expect(redialable(error.WsUpgradeRefused, 502));
+    try std.testing.expect(redialable(error.WsUpgradeRefused, 503));
+    try std.testing.expect(redialable(error.HttpUpgradeRefused, 504));
+    try std.testing.expect(redialable(error.WsUpgradeRefused, 522));
+    // a wrong path or Host, a refused Host/SNI pair: the same every time
+    try std.testing.expect(!redialable(error.WsUpgradeRefused, 404));
+    try std.testing.expect(!redialable(error.HttpUpgradeRefused, 403));
+    try std.testing.expect(!redialable(error.WsBadHandshake, 0));
+    // a server that is down or turns us away is found out at once
+    try std.testing.expect(!redialable(error.ConnectionRefused, 0));
+    try std.testing.expect(!redialable(error.ReadFailed, 0));
+    try std.testing.expect(!redialable(error.TlsCertificateUntrusted, 0));
+    try std.testing.expect(!redialable(error.RealityAuthFailed, 0));
+}
+
+/// A WebSocket front whose backend is away now and then: the first
+/// `refuse` upgrades get `status` and the connection is closed; then, if
+/// `serve`, one connection is upgraded, its VLESS request checked and the
+/// data after it echoed back.
+const FlakyWsPeer = struct {
+    server: net.Server,
+    thread: std.Thread = undefined,
+    refuse: u8,
+    status: []const u8 = "502 Bad Gateway",
+    serve: bool = true,
+    uuid: [16]u8,
+    accepted: u8 = 0,
+    echoed: bool = false,
+
+    const payload = "hello through ws";
+
+    fn init(io: Io, refuse: u8, uuid: [16]u8) !FlakyWsPeer {
+        const address: net.IpAddress = .{ .ip4 = .loopback(0) };
+        return .{ .server = try address.listen(io, .{ .reuse_address = true }), .refuse = refuse, .uuid = uuid };
+    }
+
+    fn port(peer: *const FlakyWsPeer) u16 {
+        return peer.server.socket.address.getPort();
+    }
+
+    fn run(peer: *FlakyWsPeer, io: Io) void {
+        for (0..peer.refuse + @intFromBool(peer.serve)) |i| {
+            const s = peer.server.accept(io) catch return;
+            defer s.close(io);
+            peer.accepted += 1;
+            peer.answer(io, s, i < peer.refuse) catch return;
+        }
+    }
+
+    fn answer(peer: *FlakyWsPeer, io: Io, s: net.Stream, refuse: bool) !void {
+        var rb: [4096]u8 = undefined;
+        var wb: [4096]u8 = undefined;
+        var r = s.reader(io, &rb);
+        var w = s.writer(io, &wb);
+        var key: [24]u8 = @splat(0);
+        while (true) {
+            const line = try r.interface.takeDelimiterInclusive('\n');
+            const name = "Sec-WebSocket-Key: ";
+            if (std.mem.startsWith(u8, line, name) and line.len >= name.len + 24) key = line[name.len..][0..24].*;
+            if (line.len == 2) break;
+        }
+        if (refuse) {
+            try w.interface.print("HTTP/1.1 {s}\r\nContent-Length: 0\r\n\r\n", .{peer.status});
+            return w.interface.flush();
+        }
+        var sha = std.crypto.hash.Sha1.init(.{});
+        sha.update(&key);
+        sha.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        var accept: [28]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&accept, &sha.finalResult());
+        try w.interface.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{&accept});
+        try w.interface.flush();
+
+        // the VLESS request (26 bytes for an IPv4 destination) and the
+        // data, in as many masked frames as the client chose
+        var got: [26 + payload.len]u8 = undefined;
+        var n: usize = 0;
+        while (n < got.len) {
+            const h = (try r.interface.takeArray(2)).*;
+            if (h[1] & 0x80 == 0 or h[1] & 0x7f > 125) return error.TestUnexpectedResult;
+            const mask = (try r.interface.takeArray(4)).*;
+            const len = h[1] & 0x7f;
+            if (n + len > got.len) return error.TestUnexpectedResult;
+            for (try r.interface.take(len), 0..) |b, j| got[n + j] = b ^ mask[j & 3];
+            n += len;
+        }
+        if (got[0] != 0 or !std.mem.eql(u8, got[1..17], &peer.uuid) or !std.mem.eql(u8, got[26..], payload))
+            return error.TestUnexpectedResult;
+        // the response header, the data, and a normal close
+        try w.interface.writeAll(&.{ 0x82, 2 + payload.len, 0, 0 });
+        try w.interface.writeAll(payload);
+        try w.interface.writeAll(&.{ 0x88, 2, 0x03, 0xe8 });
+        try w.interface.flush();
+        peer.echoed = true;
+    }
+};
+
+test "socks5 -> vless over WebSocket: a front that answers 502 is dialed again" {
+    const io = std.testing.io;
+    const uuid = parseUuid("11111111-2222-3333-4444-555555555555").?;
+    var peer: FlakyWsPeer = try .init(io, 2, uuid);
+    defer peer.server.deinit(io);
+    peer.thread = try std.Thread.spawn(.{}, FlakyWsPeer.run, .{ &peer, io });
+
+    var link_buf: [160]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "vless://11111111-2222-3333-4444-555555555555@127.0.0.1:{d}?type=ws&path=%2Fws&host=ws.example", .{peer.port()});
+    var p: Proxy = .{ .io = io };
+    p.setOutbound(try outboundFromLink(link, "127.0.0.1", peer.port()));
+    try p.start(0);
+    defer p.stop();
+    try socksRoundTrip(io, p.port, .{ 10, 9, 8, 7 }, 4242, FlakyWsPeer.payload);
+    peer.thread.join();
+    try std.testing.expectEqual(3, peer.accepted);
+    try std.testing.expect(peer.echoed);
+    // the flow worked: nothing failed, nothing for the window to report
+    try std.testing.expectEqual(0, p.meter.failed.load(.monotonic));
+    try std.testing.expectEqual(Fault.none, p.meter.fault.load(.monotonic));
+}
+
+test "socks5 -> vless over WebSocket: a 404 is not dialed again" {
+    const io = std.testing.io;
+    const uuid = parseUuid("11111111-2222-3333-4444-555555555555").?;
+    var peer: FlakyWsPeer = try .init(io, 1, uuid);
+    defer peer.server.deinit(io);
+    peer.status = "404 Not Found";
+    peer.serve = false;
+    peer.thread = try std.Thread.spawn(.{}, FlakyWsPeer.run, .{ &peer, io });
+
+    var link_buf: [160]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "vless://11111111-2222-3333-4444-555555555555@127.0.0.1:{d}?type=ws&path=%2Fws&host=ws.example", .{peer.port()});
+    var p: Proxy = .{ .io = io };
+    p.setOutbound(try outboundFromLink(link, "127.0.0.1", peer.port()));
+    try p.start(0);
+    defer p.stop();
+    try std.testing.expectError(error.Refused, socksRoundTrip(io, p.port, .{ 10, 9, 8, 7 }, 4242, FlakyWsPeer.payload));
+    peer.thread.join();
+    // the refusal came once the dial had given up: no other connection waits
+    try std.testing.expectEqual(1, peer.accepted);
+    try std.testing.expect(!sys.waitFd(peer.server.socket.handle, false, 0));
+    try std.testing.expectEqual(Fault.handshake, p.meter.fault.load(.monotonic));
 }
 
 test "socks5 -> block refuses the connection" {
