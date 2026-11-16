@@ -130,7 +130,9 @@ server: a download, an upload and a small request per link. Link formats underst
 Xray JSON subscriptions.
 
 The TLS ClientHello follows Chrome's, the WebSocket and HTTPUpgrade requests match Xray's
-byte for byte, and server certificates are always verified.
+byte for byte, and server certificates are always verified. A server whose front answers
+the WebSocket or HTTPUpgrade request with 5xx (its backend away for a moment) is dialed
+again, up to five times over three seconds, as Xray does.
 
 ## Install
 
