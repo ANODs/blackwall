@@ -1,0 +1,33 @@
+name: Tests
+
+# Every push to main and every pull request: the test suite on the three
+# systems the desktop app runs on. Releases (release.yml) run the same tests
+# before they build anything.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['site/**', 'worker/**', 'docs/**', '**.md']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: zig build test

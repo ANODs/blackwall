@@ -567,8 +567,8 @@ pub const Dialer = struct {
     pub fn connectAddr(d: *const Dialer, io: Io, a: *const packet.Addr, port: u16) !net.Stream {
         // Android leaves our package out of the VPN, so nothing is bound
         // there; the connect must still give up in time
-        if (d.bind == .none and !plain_timed) return sys.toIpAddress(a, port).connect(io, .{ .mode = .stream });
-        return sys.connectTcp(a, port, d.bind, d.timeout_ms);
+        if (d.bind == .none and !plain_timed and builtin.os.tag != .windows) return sys.toIpAddress(a, port).connect(io, .{ .mode = .stream });
+        return sys.connectTcp(io, a, port, d.bind, d.timeout_ms);
     }
 
     pub fn connectTarget(d: *const Dialer, io: Io, t: *const Target) !net.Stream {
