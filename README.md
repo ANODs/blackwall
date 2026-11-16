@@ -57,12 +57,20 @@ release is a single file of 3 to 14 MB.
   the same time.
 - Programs an application starts follow its rule: a shell, `git` or `curl` launched by an
   app is routed like that app unless it has a rule of its own.
+- A route per site: `youtube.com` and everything under it, for the applications without a
+  rule of their own (an application held to the VPN stays there whatever it opens). The
+  name comes from the tunnel's DNS, or from the connection's first bytes (TLS SNI, HTTP
+  Host) when the system resolves on its own.
+- DPI bypass: a direct route whose TLS ClientHello leaves in a shape that filters
+  matching the site's name do not recognise, picked per host from three ways.
 - A default route for everything without a rule.
 - Live traffic per application, and a history graph.
 
 **Servers**
 
 - Subscriptions by link, or keys pasted one by one. Several subscriptions at once.
+- A QR code instead of typing: from the camera or a picture on Android, from the clipboard
+  or the screen on a computer, read by a decoder in this repository.
 - Latency for every server; "Fastest" picks one for you.
 - Reserve servers: star the ones you trust. When the server in use stops carrying
   traffic, BLACKWALL reconnects to it once, then moves to the starred ones, fastest first,
@@ -185,7 +193,11 @@ purpose.
 | Auto | Through the VPN, on the main server (or its reserve) |
 | A server from the list | Through that server and no other. If it cannot be used, the application is blocked, never sent direct |
 | Direct | The normal internet, with your real address |
+| DPI bypass | Direct, with the TLS ClientHello split so that name filters miss it |
 | Block | No network |
+
+The same routes apply to sites. An application's own rule (or that of the application
+that started it) comes first; a site's rule takes the rest.
 
 A route that goes through the VPN has exactly two fallbacks: another VPN server from the
 reserve, or no connection. There is no path from a VPN route to a direct connection.
@@ -405,8 +417,6 @@ docs/                      updates, Android, release notes
 
 ## Roadmap
 
-- **0.2** — UDP over Trojan, VMess and Shadowsocks; rules by domain; a local DPI bypass
-  route.
 - **0.4** — Windows on a real desktop: the window and the tray, Store applications in the
   list, traffic held from boot.
 - **0.5** — WireGuard.
