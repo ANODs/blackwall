@@ -82,17 +82,32 @@ pub fn plan(h: Hello, s: Strategy, buf: []u8) Plan {
     };
 }
 
-/// What worked for which host, the last 64 of them.
+/// What worked for which site, the last 64 of them, by the name's last
+/// two labels: a video service spreads over many hosts of one domain
+/// (rr1---sn-x.googlevideo.com, rr2---...), and one filter stands in
+/// front of them all. A site not seen yet starts with what worked last
+/// anywhere: one network has one filter.
 pub const Memory = struct {
     mutex: Io.Mutex = .init,
     hosts: [64]u64 = @splat(0),
     strategy: [64]Strategy = @splat(.records),
     next: usize = 0,
+    last: ?Strategy = null,
 
     fn key(host: []const u8) u64 {
         var h = std.hash.Wyhash.init(0x5eed);
-        for (host) |c| h.update(&.{std.ascii.toLower(c)});
+        for (site(host)) |c| h.update(&.{std.ascii.toLower(c)});
         return h.final() | 1;
+    }
+
+    /// The last two labels of a name ("a.b.example.com" → "example.com");
+    /// an address as it is.
+    fn site(host: []const u8) []const u8 {
+        const h = std.mem.trimEnd(u8, host, ".");
+        if (h.len > 0 and (std.ascii.isDigit(h[h.len - 1]) or std.mem.indexOfScalar(u8, h, ':') != null)) return h;
+        const last = std.mem.lastIndexOfScalar(u8, h, '.') orelse return h;
+        const second = std.mem.lastIndexOfScalar(u8, h[0..last], '.') orelse return h;
+        return h[second + 1 ..];
     }
 
     pub fn get(m: *Memory, io: Io, host: []const u8) ?Strategy {
@@ -100,13 +115,14 @@ pub const Memory = struct {
         m.mutex.lockUncancelable(io);
         defer m.mutex.unlock(io);
         for (m.hosts, 0..) |hk, i| if (hk == k) return m.strategy[i];
-        return null;
+        return m.last;
     }
 
     pub fn put(m: *Memory, io: Io, host: []const u8, s: Strategy) void {
         const k = key(host);
         m.mutex.lockUncancelable(io);
         defer m.mutex.unlock(io);
+        m.last = s;
         for (m.hosts, 0..) |hk, i| if (hk == k) {
             m.strategy[i] = s;
             return;
@@ -160,14 +176,19 @@ test "every plan sends the request whole; HTTP is left alone" {
     try std.testing.expect(hello("SSH-2.0-x\r\n") == null);
 }
 
-test "what worked is remembered per host" {
+test "what worked is remembered per site, and tried first elsewhere" {
     var m: Memory = .{};
     const io = std.testing.io;
     try std.testing.expect(m.get(io, "a.example") == null);
-    m.put(io, "a.example", .disorder);
-    m.put(io, "B.example", .segments);
-    try std.testing.expectEqual(Strategy.disorder, m.get(io, "A.EXAMPLE").?);
-    try std.testing.expectEqual(Strategy.segments, m.get(io, "b.example").?);
-    m.put(io, "a.example", .records);
-    try std.testing.expectEqual(Strategy.records, m.get(io, "a.example").?);
+    m.put(io, "rr1---sn-abc.googlevideo.com", .disorder);
+    // another host of the same site
+    try std.testing.expectEqual(Strategy.disorder, m.get(io, "RR7---SN-XYZ.googlevideo.com.").?);
+    m.put(io, "b.example", .segments);
+    try std.testing.expectEqual(Strategy.segments, m.get(io, "x.b.example").?);
+    try std.testing.expectEqual(Strategy.disorder, m.get(io, "googlevideo.com").?);
+    // a site not seen yet: what worked last
+    try std.testing.expectEqual(Strategy.segments, m.get(io, "new.example.org").?);
+    try std.testing.expectEqualStrings("example.com", Memory.site("a.b.example.com"));
+    try std.testing.expectEqualStrings("203.0.113.7", Memory.site("203.0.113.7"));
+    try std.testing.expectEqualStrings("localhost", Memory.site("localhost"));
 }
