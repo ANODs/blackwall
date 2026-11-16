@@ -55,6 +55,7 @@ pub const Strings = struct {
     // servers
     add_subscription: []const u8,
     add_site: []const u8,
+    scan_qr: []const u8,
     refresh: []const u8,
     remove: []const u8,
     fastest: []const u8,
@@ -194,6 +195,7 @@ const en: Strings = .{
 
     .add_subscription = "Add subscription",
     .add_site = "Add a site",
+    .scan_qr = "Scan a QR code: on the clipboard or on the screen",
     .refresh = "Refresh",
     .remove = "Remove",
     .fastest = "Fastest",
@@ -324,6 +326,7 @@ const ru: Strings = .{
 
     .add_subscription = "Добавить подписку",
     .add_site = "Добавить сайт",
+    .scan_qr = "Сканировать QR-код: из буфера обмена или с экрана",
     .refresh = "Обновить",
     .remove = "Удалить",
     .fastest = "Самый быстрый",
@@ -454,6 +457,7 @@ const zh: Strings = .{
 
     .add_subscription = "添加订阅",
     .add_site = "添加网站",
+    .scan_qr = "扫描二维码：剪贴板或屏幕上的",
     .refresh = "刷新",
     .remove = "删除",
     .fastest = "最快",

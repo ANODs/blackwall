@@ -6,6 +6,7 @@ const th = @import("../theme.zig");
 const draw = @import("../draw.zig");
 const w = @import("../widgets.zig");
 const tr = @import("../../i18n.zig").t;
+const screen = @import("../../platform/screen.zig");
 
 const model = core.model;
 
@@ -197,6 +198,21 @@ fn serverRow(sv: *model.Server, i: usize) void {
     }
 }
 
+/// A QR code on the clipboard or on the screen, added as it is.
+fn scanQr() void {
+    switch (screen.scan(app.gpa, app.io)) {
+        .text => |text| {
+            defer app.gpa.free(text);
+            if (app.addFromText(text)) |_| {
+                show_add = false;
+            } else |_| add_error = true;
+        },
+        // the system asked for consent; the next scan works
+        .needs_permission => {},
+        .none => add_error = true,
+    }
+}
+
 fn addDialog() void {
     var fw = dvui.floatingWindow(@src(), .{ .modal = true, .modal_alpha = 150, .open_flag = &show_add, .resize = .none }, .{
         .min_size_content = .{ .w = 420 },
@@ -215,6 +231,8 @@ fn addDialog() void {
         var hb = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer hb.deinit();
         w.text(@src(), tr.subscription, th.semibold(16), th.text, .{ .expand = .horizontal });
+        if (w.iconButton(@src(), .qr, .{ .size = 28, .icon_size = 16, .tooltip = tr.scan_qr }, .{})) scanQr();
+        w.gap(@src(), 4, 0);
         if (w.iconButton(@src(), .close, .{ .size = 28, .icon_size = 14 }, .{})) show_add = false;
     }
     w.gap(@src(), 0, 16);

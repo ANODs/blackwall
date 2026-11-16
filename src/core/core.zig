@@ -23,6 +23,7 @@ pub const win_scm = @import("win_scm.zig");
 pub const udp_out = @import("udp_out.zig");
 pub const dpi = @import("dpi.zig");
 pub const sni = @import("sni.zig");
+pub const qr = @import("qr.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const failover = @import("failover.zig");
 pub const ipc = @import("ipc.zig");
@@ -60,6 +61,11 @@ test {
     _ = ipstack.packet;
     _ = ipstack.stack;
     _ = ipstack.dns;
+    _ = udp_out;
+    _ = sni;
+    _ = dpi;
+    _ = qr;
+    _ = @import("aes_gcm.zig");
 }
 
 test "Xray JSON with REALITY + Vision becomes a usable outbound" {

@@ -71,6 +71,7 @@ pub const Icon = enum {
     shield,
     trash,
     clipboard,
+    qr,
 };
 
 const G = struct {
@@ -207,6 +208,15 @@ pub fn icon(which: Icon, r: Rect, color: Color, stroke_px: f32) void {
         .clipboard => {
             g.box(5.5, 5.5, 13, 15, 2);
             g.box(9, 3.5, 6, 4, 1.2);
+        },
+        .qr => {
+            // three finder corners and a few modules
+            g.box(4, 4, 6.5, 6.5, 1.2);
+            g.box(13.5, 4, 6.5, 6.5, 1.2);
+            g.box(4, 13.5, 6.5, 6.5, 1.2);
+            g.line(&.{ .{ 14, 14 }, .{ 14, 16.5 } });
+            g.line(&.{ .{ 17.5, 13.5 }, .{ 20, 13.5 } });
+            g.line(&.{ .{ 17, 17 }, .{ 17, 20 }, .{ 20, 20 } });
         },
     }
 }
