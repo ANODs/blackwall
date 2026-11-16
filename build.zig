@@ -107,7 +107,7 @@ pub fn build(b: *std.Build) void {
     // Background service: the data plane without the window. `zig build service`
     // builds only it (also for Linux targets, where the window is not needed).
     // Not on Windows yet: its TUN needs the WinTUN driver.
-    const service: ?*std.Build.Step.Compile = if (os != .windows) b.addExecutable(.{
+    const service: ?*std.Build.Step.Compile = if (true) b.addExecutable(.{
         .name = "blackwall-service",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/service/main.zig"),

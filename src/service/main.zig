@@ -6,6 +6,10 @@
 //! --tun helper (macOS): the root helper creates the utun, routes and DNS,
 //! applies the kill switch from the settings and hands the utun over.
 //!
+//! --tun wintun (Windows, as LocalSystem or an administrator): the
+//! service creates the Wintun adapter and its routes itself (windows.zig);
+//! wintun.dll is next to the executable.
+//!
 //! --tun auto (Linux): the device, the routes and the capture of the
 //! resolvers (linux.zig) are set up by blackwall-tun, which holds
 //! CAP_NET_ADMIN and hands the device over (tun_main.zig); run as root the
@@ -30,6 +34,8 @@ const routes = @import("routes.zig");
 const fdpass = @import("fdpass");
 const linux = @import("linux.zig");
 const linux_proc = @import("linux_proc.zig");
+const win = @import("windows.zig");
+const on_windows = builtin.os.tag == .windows;
 const darwin = if (builtin.os.tag.isDarwin()) struct {
     const process = @import("darwin/process.zig");
     const helper = @import("helper_client.zig");
@@ -49,7 +55,7 @@ pub const std_options: std.Options = .{ .logFn = logFn };
 /// service.events in the configuration folder: what the log says, with
 /// the time, kept across restarts (the window starts each run's
 /// service.log afresh). Lets "why did it stop working" be answered later.
-var events_fd: c.fd_t = -1;
+var events_fd: if (on_windows) ?std.os.windows.HANDLE else c.fd_t = if (on_windows) null else -1;
 const events_name = "service.events";
 const events_max = 512 * 1024;
 
@@ -58,8 +64,17 @@ const Tm = extern struct { sec: c_int, min: c_int, hour: c_int, mday: c_int, mon
 extern "c" fn time(t: ?*i64) i64;
 extern "c" fn localtime_r(t: *const i64, out: *Tm) ?*Tm;
 
+/// Windows: the calls the events file needs (kernel32).
+const k32 = struct {
+    const W: std.builtin.CallingConvention = .winapi;
+    const SYSTEMTIME = extern struct { year: u16, month: u16, wday: u16, day: u16, hour: u16, min: u16, sec: u16, ms: u16 };
+    extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disp: u32, flags: u32, template: ?std.os.windows.HANDLE) callconv(W) std.os.windows.HANDLE;
+    extern "kernel32" fn WriteFile(h: std.os.windows.HANDLE, buf: [*]const u8, n: u32, written: ?*u32, ov: ?*anyopaque) callconv(W) i32;
+    extern "kernel32" fn GetLocalTime(t: *SYSTEMTIME) callconv(W) void;
+    extern "kernel32" fn GetCurrentProcessId() callconv(W) u32;
+};
+
 fn openEvents(io: Io, config_dir: []const u8) void {
-    if (builtin.os.tag == .windows) return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var old_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/" ++ events_name, .{config_dir}) catch return;
@@ -69,29 +84,55 @@ fn openEvents(io: Io, config_dir: []const u8) void {
     if (cwd.statFile(io, path, .{})) |st| {
         if (st.size > events_max) cwd.rename(path, cwd, old, io) catch {};
     } else |_| {}
+    if (comptime on_windows) {
+        var wide: [std.fs.max_path_bytes:0]u16 = undefined;
+        const n = std.unicode.wtf8ToWtf16Le(&wide, path) catch return;
+        wide[n] = 0;
+        // FILE_APPEND_DATA, shared for reading, OPEN_ALWAYS
+        const h = k32.CreateFileW(wide[0..n :0], 0x4, 0x1 | 0x2, null, 4, 0x80, null);
+        if (h != std.os.windows.INVALID_HANDLE_VALUE) events_fd = h;
+        return;
+    }
     events_fd = c.open(@ptrCast(path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c.mode_t, 0o600));
 }
 
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
     std.log.defaultLog(level, scope, format, args);
-    if (events_fd < 0) return;
+    if (if (on_windows) events_fd == null else events_fd < 0) return;
     var buf: [640]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    var now: i64 = time(null);
-    var tm: Tm = undefined;
-    _ = localtime_r(&now, &tm);
-    w.print("{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}({s}): ", .{
-        @as(u32, @intCast(tm.mon + 1)), @as(u32, @intCast(tm.mday)),
-        @as(u32, @intCast(tm.hour)),    @as(u32, @intCast(tm.min)),
-        @as(u32, @intCast(tm.sec)),     @tagName(level),
-        @tagName(scope),
-    }) catch {};
+    var mon: u32 = 0;
+    var day: u32 = 0;
+    var hour: u32 = 0;
+    var min: u32 = 0;
+    var sec: u32 = 0;
+    if (comptime on_windows) {
+        var st: k32.SYSTEMTIME = undefined;
+        k32.GetLocalTime(&st);
+        mon = st.month;
+        day = st.day;
+        hour = st.hour;
+        min = st.min;
+        sec = st.sec;
+    } else {
+        var now: i64 = time(null);
+        var tm: Tm = undefined;
+        _ = localtime_r(&now, &tm);
+        mon = @intCast(tm.mon + 1);
+        day = @intCast(tm.mday);
+        hour = @intCast(tm.hour);
+        min = @intCast(tm.min);
+        sec = @intCast(tm.sec);
+    }
+    w.print("{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}({s}): ", .{ mon, day, hour, min, sec, @tagName(level), @tagName(scope) }) catch {};
     w.print(format, args) catch {};
     // a line cut short still ends as a line
     if (w.end >= buf.len) w.end = buf.len - 1;
     w.writeByte('\n') catch {};
     const line = w.buffered();
-    _ = c.write(events_fd, line.ptr, line.len);
+    if (comptime on_windows) {
+        _ = k32.WriteFile(events_fd.?, line.ptr, @intCast(line.len), null, null);
+    } else _ = c.write(events_fd, line.ptr, line.len);
 }
 
 const Args = struct {
@@ -102,7 +143,7 @@ const Args = struct {
     mtu: u16 = 1500,
     socks: ?u16 = null,
 
-    const Tun = union(enum) { helper, auto, linux: []const u8, fd: c.fd_t };
+    const Tun = union(enum) { helper, auto, wintun, linux: []const u8, fd: i32 };
 };
 
 const Service = struct {
@@ -118,7 +159,9 @@ const Service = struct {
     settings: core.model.Settings = .{},
     /// VPN server addresses, for the strict kill switch
     server_ips: std.ArrayList([]const u8) = .empty,
-    tun_fd: ?c.fd_t = null,
+    tun_fd: ?i32 = null,
+    /// the Wintun adapter and its routes (Windows)
+    lease: if (on_windows) ?win.Lease else void = if (on_windows) null else {},
     via_helper: bool = false,
     /// the device is ours to set up and take down (Linux, `--tun auto`)
     own_device: bool = false,
@@ -194,13 +237,18 @@ const Service = struct {
 
     fn start(s: *Service) !void {
         try s.loadConfig();
-        if (s.args.tun) |tun| {
+        if (s.args.tun) |tun| outer: {
+            if (comptime on_windows) {
+                try s.startWintun(tun);
+                break :outer;
+            }
             var bind: core.sys.Bind = if (s.args.bind) |name| .interface(name) else .none;
             var dns_buf: [8]packet.Endpoint = undefined;
             var dns_servers: []const packet.Endpoint = if (s.args.dns.items.len > 0) s.args.dns.items else &default_dns;
             var lookup: ?tunnel.AppLookup = null;
             const fd: c.fd_t = switch (tun) {
                 .fd => |f| f,
+                .wintun => return error.Unsupported,
                 .linux => |name| if (builtin.os.tag == .linux) try linux.openTun(name) else return error.Unsupported,
                 .auto => if (builtin.os.tag == .linux) blk: {
                     const opts: linux.Options = .{
@@ -291,6 +339,38 @@ const Service = struct {
         }
     }
 
+    /// Windows: the adapter, its routes and the tunnel on it (windows.zig).
+    fn startWintun(s: *Service, tun: Args.Tun) !void {
+        if (comptime !on_windows) return error.Unsupported;
+        if (tun != .wintun) return error.Unsupported;
+        var dll_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_len = std.process.executableDirPath(s.io, &dll_buf) catch return error.WintunMissing;
+        const dll = std.fmt.bufPrint(dll_buf[dir_len..], "\\wintun.dll", .{}) catch return error.WintunMissing;
+        const path = dll_buf[0 .. dir_len + dll.len];
+        s.lease = win.up(.{ .mtu = s.args.mtu, .ipv6 = s.settings.ipv6 != .system, .dll = path }) catch |err| {
+            s.writeError(err);
+            return err;
+        };
+        const lease = &s.lease.?;
+        errdefer {
+            win.down(lease);
+            s.lease = null;
+        }
+        var dns_buf: [8]packet.Endpoint = undefined;
+        var dns_servers: []const packet.Endpoint = if (s.args.dns.items.len > 0) s.args.dns.items else &default_dns;
+        for (lease.dns[0..lease.dns_len], 0..) |ip, k| dns_buf[k] = .{ .addr = packet.v4(ip), .port = 53 };
+        if (lease.dns_len > 0) dns_servers = dns_buf[0..lease.dns_len];
+        for (lease.dns[0..lease.dns_len]) |ip| s.addDns(ip);
+        for (core.ipstack.dns.Resolver.public_servers) |e| s.addDns(e.addr[12..16].*);
+        log.info("adapter {d}, own traffic on interface {d}, {d} resolvers captured", .{ lease.index, lease.bind_index, lease.dns_len });
+        const t = try tunnel.Tunnel.create(s.gpa, s.io, .{ .mtu = s.args.mtu, .bind = .{ .index = lease.bind_index }, .upstream_dns = dns_servers });
+        errdefer t.destroy();
+        try t.setConfig(s.built.?.cfg);
+        s.t = t;
+        s.device_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, tunnel.Tunnel.run, .{ t, &lease.device });
+        log.info("tun up (wintun, mtu {d})", .{s.args.mtu});
+    }
+
     fn shutdown(s: *Service) void {
         if (s.socks) |p| {
             p.stop();
@@ -301,10 +381,16 @@ const Service = struct {
             t.stop();
             if (s.device_thread) |th| th.join();
             t.destroy();
-            s.device.deinit();
+            if (comptime on_windows) {
+                if (s.lease) |*l| {
+                    l.device.deinit();
+                    win.down(l);
+                }
+                s.lease = null;
+            } else s.device.deinit();
             s.t = null;
         }
-        if (s.tun_fd) |fd| {
+        if (s.tun_fd) |fd| if (comptime !on_windows) {
             // a clean stop lets the traffic go; "suspend" (and a crash,
             // which never gets here) leaves the device holding it
             if (s.own_device and !s.keep_capture) {
@@ -313,7 +399,7 @@ const Service = struct {
             }
             if (builtin.os.tag == .linux and s.own_device) s.owners.deinit();
             _ = c.close(fd);
-        }
+        };
         s.tun_fd = null;
         s.own_device = false;
         if (builtin.os.tag.isDarwin()) {
@@ -422,7 +508,7 @@ const Service = struct {
             if (fault == .none) fault = f;
         }
         const st: ipc.Status = .{
-            .pid = c.getpid(),
+            .pid = if (comptime on_windows) @intCast(k32.GetCurrentProcessId()) else c.getpid(),
             .build = build_options.version,
             .tun = s.t != null,
             .socks_port = if (s.socks) |p| p.port else 0,
@@ -460,7 +546,8 @@ const Service = struct {
         var z: [std.fs.max_path_bytes:0]u8 = undefined;
         @memcpy(z[0..path.len], path);
         z[path.len] = 0;
-        _ = c.chmod(&z, 0o600);
+        // Windows: the folder's own permissions (the user's profile) guard it
+        if (comptime !on_windows) _ = c.chmod(&z, 0o600);
         log.info("listening on {s}", .{path});
         return server;
     }
@@ -503,6 +590,9 @@ const Service = struct {
 
     fn peerAllowed(s: *Service, fd: c.fd_t) bool {
         _ = s;
+        // the socket file is in the user's profile, where only the user,
+        // the administrators and the system may open it
+        if (comptime on_windows) return true;
         const uid = core.sys.peerUid(fd) orelse return false;
         const me = c.geteuid();
         return uid == me or uid == 0;
@@ -584,6 +674,7 @@ fn findLinuxApp(ctx: *anyopaque, udp: bool, local: packet.Endpoint, remote: pack
 /// the TUN takes over DNS). Caller frees.
 fn resolve4(gpa: std.mem.Allocator, host: []const u8) ?[]const u8 {
     if (std.Io.net.Ip4Address.parse(host, 0)) |_| return gpa.dupe(u8, host) catch null else |_| {}
+    if (comptime on_windows) return null; // the kill switch there is not built yet
     var name: [256:0]u8 = @splat(0);
     if (host.len >= name.len) return null;
     @memcpy(name[0..host.len], host);
@@ -615,6 +706,10 @@ fn parseEndpoint(text: []const u8, default_port: u16) ?packet.Endpoint {
 }
 
 fn defaultConfigDir(a: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
+    if (comptime on_windows) {
+        const appdata = env.get("APPDATA") orelse return a.dupe(u8, "BLACKWALL");
+        return std.fmt.allocPrint(a, "{s}\\BLACKWALL", .{appdata});
+    }
     const home = env.get("HOME") orelse return a.dupe(u8, ".blackwall");
     if (builtin.os.tag.isDarwin()) return std.fmt.allocPrint(a, "{s}/Library/Application Support/BLACKWALL", .{home});
     if (env.get("XDG_CONFIG_HOME")) |x| return std.fmt.allocPrint(a, "{s}/blackwall", .{x});
@@ -635,12 +730,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--tun")) {
             if (std.mem.eql(u8, val, "helper")) {
                 args.tun = .helper;
+            } else if (std.mem.eql(u8, val, "wintun")) {
+                args.tun = .wintun;
             } else if (std.mem.eql(u8, val, "auto")) {
                 args.tun = .auto;
             } else if (std.mem.startsWith(u8, val, "linux:")) {
                 args.tun = .{ .linux = val[6..] };
             } else if (std.mem.startsWith(u8, val, "fd:")) {
-                args.tun = .{ .fd = try std.fmt.parseInt(c.fd_t, val[3..], 10) };
+                args.tun = .{ .fd = try std.fmt.parseInt(i32, val[3..], 10) };
             } else return usage();
             i += 1;
         } else if (std.mem.eql(u8, arg, "--release")) {
@@ -710,7 +807,7 @@ fn raiseFileLimit() void {
 
 fn usage() error{Usage} {
     std.debug.print(
-        \\usage: blackwall-service [--config DIR] [--tun helper | --tun auto | --tun linux:NAME | --tun fd:N]
+        \\usage: blackwall-service [--config DIR] [--tun helper | --tun auto | --tun wintun | --tun linux:NAME | --tun fd:N]
         \\                         [--bind IFNAME] [--dns IP[:PORT]]... [--mtu N] [--socks PORT]
         \\
     , .{});
@@ -722,5 +819,6 @@ test {
     _ = linux;
     _ = linux_proc;
     _ = @import("nft.zig");
+    _ = win;
     if (builtin.os.tag.isDarwin()) _ = darwin.process;
 }

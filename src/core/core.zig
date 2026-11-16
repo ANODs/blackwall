@@ -18,6 +18,7 @@ pub const vmess = @import("vmess.zig");
 pub const vision = @import("vision.zig");
 pub const xudp = @import("xudp.zig");
 pub const sys = @import("sys.zig");
+pub const wintun = @import("wintun.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const failover = @import("failover.zig");
 pub const ipc = @import("ipc.zig");

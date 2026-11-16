@@ -23,6 +23,8 @@ const tls13 = @import("tls13.zig");
 const vision = @import("vision.zig");
 const xudp = @import("xudp.zig");
 const failover = @import("failover.zig");
+pub const wintun = @import("wintun.zig");
+const windows = builtin.os.tag == .windows;
 
 const Endpoint = packet.Endpoint;
 
@@ -916,6 +918,16 @@ pub const Tunnel = struct {
                 t.sweepUdp();
                 t.group.tick();
             }
+            if (comptime windows) {
+                dev.wait(@intCast(wait));
+                var batch: usize = 0;
+                while (batch < 64) : (batch += 1) {
+                    const pkt = dev.read(&buf) orelse break;
+                    if (pkt.len > 0) t.stack.input(pkt);
+                }
+                if (batch > 0) t.stack.flush();
+                continue;
+            }
             var fds = [2]c.pollfd{
                 .{ .fd = dev.fd, .events = c.POLL.IN, .revents = 0 },
                 .{ .fd = dev.wake[0], .events = c.POLL.IN, .revents = 0 },
@@ -941,12 +953,16 @@ pub const Tunnel = struct {
     /// Make `run` return.
     pub fn stop(t: *Tunnel) void {
         t.stopping.store(true, .release);
-        if (t.device) |d| _ = c.write(d.wake[1], "x", 1);
+        const d = t.device orelse return;
+        if (comptime windows) d.wake() else _ = c.write(d.wake[1], "x", 1);
     }
 };
 
-/// A TUN file descriptor and its packet framing.
-pub const Device = struct {
+/// The TUN device: a file descriptor and its packet framing, or on
+/// Windows a Wintun session.
+pub const Device = if (windows) wintun.Device else PosixDevice;
+
+const PosixDevice = struct {
     fd: c.fd_t,
     /// macOS utun: every packet carries a 4-byte address family in front
     af_header: bool,
@@ -954,9 +970,7 @@ pub const Device = struct {
     wake: [2]c.fd_t,
     dropped: std.atomic.Value(u64) = .init(0),
 
-    pub fn init(fd: c.fd_t, af_header: bool) !Device {
-        // a TUN device exists where the service does; Windows has neither yet
-        if (comptime !sys.supported) return error.Unsupported;
+    pub fn init(fd: c.fd_t, af_header: bool) !PosixDevice {
         var p: [2]c.fd_t = undefined;
         if (c.pipe(&p) != 0) return error.PipeFailed;
         const nb: c_int = @bitCast(@as(u32, @bitCast(c.O{ .NONBLOCK = true })));
@@ -967,13 +981,12 @@ pub const Device = struct {
         return .{ .fd = fd, .af_header = af_header, .wake = p };
     }
 
-    pub fn deinit(d: *Device) void {
+    pub fn deinit(d: *PosixDevice) void {
         _ = c.close(d.wake[0]);
         _ = c.close(d.wake[1]);
     }
 
-    pub fn write(d: *Device, pkt: []const u8) void {
-        if (comptime !sys.supported) return;
+    pub fn write(d: *PosixDevice, pkt: []const u8) void {
         if (pkt.len == 0) return;
         if (!d.af_header) {
             if (c.write(d.fd, pkt.ptr, pkt.len) < 0) _ = d.dropped.fetchAdd(1, .monotonic);
