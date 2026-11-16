@@ -25,7 +25,6 @@ jobs:
           version: 0.17.1
       - run: zig test src/core/afd.zig
       - run: zig build test --summary failures
-      - run: zig build -Doptimize=ReleaseSafe
       - name: Wintun
         run: |
           Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile $env:RUNNER_TEMP\wintun.zip
@@ -33,5 +32,6 @@ jobs:
           Write-Host "sha256 $h"
           if ($h -ne '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51') { throw 'wintun.zip is not the expected file' }
           Expand-Archive $env:RUNNER_TEMP\wintun.zip -DestinationPath $env:RUNNER_TEMP\wintun
-          Copy-Item $env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll zig-out\bin\
+      - run: zig build -Doptimize=ReleaseSafe "-Dwintun=$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll"
+      - run: Copy-Item $env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll zig-out\bin\
       - run: pwsh tools/windows/e2e.ps1 -Bin zig-out\bin

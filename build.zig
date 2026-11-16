@@ -106,7 +106,6 @@ pub fn build(b: *std.Build) void {
 
     // Background service: the data plane without the window. `zig build service`
     // builds only it (also for Linux targets, where the window is not needed).
-    // Not on Windows yet: its TUN needs the WinTUN driver.
     const service: ?*std.Build.Step.Compile = if (true) b.addExecutable(.{
         .name = "blackwall-service",
         .root_module = b.createModule(.{
@@ -120,6 +119,20 @@ pub fn build(b: *std.Build) void {
             },
         }),
     }) else null;
+    // Windows: the app carries the service and wintun.dll, and puts them in
+    // place when the user first connects (src/link.zig, core/win_scm.zig)
+    const wintun_dll = b.option([]const u8, "wintun", "Windows: wintun.dll (amd64, from www.wintun.net) for the app to carry");
+    if (os == .windows) if (service) |sv| {
+        const files = b.addWriteFiles();
+        _ = files.addCopyFile(sv.getEmittedBin(), "blackwall-service.exe");
+        if (wintun_dll) |p| _ = files.addCopyFile(.{ .cwd_relative = p }, "wintun.dll") else _ = files.add("wintun.dll", "");
+        const embed = files.add("embed.zig",
+            \\pub const service = @embedFile("blackwall-service.exe");
+            \\pub const wintun = @embedFile("wintun.dll");
+            \\
+        );
+        exe.root_module.addAnonymousImport("win_embed", .{ .root_source_file = embed });
+    };
     const service_step = b.step("service", "Build only the background service (and the macOS helper)");
     if (service) |sv| {
         // its release is reported to the window, which restarts an older one

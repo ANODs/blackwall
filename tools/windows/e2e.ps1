@@ -98,6 +98,27 @@ Start-Sleep -Seconds 3
 $code = Fetch
 Check "the network is back ($code)" ($code -eq '200')
 
+Write-Host "== as a Windows service"
+Config 'direct'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+& (Join-Path $Bin 'blackwall-service.exe') install --config $cfg --user $sid
+Check "installed (exit $LASTEXITCODE)" ($LASTEXITCODE -eq 0)
+Check 'its files are in Program Files' ((Test-Path "$env:ProgramFiles\BLACKWALL\blackwall-service.exe") -and (Test-Path "$env:ProgramFiles\BLACKWALL\wintun.dll"))
+& sc.exe sdshow BLACKWALL | Write-Host
+& sc.exe start BLACKWALL --tun wintun | Out-Null
+Start-Sleep -Seconds 6
+Check "it runs ($((Get-Service BLACKWALL).Status))" ((Get-Service BLACKWALL).Status -eq 'Running')
+$code = Fetch
+Check "curl through the service ($code)" ($code -eq '200')
+& sc.exe stop BLACKWALL | Out-Null
+Start-Sleep -Seconds 5
+Check "it stopped ($((Get-Service BLACKWALL).Status))" ((Get-Service BLACKWALL).Status -eq 'Stopped')
+Check 'the adapter went with it' ($null -eq (Get-NetAdapter -Name 'BLACKWALL' -ErrorAction SilentlyContinue))
+$code = Fetch
+Check "the network is back ($code)" ($code -eq '200')
+& (Join-Path $Bin 'blackwall-service.exe') uninstall
+Check 'uninstalled' ($null -eq (Get-Service BLACKWALL -ErrorAction SilentlyContinue))
+
 if (Test-Path (Join-Path $cfg 'service.events')) {
     Write-Host "== service.events"
     Get-Content (Join-Path $cfg 'service.events') -Tail 40 | Write-Host

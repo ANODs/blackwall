@@ -729,8 +729,55 @@ fn defaultConfigDir(a: std.mem.Allocator, env: *std.process.Environ.Map) ![]cons
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(a);
+    if (comptime on_windows) {
+        const first: []const u8 = if (argv.len > 1) argv[1] else "";
+        if (std.mem.eql(u8, first, "install")) return installWindows(init, argv[2..]);
+        if (std.mem.eql(u8, first, "uninstall")) return core.win_scm.uninstall();
+        if (std.mem.eql(u8, first, "--scm")) {
+            scm_init = init;
+            return core.win_scm.dispatch(argv[2..], .{ .run = scmRun, .stop = scmStop });
+        }
+    }
+    return serve(init, argv[1..]);
+}
+
+/// Windows, as an administrator: puts the service in place for one user
+/// (see core/win_scm.zig).
+fn installWindows(init: std.process.Init, argv: []const []const u8) !void {
+    var config: ?[]const u8 = null;
+    var sid: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i + 1 < argv.len) : (i += 2) {
+        if (std.mem.eql(u8, argv[i], "--config")) config = argv[i + 1];
+        if (std.mem.eql(u8, argv[i], "--user")) sid = argv[i + 1];
+    }
+    const exe = try std.process.executablePathAlloc(init.io, init.arena.allocator());
+    core.win_scm.install(init.environ_map, exe, config orelse return usage(), sid orelse return usage(), build_options.version) catch |err| {
+        log.err("install: {t}", .{err});
+        return err;
+    };
+    log.info("installed", .{});
+}
+
+var scm_init: std.process.Init = undefined;
+var scm_config: ?[]const u8 = null;
+
+fn scmRun(args: []const []const u8) void {
+    serve(scm_init, args) catch |err| log.err("service: {t}", .{err});
+}
+
+/// The SCM asked it to stop: the same as the window's "stop".
+fn scmStop() void {
+    const dir = scm_config orelse return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const line = ipc.call(scm_init.gpa, scm_init.io, ipc.socketPath(&buf, dir), "stop", 5000) catch return;
+    scm_init.gpa.free(line);
+}
+
+fn serve(init: std.process.Init, argv: []const []const u8) !void {
+    const a = init.arena.allocator();
     var args: Args = .{};
-    var i: usize = 1;
+    var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         const val = if (i + 1 < argv.len) argv[i + 1] else "";
@@ -778,6 +825,7 @@ pub fn main(init: std.process.Init) !void {
         .config_dir = args.config_dir orelse try defaultConfigDir(a, init.environ_map),
     };
     std.Io.Dir.cwd().createDirPath(init.io, s.config_dir) catch {};
+    scm_config = s.config_dir;
     openEvents(init.io, s.config_dir);
     {
         var buf: [std.fs.max_path_bytes]u8 = undefined;

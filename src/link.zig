@@ -1,6 +1,7 @@
 //! The window's side of the background service (blackwall-service): starts
 //! it — in TUN mode on macOS after making sure the root helper is
-//! installed — stops it, asks it to re-read the configuration and reads its
+//! installed; on Windows as the system service the app put in place with
+//! the administrator's consent (core/win_scm.zig) — stops it, asks it to re-read the configuration and reads its
 //! counters once a second.
 //!
 //! Everything that can block (starting processes, the administrator
@@ -18,18 +19,24 @@ const helper = core.helper_ipc;
 const c = std.c;
 const log = std.log.scoped(.link);
 
-/// The service exists for macOS and Linux; Windows keeps the in-window proxy.
-pub const supported = builtin.os.tag == .macos or (builtin.os.tag == .linux and !builtin.abi.isAndroid());
+/// The service runs on macOS, Linux and Windows (not on Android, where the app is the service).
+pub const supported = builtin.os.tag == .macos or builtin.os.tag == .windows or (builtin.os.tag == .linux and !builtin.abi.isAndroid());
 /// Capturing all traffic: through the root helper on macOS; on Linux
 /// through blackwall-tun, which holds CAP_NET_ADMIN granted to it once (see
 /// `ensureCapabilities`) and hands the device to the service.
-pub const tun_supported = builtin.os.tag == .macos or (builtin.os.tag == .linux and !builtin.abi.isAndroid());
+/// On Windows the service itself creates the Wintun adapter; it runs as
+/// LocalSystem.
+pub const tun_supported = supported;
 /// Holding traffic from boot until the service is up is the helper's job.
 pub const hold_supported = builtin.os.tag == .macos;
 const on_linux = builtin.os.tag == .linux and !builtin.abi.isAndroid();
+const on_windows = builtin.os.tag == .windows;
+const scm = core.win_scm;
+/// The service and wintun.dll the Windows app carries (build.zig).
+const win_embed = if (on_windows) @import("win_embed") else struct {};
 
-/// A process id where processes are numbers (Windows never starts the service).
-const Pid = if (supported) c.pid_t else i32;
+/// A process id where processes are numbers (on Windows the SCM knows the service).
+const Pid = if (supported and !on_windows) c.pid_t else i32;
 
 pub const Options = struct {
     /// capture all traffic through the TUN (needs the helper)
@@ -135,9 +142,12 @@ pub const Link = struct {
         const exe = std.process.executablePathAlloc(io, gpa) catch return null;
         defer gpa.free(exe);
         const dir = std.fs.path.dirname(exe) orelse return null;
-        var probe_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const probe = std.fmt.bufPrint(&probe_buf, "{s}/blackwall-service", .{dir}) catch return null;
-        std.Io.Dir.cwd().access(io, probe, .{ .execute = true }) catch return null;
+        // Windows carries the service inside the app
+        if (!on_windows) {
+            var probe_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const probe = std.fmt.bufPrint(&probe_buf, "{s}/blackwall-service", .{dir}) catch return null;
+            std.Io.Dir.cwd().access(io, probe, .{ .execute = true }) catch return null;
+        }
         const l = gpa.create(Link) catch return null;
         l.* = .{
             .gpa = gpa,
@@ -270,7 +280,8 @@ pub const Link = struct {
             l.sink(.{ .up = .{ .tun = l.tun, .socks_port = l.socks, .adopted = true, .stale = false } });
             return;
         }
-        if (o.tun) (if (on_linux) l.ensureCapabilities(o.interactive) else l.ensureHelper(o.interactive)) catch |err| {
+        // Windows: the system service carries the proxy port too
+        if (o.tun or on_windows) (if (on_windows) l.ensureWinService(o.interactive) else if (on_linux) l.ensureCapabilities(o.interactive) else l.ensureHelper(o.interactive)) catch |err| {
             log.err("helper: {t}", .{err});
             const why: Failure = switch (err) {
                 error.Refused, error.NeedsAdministrator => .need_admin,
@@ -373,6 +384,7 @@ pub const Link = struct {
     // ------------------------------------------------------------ process
 
     fn spawn(l: *Link, o: Options) !void {
+        if (comptime on_windows) return l.spawnWin(o);
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const exe = try std.fmt.bufPrint(&path_buf, "{s}/blackwall-service", .{l.bin_dir});
         var file_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -407,6 +419,10 @@ pub const Link = struct {
     /// Whether the service has ended (a child of ours is reaped here). False
     /// when its process is unknown.
     fn exited(l: *Link) bool {
+        if (comptime on_windows) {
+            const st = scm.query() orelse return true;
+            return st == .stopped;
+        }
         if (l.child) |pid| {
             var st: c_int = 0;
             if (c.waitpid(pid, &st, c.W.NOHANG) == 0) return false;
@@ -421,6 +437,7 @@ pub const Link = struct {
 
     /// Last resort for a service that neither answers nor stops.
     fn kill(l: *Link) void {
+        if (comptime on_windows) return scm.stop();
         if (l.child) |pid| {
             _ = c.kill(pid, c.SIG.KILL);
             var st: c_int = 0;
@@ -449,7 +466,59 @@ pub const Link = struct {
     /// Whether TUN mode can start without asking anyone.
     fn privileged(l: *Link) bool {
         if (on_linux) return l.capable();
+        if (on_windows) return l.winServiceCurrent();
         return l.helperState() == .current;
+    }
+
+    // ------------------------------------------------------------ service (Windows)
+
+    /// The installed service is this release's.
+    fn winServiceCurrent(l: *Link) bool {
+        if (comptime !on_windows) return false;
+        if (scm.query() == null) return false;
+        var env = win.env(l.gpa) orelse return false;
+        defer env.deinit();
+        var buf: [128]u8 = undefined;
+        const have = scm.installedBuild(&env, &buf, l.io) orelse return false;
+        return std.mem.eql(u8, have, l.build);
+    }
+
+    /// Puts this release's service in place, after the administrator's
+    /// consent (UAC). Once per release: the service then starts and stops
+    /// at the window's word without asking.
+    fn ensureWinService(l: *Link, interactive: bool) anyerror!void {
+        if (comptime !on_windows) return error.Unsupported;
+        if (l.winServiceCurrent()) return;
+        if (!interactive) return error.NeedsAdministrator;
+        if (win_embed.wintun.len == 0) return error.WintunMissing;
+        // the service and wintun.dll, unpacked for the installer to copy
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&dir_buf, "{s}\\setup", .{l.config_dir});
+        const cwd = std.Io.Dir.cwd();
+        try cwd.createDirPath(l.io, dir);
+        var p_buf: [std.fs.max_path_bytes]u8 = undefined;
+        try cwd.writeFile(l.io, .{ .sub_path = try std.fmt.bufPrint(&p_buf, "{s}\\wintun.dll", .{dir}), .data = win_embed.wintun });
+        const exe = try std.fmt.bufPrint(&p_buf, "{s}\\blackwall-service.exe", .{dir});
+        try cwd.writeFile(l.io, .{ .sub_path = exe, .data = win_embed.service });
+        var sid_buf: [128]u8 = undefined;
+        const sid = win.userSid(&sid_buf) orelse return error.NoUser;
+        var params_buf: [std.fs.max_path_bytes + 256]u8 = undefined;
+        const params = try std.fmt.bufPrint(&params_buf, "install --config \"{s}\" --user {s}", .{ l.config_dir, sid });
+        try win.runElevated(exe, params);
+        if (!l.winServiceCurrent()) return error.InstallFailed;
+    }
+
+    fn spawnWin(l: *Link, o: Options) !void {
+        var file_buf: [std.fs.max_path_bytes]u8 = undefined;
+        std.Io.Dir.cwd().deleteFile(l.io, try std.fmt.bufPrint(&file_buf, "{s}/" ++ ipc.error_name, .{l.config_dir})) catch {};
+        var socks_buf: [8]u8 = undefined;
+        var mtu_buf: [8]u8 = undefined;
+        var argv_buf: [8][]const u8 = undefined;
+        var argv: std.ArrayList([]const u8) = .initBuffer(&argv_buf);
+        if (o.tun) argv.appendSliceAssumeCapacity(&.{ "--tun", "wintun" });
+        if (o.socks != 0) argv.appendSliceAssumeCapacity(&.{ "--socks", try std.fmt.bufPrint(&socks_buf, "{d}", .{o.socks}) });
+        if (o.mtu != 0) argv.appendSliceAssumeCapacity(&.{ "--mtu", try std.fmt.bufPrint(&mtu_buf, "{d}", .{o.mtu}) });
+        try scm.start(argv.items);
     }
 
     // ------------------------------------------------------------ capabilities (Linux)
@@ -604,6 +673,86 @@ pub const Link = struct {
         const term = try child.wait(l.io);
         // osascript fails with -128 when the user cancels
         if (term != .exited or term.exited != 0) return error.Refused;
+    }
+};
+
+/// Windows calls of the window's side.
+const win = struct {
+    const w = std.os.windows;
+    const W: std.builtin.CallingConvention = .winapi;
+    const SHELLEXECUTEINFOW = extern struct {
+        cbSize: u32 = @sizeOf(SHELLEXECUTEINFOW),
+        fMask: u32 = 0,
+        hwnd: ?w.HANDLE = null,
+        lpVerb: ?[*:0]const u16 = null,
+        lpFile: ?[*:0]const u16 = null,
+        lpParameters: ?[*:0]const u16 = null,
+        lpDirectory: ?[*:0]const u16 = null,
+        nShow: i32 = 0,
+        hInstApp: ?w.HANDLE = null,
+        lpIDList: ?*anyopaque = null,
+        lpClass: ?[*:0]const u16 = null,
+        hkeyClass: ?w.HANDLE = null,
+        dwHotKey: u32 = 0,
+        hIcon: ?w.HANDLE = null,
+        hProcess: ?w.HANDLE = null,
+    };
+    extern "shell32" fn ShellExecuteExW(info: *SHELLEXECUTEINFOW) callconv(W) i32;
+    extern "kernel32" fn WaitForSingleObject(h: w.HANDLE, ms: u32) callconv(W) u32;
+    extern "kernel32" fn GetExitCodeProcess(h: w.HANDLE, code: *u32) callconv(W) i32;
+    extern "kernel32" fn GetLastError() callconv(W) u32;
+    extern "kernel32" fn GetCurrentProcess() callconv(W) w.HANDLE;
+    extern "kernel32" fn LocalFree(p: ?*anyopaque) callconv(W) ?*anyopaque;
+    extern "advapi32" fn OpenProcessToken(process: w.HANDLE, access: u32, token: *w.HANDLE) callconv(W) i32;
+    extern "advapi32" fn GetTokenInformation(token: w.HANDLE, class: u32, info: ?*anyopaque, len: u32, ret: *u32) callconv(W) i32;
+    extern "advapi32" fn ConvertSidToStringSidW(sid: *anyopaque, out: *?[*:0]u16) callconv(W) i32;
+
+    fn env(gpa: std.mem.Allocator) ?std.process.Environ.Map {
+        return std.process.Environ.createMap(.{ .block = .global }, gpa) catch null;
+    }
+
+    /// The user's SID as text ("S-1-5-21-…").
+    fn userSid(out: []u8) ?[]const u8 {
+        var token: w.HANDLE = undefined;
+        if (OpenProcessToken(GetCurrentProcess(), 0x8, &token) == 0) return null; // TOKEN_QUERY
+        defer w.CloseHandle(token);
+        var buf: [256]u8 align(8) = undefined;
+        var len: u32 = 0;
+        if (GetTokenInformation(token, 1, &buf, buf.len, &len) == 0) return null; // TokenUser
+        // TOKEN_USER: { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes } }
+        const sid: *anyopaque = @ptrFromInt(std.mem.readInt(usize, buf[0..@sizeOf(usize)], .little));
+        var text: ?[*:0]u16 = null;
+        if (ConvertSidToStringSidW(sid, &text) == 0) return null;
+        defer _ = LocalFree(text);
+        const n = std.unicode.wtf16LeToWtf8(out, std.mem.sliceTo(text.?, 0));
+        return out[0..n];
+    }
+
+    /// Runs `exe params` as an administrator (the UAC prompt) and waits.
+    fn runElevated(exe: []const u8, params: []const u8) !void {
+        var exe_w: [std.fs.max_path_bytes:0]u16 = undefined;
+        var par_w: [std.fs.max_path_bytes + 256:0]u16 = undefined;
+        const en = try std.unicode.wtf8ToWtf16Le(&exe_w, exe);
+        exe_w[en] = 0;
+        const pn = try std.unicode.wtf8ToWtf16Le(&par_w, params);
+        par_w[pn] = 0;
+        var info: SHELLEXECUTEINFOW = .{
+            .fMask = 0x40, // SEE_MASK_NOCLOSEPROCESS
+            .lpVerb = std.unicode.utf8ToUtf16LeStringLiteral("runas"),
+            .lpFile = exe_w[0..en :0],
+            .lpParameters = par_w[0..pn :0],
+            .nShow = 0, // SW_HIDE
+        };
+        if (ShellExecuteExW(&info) == 0) {
+            // ERROR_CANCELLED: the user said no
+            return if (GetLastError() == 1223) error.Refused else error.NeedsAdministrator;
+        }
+        const h = info.hProcess orelse return;
+        defer w.CloseHandle(h);
+        _ = WaitForSingleObject(h, 120_000);
+        var code: u32 = 1;
+        _ = GetExitCodeProcess(h, &code);
+        if (code != 0) return error.InstallFailed;
     }
 };
 
