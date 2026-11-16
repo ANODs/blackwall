@@ -23,6 +23,7 @@ const tls13 = @import("tls13.zig");
 const vision = @import("vision.zig");
 const xudp = @import("xudp.zig");
 const udp_out = @import("udp_out.zig");
+const sni = @import("sni.zig");
 const failover = @import("failover.zig");
 pub const wintun = @import("wintun.zig");
 const windows = builtin.os.tag == .windows;
@@ -312,6 +313,47 @@ pub const Tunnel = struct {
         };
     }
 
+    /// Whether a site's rule could decide where a flow of `app` goes: there
+    /// are such rules, and the application has none of its own.
+    fn sitesMayDecide(t: *Tunnel, app: ?[]const u8) bool {
+        t.cfg_mutex.lockUncancelable(t.io);
+        defer t.cfg_mutex.unlock(t.io);
+        if (t.domain_map.count() == 0) return false;
+        const chain = app orelse return t.cfg.unknown == null;
+        var ids = std.mem.splitScalar(u8, chain, 0);
+        while (ids.next()) |id| {
+            for (t.cfg.rules) |rule| if (std.mem.eql(u8, rule.app, id)) return false;
+        }
+        return true;
+    }
+
+    /// How long a flow may take to say which site it wants.
+    const sniff_ms = 400;
+
+    /// The site named by the first bytes of `local` (a TLS ClientHello's
+    /// server name, an HTTP Host), left unread for the flow; null when it
+    /// says nothing in time or nothing of the kind.
+    fn sniff(local: anytype) ?[]const u8 {
+        const r = local.r;
+        var waited: u32 = 0;
+        while (true) {
+            const have = r.buffered();
+            const k, const need = sni.kind(have);
+            switch (k) {
+                .tls => if (have.len >= need or need > r.buffer.len) return if (sni.serverName(have)) |f| f.name else null,
+                .http => if (std.mem.indexOf(u8, have, "\r\n\r\n") != null or have.len == r.buffer.len) return if (sni.httpHost(have)) |f| f.name else null,
+                .other => return null,
+                .incomplete => {},
+            }
+            if (waited >= sniff_ms) return null;
+            if (!local.waitReadable(50)) {
+                waited += 50;
+                continue;
+            }
+            r.fillMore() catch return null;
+        }
+    }
+
     /// The rule of `name` or of the nearest site above it. The caller
     /// holds `cfg_mutex`.
     fn domainChoice(t: *Tunnel, name: []const u8) ?Choice {
@@ -391,13 +433,21 @@ pub const Tunnel = struct {
             target = .fromEndpoint(remote);
         }
 
-        const where = t.decide(app, name);
-        const ob = where.snap.get();
         var rb: [tls13.min_read_buffer]u8 = undefined;
         var wb: [4096]u8 = undefined;
         var r: tcp.Reader = .init(conn, &rb);
         var w: tcp.Writer = .init(conn, &wb);
         var local: proxy.Local = .{ .r = &r.interface, .w = &w.interface, .end = .{ .tun = conn } };
+        // to a real address, where a site's rule could apply: the name is
+        // in the application's first bytes, which come only once it is
+        // connected
+        if (name == null and t.sitesMayDecide(app)) {
+            local.ready() catch return;
+            name = sniff(&local);
+        }
+
+        const where = t.decide(app, name);
+        const ob = where.snap.get();
         // this flow's own counters tell the group how its server did
         var mine: proxy.Meter = .{};
         const flow: proxy.Flow = .{
@@ -1074,6 +1124,53 @@ test "tunnel: sites take the applications without a rule, never the others" {
     try std.testing.expect(t.decide(browser, "youtube.com").snap.outbound == .direct);
     try std.testing.expect(t.decide(browser, "work.example").snap.outbound == .block);
     try std.testing.expect(t.decide("/Applications/Bank.app", "youtube.com").snap.outbound == .block);
+}
+
+test "tunnel: the name a flow asks for, from its first bytes, as they come" {
+    var hello_buf: [512]u8 = undefined;
+    const hello = sni.testHello(&hello_buf, "video.example.org");
+    // the whole ClientHello at once, in two pieces, and an HTTP request
+    const Feed = struct {
+        parts: []const []const u8,
+        next: usize = 0,
+        rbuf: [4096]u8 = undefined,
+        reader: Io.Reader = undefined,
+        r: *Io.Reader = undefined,
+
+        fn init(f: *@This()) void {
+            f.reader = .{ .vtable = &.{ .stream = stream }, .buffer = &f.rbuf, .seek = 0, .end = 0 };
+            f.r = &f.reader;
+        }
+        fn stream(io_r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+            const f: *@This() = @alignCast(@fieldParentPtr("reader", io_r));
+            if (f.next == f.parts.len) return error.EndOfStream;
+            const part = f.parts[f.next];
+            f.next += 1;
+            const dest = limit.slice(try w.writableSliceGreedy(1));
+            @memcpy(dest[0..part.len], part);
+            w.advance(part.len);
+            return part.len;
+        }
+        pub fn waitReadable(f: *@This(), _: u32) bool {
+            return f.next < f.parts.len;
+        }
+    };
+    const cases = [_]struct { []const []const u8, ?[]const u8 }{
+        .{ &.{hello}, "video.example.org" },
+        .{ &.{ hello[0..3], hello[3..100], hello[100..] }, "video.example.org" },
+        .{ &.{ "GET /x HTTP/1.1\r\nHost: plain.example\r\n", "Accept: */*\r\n\r\n" }, "plain.example" },
+        .{ &.{"SSH-2.0-OpenSSH_9\r\n"}, null },
+        // says nothing: the flow goes on without a name
+        .{ &.{}, null },
+    };
+    for (cases) |case| {
+        var f: Feed = .{ .parts = case[0] };
+        f.init();
+        const got = Tunnel.sniff(&f);
+        if (case[1]) |want| try std.testing.expectEqualStrings(want, got.?) else try std.testing.expect(got == null);
+        // nothing was consumed: the flow still sends it all
+        if (case[0].len > 0) try std.testing.expect(f.r.buffered().len > 0);
+    }
 }
 
 test "tunnel: a flow without a rule follows the application that started it" {

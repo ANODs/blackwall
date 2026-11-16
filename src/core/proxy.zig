@@ -979,9 +979,14 @@ pub const Local = struct {
         /// a connection terminated by the TUN stack
         tun: *tcp.Conn,
     },
+    /// told already (the tunnel may accept before it dials, to read the
+    /// name the application asks for)
+    accepted: bool = false,
 
     /// The outbound is ready: tell the application it is connected.
     pub fn ready(l: *Local) !void {
+        if (l.accepted) return;
+        l.accepted = true;
         switch (l.end) {
             .socks => try reply(l.w, 0),
             .tun => |c| try c.accept(),
