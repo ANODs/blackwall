@@ -95,11 +95,11 @@ release is a single file of 3 to 11 MB.
 
 | | macOS (Apple Silicon) | Android 10+ | Linux (x64) | Windows (x64) |
 |---|---|---|---|---|
-| Capture all traffic (TUN) | Yes | Yes | Yes | Not yet |
-| Routes per application | Yes | Yes | Yes | Not yet |
+| Capture all traffic (TUN) | Yes | Yes | Yes | Yes (Wintun) |
+| Routes per application | Yes | Yes | Yes | Yes |
 | Local SOCKS5 proxy (`127.0.0.1:1080`) | Yes | No | Yes | Yes |
-| Protection after Disconnect | Yes | Yes | Yes | No |
-| Kill switch | Yes (pf) | Android's own "Always-on VPN" | Yes (nftables) | No |
+| Protection after Disconnect | Yes | Yes | Yes | Yes |
+| Kill switch | Yes (pf) | Android's own "Always-on VPN" | Yes (nftables) | Yes (WFP) |
 | Traffic held from boot | Yes | Android's own "Always-on VPN" | No | No |
 | Menu bar / tray / notification | Yes | Yes | Built, untested | Built, untested |
 | Automatic updates | Yes | No | Yes | Yes |
@@ -109,8 +109,11 @@ emulator (Android 16, arm64) from first start to a reboot with "Block connection
 VPN" on, and not through daily use on a phone yet. On Linux the capture, the routes per
 application, the protection after Disconnect and the strict kill switch pass an end-to-end
 test in a virtual machine (Alpine, kernel 6.18); the window and the tray have not been
-through a real desktop yet. Linux needs kernel 5.7 or newer. The Windows build passes the
-automatic tests in CI and has not been through real use.
+through a real desktop yet. Linux needs kernel 5.7 or newer. On Windows the capture
+through Wintun, the routes per application, the system service with its install and
+signed upgrade, and both kill switch modes pass an end-to-end test on a Windows machine
+in CI on every push; protection after Disconnect runs on the same path but has no test
+of its own there, and the window and the tray have not been through a real desktop yet.
 
 ## Protocols and transports
 
@@ -145,7 +148,9 @@ The builds are not signed by Apple or Microsoft yet:
 
 - **macOS**: right-click the app, choose Open. The first connection in TUN mode asks for
   the administrator password once, to install the network helper.
-- **Windows**: SmartScreen, More info, Run anyway.
+- **Windows**: SmartScreen, More info, Run anyway. The first Connect asks once (UAC) to
+  install the BLACKWALL system service, which carries the traffic; later releases replace
+  it by themselves. See [docs/windows.md](docs/windows.md).
 - **Linux**: unpack the archive and run `./install.sh`, which puts BLACKWALL into the
   applications menu for your user (no root). The first Connect in TUN mode asks for your
   password once, through the system's dialog, to give `blackwall-tun` its network
@@ -316,8 +321,11 @@ zig build test
 The suite covers the protocol code against recorded and scripted peers, the TCP/IP stack,
 the routing table, the recovery logic and the release tooling, and runs on macOS, Linux and
 Windows in CI on every push. The Linux capture, routes per application, protection after
-Disconnect and the strict kill switch also have an end-to-end test in a virtual machine,
-and the Android app is checked in an emulator.
+Disconnect and the strict kill switch also have an end-to-end test in a virtual machine;
+on Windows [tools/windows/e2e.ps1](tools/windows/e2e.ps1) and
+[upgrade.ps1](tools/windows/upgrade.ps1) do the same on a CI machine (the adapter, routes
+per application, the service, the kill switch, a signed upgrade and a forged one); the
+Android app is checked in an emulator.
 
 Two tools help when working on the data plane:
 
@@ -356,6 +364,7 @@ src/
   service/                 the background service
   android/                 the core as a library for the Android app
   helper/                  the root helper (macOS)
+tools/windows/             end-to-end checks on a Windows machine
   tools/                   release signing, headless proxy
 android/                   the Android shell: VpnService, the window, resources
 docs/                      updates, Android, release notes
@@ -363,7 +372,10 @@ docs/                      updates, Android, release notes
 
 ## Known limitations
 
-- Windows has the local proxy only: no capture, no routes per application.
+- Windows: the list of applications comes from the Start menu shortcuts that point at a
+  program (Store apps and installer-advertised shortcuts are not in it yet; they can still
+  follow the default route); traffic is not held from boot; IPv6 resolvers of the network
+  are not captured.
 - Linux: a connection is matched to its application only for your own processes (another
   user's daemons follow the default route); programs in Flatpak or Snap, and those
   started through a wrapper script, appear under their real executable once they have had
@@ -385,7 +397,8 @@ docs/                      updates, Android, release notes
 
 - **0.2** — UDP over Trojan, VMess and Shadowsocks; rules by domain; a local DPI bypass
   route.
-- **0.4** — Windows: capture through Wintun, routes per application, a kill switch on WFP.
+- **0.4** — Windows on a real desktop: the window and the tray, Store applications in the
+  list, traffic held from boot.
 - **0.5** — WireGuard.
 - **0.6** — QUIC and Hysteria2.
 - **0.7** — TUIC.
