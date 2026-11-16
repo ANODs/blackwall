@@ -152,6 +152,8 @@ h2{font-size:clamp(32px,5.2vw,60px);font-weight:600;line-height:1.05;letter-spac
 .plat h3{font-size:24px;font-weight:600;letter-spacing:-.02em}
 .arch{margin-top:6px;font:400 12px/1.4 var(--mono);color:var(--text3)}
 .note{margin-top:20px;font-size:14px;line-height:1.55;color:var(--text2)}
+.soon{margin-top:12px;font:400 12px/1.4 var(--mono);color:var(--text3)}
+.l-zh .soon{font-family:var(--sans)}
 .plat-b{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:auto;padding-top:28px}
 .plat .btn{height:42px;padding:0 18px;font-size:14px;border-radius:11px}
 .nums{display:flex;flex-direction:column;align-items:flex-end;gap:2px;font:400 12px/1.4 var(--mono);color:var(--text2);text-align:right}
