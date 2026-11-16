@@ -393,7 +393,11 @@ docs/                      updates, Android, release notes
   Trojan, Shadowsocks UDP), except Shadowsocks 2022 through a relay (identity headers),
   where it is dropped.
 - XHTTP supports the stream-one mode.
-- "DPI bypass" is listed as a route but not implemented; it behaves like Direct.
+- "DPI bypass" reshapes the TLS ClientHello of a direct connection (two records, two
+  segments, or the first segment with TTL 1, whichever gets through for that host). It
+  helps against filters that match the site's name; a site blocked by its address stays
+  blocked. Plain HTTP and QUIC are not reshaped (QUIC is dropped on that route so browsers
+  use TLS over TCP).
 - A changed route applies to new connections; open ones finish on the route they started
   with.
 - DNS queries other than address lookups are forwarded to the network's own resolver.

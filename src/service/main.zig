@@ -327,6 +327,7 @@ const Service = struct {
             p.setOutbound(switch (cfg.default) {
                 .direct => .direct,
                 .block => .block,
+                .dpi => .dpi,
                 .outbound => |i| cfg.outbounds[i],
                 // the port has no reserve: it stays on the main server
                 .main => if (cfg.main.len > 0) cfg.outbounds[cfg.main[0]] else .block,

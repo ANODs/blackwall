@@ -150,6 +150,48 @@ pub fn waitFd(fd: c.fd_t, for_write: bool, ms: i32) bool {
     }
 }
 
+const ttl_opt: struct { v4: u32, v6: u32 } = switch (builtin.os.tag) {
+    .linux => .{ .v4 = 2, .v6 = 16 }, // IP_TTL, IPV6_UNICAST_HOPS
+    else => .{ .v4 = 4, .v6 = 4 }, // macOS and Windows
+};
+
+/// The time to live (hop limit) of what a socket sends; null if unknown.
+pub fn ttl(fd: c.fd_t, v6: bool) ?u32 {
+    var v: u32 = 0;
+    const level: i32 = if (v6) 41 else 0;
+    const name = if (v6) ttl_opt.v6 else ttl_opt.v4;
+    if (comptime windows) {
+        afd.intOption(fd, level, name, &v, true) catch return null;
+        return v;
+    }
+    var len: c.socklen_t = @sizeOf(u32);
+    if (c.getsockopt(fd, level, name, &v, &len) != 0) return null;
+    return v;
+}
+
+pub fn setTtl(fd: c.fd_t, v6: bool, value: u32) bool {
+    var v = value;
+    const level: i32 = if (v6) 41 else 0;
+    const name = if (v6) ttl_opt.v6 else ttl_opt.v4;
+    if (comptime windows) {
+        afd.intOption(fd, level, name, &v, false) catch return false;
+        return true;
+    }
+    return c.setsockopt(fd, level, name, &v, @sizeOf(u32)) == 0;
+}
+
+/// A readable TCP socket: data waits (true), or it ended or was reset
+/// (false). Nothing is read.
+pub fn hasData(fd: c.fd_t) bool {
+    if (comptime windows) return afd.peekData(fd);
+    var one: [1]u8 = undefined;
+    while (true) {
+        const n = c.recv(fd, &one, 1, c.MSG.PEEK);
+        if (n < 0 and c.errno(n) == .INTR) continue;
+        return n > 0;
+    }
+}
+
 /// Reads a socket like `net.Stream.Reader`, except that a read gives up
 /// once `deadline_ms` (awake clock; 0 = never) has passed. A server that
 /// accepts a connection and then says nothing would otherwise hold its

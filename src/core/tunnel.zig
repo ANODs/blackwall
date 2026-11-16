@@ -33,6 +33,8 @@ const Endpoint = packet.Endpoint;
 pub const Choice = union(enum) {
     direct,
     block,
+    /// direct, with the first bytes shaped past DPI
+    dpi,
     /// index into `Config.outbounds`: this server and no other
     outbound: u16,
     /// the main server, or the reserve server standing in for it (`Config.main`)
@@ -307,6 +309,7 @@ pub const Tunnel = struct {
         };
         return switch (choice) {
             .direct => .{ .snap = .of(.direct) },
+            .dpi => .{ .snap = .of(.dpi) },
             .block => .{ .snap = .of(.block) },
             .outbound => |i| .{ .snap = if (i < t.cfg.outbounds.len) .of(t.cfg.outbounds[i]) else .of(.block) },
             .main => if (t.group.current()) |s| .{ .snap = s, .main = true } else .{ .snap = .of(.block) },
@@ -583,6 +586,9 @@ pub const Tunnel = struct {
         switch (snap.outbound) {
             .block => t.rememberDrop(key, stats),
             .direct => t.startDirect(key, payload, stats),
+            // QUIC has its own ClientHello, unshaped: browsers fall back to
+            // TCP, which this route shapes; other UDP goes as it is
+            .dpi => if (dst.port == 443) t.rememberDrop(key, stats) else t.startDirect(key, payload, stats),
             // QUIC of proxied apps is dropped: browsers fall back to TCP,
             // which the servers carry far more efficiently
             .vless, .vmess, .trojan, .shadowsocks => if (dst.port == 443 and t.dropQuic())

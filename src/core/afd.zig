@@ -120,6 +120,14 @@ fn bindAny(h: Handle, fam: u16) Error!net.IpAddress {
     return std.Io.Threaded.addressFromPosix(&s.addr);
 }
 
+/// Set (or, with `get`, read) a socket option of the transport (IP_TTL and
+/// the like): the value is a 32-bit integer.
+pub fn intOption(h: Handle, level: i32, name: u32, value: *u32, get: bool) Error!void {
+    const info: w.AFD.SOCKOPT_INFO = .{ .mode = if (get) .get else .set, .level = level, .optname = name, .optval = value, .optlen = @sizeOf(u32) };
+    const r = call(h, w.IOCTL.AFD.SOCKOPT, @ptrCast(&info), &.{}, null) catch return error.BindFailed;
+    if (r.status != .SUCCESS) return error.BindFailed;
+}
+
 /// Sends this socket's packets out of interface `index` only, whatever
 /// the routes say (IP_UNICAST_IF / IPV6_UNICAST_IF).
 pub fn unicastIf(h: Handle, fam: u16, index: u32) Error!void {
@@ -215,6 +223,21 @@ pub fn wait(h: Handle, for_write: bool, ms: i32) bool {
         .TIMEOUT => false,
         else => true,
     };
+}
+
+/// Whether a connected TCP socket has data waiting (true) or has ended or
+/// been reset (false); read nothing. Call once it is readable.
+pub fn peekData(h: Handle) bool {
+    var one: [1]u8 = undefined;
+    var bufs = [1]w.AFD.WSABUF(.@"var"){.{ .len = 1, .buf = &one }};
+    const info: w.AFD.RECV_INFO = .{
+        .BufferArray = &bufs,
+        .BufferCount = 1,
+        .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+        .TdiFlags = .{ .NORMAL = true, .PEEK = true },
+    };
+    const r = call(h, w.IOCTL.AFD.RECEIVE, @ptrCast(&info), &.{}, 1000) catch return false;
+    return r.status == .SUCCESS and r.info > 0;
 }
 
 /// Bytes from a connected TCP socket; 0 at its end.

@@ -27,6 +27,8 @@ const shadowsocks = @import("shadowsocks.zig");
 const vmess = @import("vmess.zig");
 const vision = @import("vision.zig");
 const sys = @import("sys.zig");
+const sniff = @import("sni.zig");
+const dpi = @import("dpi.zig");
 const packet = @import("ipstack/packet.zig");
 const tcp = @import("ipstack/stack.zig");
 const dns = @import("ipstack/dns.zig");
@@ -142,6 +144,8 @@ pub const Via = struct {
 pub const Outbound = union(enum) {
     direct,
     block,
+    /// direct, with the first bytes shaped past DPI (dpi.zig)
+    dpi,
     vless: Vless,
     trojan: trojan.Trojan,
     shadowsocks: shadowsocks.Shadowsocks,
@@ -150,7 +154,7 @@ pub const Outbound = union(enum) {
     /// Null for the outbounds that use no server.
     pub fn via(o: *const Outbound) ?Via {
         return switch (o.*) {
-            .direct, .block => null,
+            .direct, .block, .dpi => null,
             .shadowsocks => |*s| .{ .host = s.host, .port = s.port },
             inline .vless, .trojan, .vmess => |*s| .{
                 .host = s.host,
@@ -174,7 +178,7 @@ pub const Outbound = union(enum) {
         const vb = b.via().?;
         if (va.port != vb.port or !std.mem.eql(u8, va.host, vb.host)) return false;
         return switch (a.*) {
-            .direct, .block => true,
+            .direct, .block, .dpi => true,
             .vless => |*v| std.mem.eql(u8, &v.uuid, &b.vless.uuid),
             .trojan => |*t| std.mem.eql(u8, &t.key, &b.trojan.key),
             .shadowsocks => |*s| s.method == b.shadowsocks.method and std.mem.eql(u8, &s.key, &b.shadowsocks.key),
@@ -185,7 +189,7 @@ pub const Outbound = union(enum) {
     /// The strings an outbound points to rather than holds.
     fn strings(o: *Outbound) ?struct { host: *[]const u8, sni: ?*[]const u8 } {
         switch (o.*) {
-            .direct, .block => return null,
+            .direct, .block, .dpi => return null,
             inline else => |*s| {
                 const has_reality = comptime @hasField(@TypeOf(s.*), "reality");
                 return .{
@@ -1083,9 +1087,114 @@ pub const Flow = struct {
                 try local.ready();
                 try f.relayPlain(local, upstream);
             },
+            .dpi => try f.runDpi(local, target),
             .vless => try f.runVless(ob, local, target),
             .trojan, .shadowsocks, .vmess => try f.runStream(ob, local, target),
         }
+    }
+
+    /// Direct, with the first flight shaped past DPI (dpi.zig): the
+    /// application is told it is connected first, its ClientHello (or HTTP
+    /// request) is read, and sent in the way that worked for this host
+    /// before, else in each way in turn until the server answers.
+    fn runDpi(f: *const Flow, local: *Local, target: *const Target) !void {
+        try local.ready();
+        const first = firstFlight(local);
+        const h = dpi.hello(first) orelse return f.dpiPlain(local, target);
+        var name_buf: [255]u8 = undefined;
+        const host = if (target.kind == .domain) target.addr() else blk: {
+            const found = sniff.find(h.bytes) orelse break :blk target.addr();
+            const n = @min(found.name.len, name_buf.len);
+            @memcpy(name_buf[0..n], found.name[0..n]);
+            break :blk name_buf[0..n];
+        };
+        const known = dpi.force orelse dpi.memory.get(f.io, host);
+        var s: dpi.Strategy = known orelse .records;
+        var buf: [tls13.min_read_buffer + 16]u8 = undefined;
+        var tried: usize = 0;
+        while (tried < dpi.Strategy.count) : (tried += 1) {
+            const upstream = f.dialer.connectTarget(f.io, target) catch |err| {
+                local.reset(f.io);
+                return err;
+            };
+            if (f.sendShaped(upstream, target, dpi.plan(h, s, &buf))) {
+                if (sys.waitFd(upstream.socket.handle, false, dpi.answer_ms) and sys.hasData(upstream.socket.handle)) {
+                    if (known != s) dpi.memory.put(f.io, host, s);
+                    local.r.toss(h.bytes.len);
+                    f.up(h.bytes.len);
+                    defer upstream.close(f.io);
+                    return f.relayPlain(local, upstream);
+                }
+            } else |_| {}
+            upstream.close(f.io);
+            s = @enumFromInt((@intFromEnum(s) + 1) % dpi.Strategy.count);
+        }
+        f.fault(.unreachable_server);
+        local.reset(f.io);
+        return error.DpiRefused;
+    }
+
+    /// Nothing to shape (another protocol, or nothing said in time): a
+    /// plain direct connection, which carries what was read.
+    fn dpiPlain(f: *const Flow, local: *Local, target: *const Target) !void {
+        const upstream = f.dialer.connectTarget(f.io, target) catch |err| {
+            local.reset(f.io);
+            return err;
+        };
+        defer upstream.close(f.io);
+        return f.relayPlain(local, upstream);
+    }
+
+    /// The application's first bytes, as much as makes a ClientHello or a
+    /// request head, read but left in `local.r`; whatever came within
+    /// `first_flight_ms` otherwise.
+    fn firstFlight(local: *Local) []const u8 {
+        const r = local.r;
+        var waited: u32 = 0;
+        while (true) {
+            const have = r.buffered();
+            const k, const need = sniff.kind(have);
+            switch (k) {
+                .tls => if (have.len >= need or need > r.buffer.len) return have,
+                .http => if (std.mem.indexOf(u8, have, "\r\n\r\n") != null or have.len == r.buffer.len) return have,
+                .other => return have,
+                .incomplete => {},
+            }
+            if (waited >= first_flight_ms) return have;
+            if (!local.waitReadable(50)) {
+                waited += 50;
+                continue;
+            }
+            r.fillMore() catch return r.buffered();
+        }
+    }
+
+    const first_flight_ms = 400;
+
+    /// The plan's parts on their way: together, or each its own segment,
+    /// the first with a TTL of 1 when asked (it dies on the way and the
+    /// kernel sends it again, after the second).
+    fn sendShaped(f: *const Flow, upstream: net.Stream, target: *const Target, p: dpi.Plan) !void {
+        var wb: [4096]u8 = undefined;
+        var w = upstream.writer(f.io, &wb);
+        const fd = upstream.socket.handle;
+        if (p.together) {
+            try w.interface.writeAll(p.parts[0]);
+            try w.interface.writeAll(p.parts[1]);
+            return w.interface.flush();
+        }
+        const v6 = target.kind == .ip6 or (target.kind == .domain and upstream.socket.address == .ip6);
+        const normal = if (p.low_ttl_first) sys.ttl(fd, v6) else null;
+        if (normal != null) _ = sys.setTtl(fd, v6, 1);
+        try w.interface.writeAll(p.parts[0]);
+        try w.interface.flush();
+        if (normal) |t| {
+            // let the segment leave with the low TTL before it is restored
+            f.io.sleep(.fromMilliseconds(5), .awake) catch {};
+            _ = sys.setTtl(fd, v6, t);
+        } else f.io.sleep(.fromMilliseconds(2), .awake) catch {};
+        try w.interface.writeAll(p.parts[1]);
+        try w.interface.flush();
     }
 
     fn relayPlain(f: *const Flow, local: *Local, upstream: net.Stream) !void {
@@ -1106,6 +1215,7 @@ pub const Flow = struct {
 
     fn relayBack(f: *const Flow, from: *Io.Reader, local: *Local, bk: *Back) void {
         defer bk.finish(f.io);
+
         if (f.pumpBack(from, local.w, bk)) local.closeBoth(f.io) else |_| local.reset(f.io);
     }
 

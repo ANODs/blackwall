@@ -56,7 +56,11 @@ pub fn main(init: std.process.Init) !void {
     }
     var proxy: core.proxy.Proxy = .{ .io = init.io };
     proxy.dialer = dialer;
-    if (args.len > 2) {
+    if (args.len > 2 and std.mem.startsWith(u8, args[2], "dpi")) {
+        // the DPI bypass route; "dpi:segments" fixes one way for every host
+        proxy.setOutbound(.dpi);
+        if (args[2].len > 4) core.dpi.force = std.meta.stringToEnum(core.dpi.Strategy, args[2][4..]) orelse return error.UnknownStrategy;
+    } else if (args.len > 2) {
         const sv = try core.sublink.parseLink(init.arena.allocator(), args[2]);
         proxy.setOutbound(try core.proxy.outboundFromLink(args[2], sv.host, sv.port));
     }

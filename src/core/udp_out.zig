@@ -64,7 +64,7 @@ pub fn kindOf(ob: *const proxy.Outbound) ?Kind {
         .vmess => .vmess,
         .trojan => .trojan,
         .shadowsocks => .shadowsocks,
-        .direct, .block => null,
+        .direct, .block, .dpi => null,
     };
 }
 

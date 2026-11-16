@@ -111,8 +111,7 @@ fn currentIndex(state: *const model.State, ids: []const u32) ?u16 {
 fn choiceOf(route: model.Route, ids: []const u32, has_main: bool) tunnel.Choice {
     return switch (route) {
         .direct => .direct,
-        // the local DPI bypass module does not exist yet: such apps go direct
-        .dpi => .direct,
+        .dpi => .dpi,
         .block => .block,
         .default, .auto => if (has_main) .main else .block,
         .server => |id| for (ids, 0..) |sid, i| {
