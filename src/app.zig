@@ -178,7 +178,7 @@ fn writeConfig() bool {
 /// login, in TUN mode, and then either connects or guards.
 fn bootHoldWanted() bool {
     const s = &state.settings;
-    if (state.demo or !persist or !link_mod.tun_supported) return false;
+    if (state.demo or !persist or !link_mod.hold_supported) return false;
     if (!s.launch_at_login or s.tunnel_mode != .tun or s.kill_switch == .off) return false;
     return s.auto_connect or (s.protect_when_off and state.hasProtectedApps());
 }

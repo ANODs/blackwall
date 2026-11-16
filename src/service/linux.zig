@@ -1,7 +1,8 @@
 //! Linux pieces of the data plane: the TUN device and everything around it.
 //!
 //! `openTun` opens a device somebody else set up (a script, systemd).
-//! `up` does the whole job by itself, which is what the app uses: it
+//! `up` does the whole job by itself (in `blackwall-tun`, see
+//! tun_main.zig, or in a service that runs with the capability): it
 //! creates the device, gives it its address, sends the default route and
 //! the network's resolvers into it, and tells which physical interface the
 //! service's own sockets must stay on. It needs CAP_NET_ADMIN and nothing
@@ -21,6 +22,7 @@ const log = std.log.scoped(.linux);
 
 const TUNSETIFF: u32 = 0x400454ca; // _IOW('T', 202, int)
 const TUNSETPERSIST: u32 = 0x400454cb; // _IOW('T', 203, int)
+const TUNSETOWNER: u32 = 0x400454cc; // _IOW('T', 204, int)
 const IFF_TUN: u16 = 0x0001;
 const IFF_NO_PI: u16 = 0x1000;
 
@@ -147,6 +149,9 @@ pub fn up(io: std.Io, gpa: std.mem.Allocator, o: Options) !Lease {
 
     const fd = try openTun(device);
     errdefer _ = c.close(fd);
+    // the user owns it: the service, which runs without capabilities, can
+    // take it over again and let it go (`remove`)
+    _ = c.ioctl(fd, @bitCast(TUNSETOWNER), @as(c_ulong, c.getuid()));
     if (c.ioctl(fd, @bitCast(TUNSETPERSIST), @as(c_ulong, @intFromBool(o.hold))) != 0) return error.TunSetupFailed;
 
     const s = c.socket(c.AF.INET, c.SOCK.DGRAM | c.SOCK.CLOEXEC, 0);

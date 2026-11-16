@@ -6,10 +6,13 @@
 //! --tun helper (macOS): the root helper creates the utun, routes and DNS,
 //! applies the kill switch from the settings and hands the utun over.
 //!
-//! --tun auto (Linux): the service sets the device, the routes and the
-//! capture of the resolvers up by itself (linux.zig); it needs
-//! CAP_NET_ADMIN on its executable and nothing else. `--release` removes a
-//! device a service that is gone left behind.
+//! --tun auto (Linux): the device, the routes and the capture of the
+//! resolvers (linux.zig) are set up by blackwall-tun, which holds
+//! CAP_NET_ADMIN and hands the device over (tun_main.zig); run as root the
+//! service does it itself. Connections are matched to their programs
+//! through /proc (linux_proc.zig), and the strict kill switch is an
+//! nftables table (nft.zig). `--release` removes a device that a service
+//! which is gone left behind.
 //!
 //! Reads the configuration the app writes (config.json in DIR), carries the
 //! traffic of applications routed into the TUN and/or the SOCKS port, and
@@ -24,7 +27,9 @@ const builtin = @import("builtin");
 const core = @import("core");
 const build_options = @import("build_options");
 const routes = @import("routes.zig");
+const fdpass = @import("fdpass");
 const linux = @import("linux.zig");
+const linux_proc = @import("linux_proc.zig");
 const darwin = if (builtin.os.tag.isDarwin()) struct {
     const process = @import("darwin/process.zig");
     const helper = @import("helper_client.zig");
@@ -120,6 +125,11 @@ const Service = struct {
     /// "suspend": leave the helper's capture in place (the kill switch decides)
     keep_capture: bool = false,
     searcher: if (builtin.os.tag.isDarwin()) darwin.process.Searcher else void = undefined,
+    /// resolvers the service itself asks (Linux strict kill switch)
+    dns4: [8][4]u8 = undefined,
+    dns4_len: usize = 0,
+    /// who owns a connection (Linux, `--tun auto`)
+    owners: if (builtin.os.tag == .linux) linux_proc.Searcher else void = undefined,
     stopping: std.atomic.Value(bool) = .init(false),
 
     /// The kill switch the helper holds. In standby direct traffic must
@@ -159,6 +169,7 @@ const Service = struct {
             }
         }
         if (s.via_helper and builtin.os.tag.isDarwin()) darwin.helper.servers(s.gpa, s.io, s.server_ips.items);
+        s.applyFirewall();
         if (s.t) |t| try t.setConfig(b.cfg);
         if (s.built) |*old| old.deinit();
         s.built = b;
@@ -192,20 +203,35 @@ const Service = struct {
                 .fd => |f| f,
                 .linux => |name| if (builtin.os.tag == .linux) try linux.openTun(name) else return error.Unsupported,
                 .auto => if (builtin.os.tag == .linux) blk: {
-                    const lease = linux.up(s.io, s.gpa, .{
+                    const opts: linux.Options = .{
                         .mtu = s.args.mtu,
                         // the device that stays behind a dead service is the kill switch
                         .hold = s.killSwitch() != .off,
                         .ipv6 = s.settings.ipv6 != .system,
-                    }) catch |err| {
-                        s.writeError(err);
-                        return err;
+                    };
+                    // as root (systemd) the service does it itself; as the user it
+                    // asks blackwall-tun, also for a device it held before, which
+                    // it could open again but not set up
+                    const as_user = c.geteuid() != 0;
+                    const lease = (if (as_user) tunHelper(s.gpa, s.io, opts) else linux.up(s.io, s.gpa, opts)) catch |err| switch (err) {
+                        error.NeedsAdministrator => (if (as_user) err else tunHelper(s.gpa, s.io, opts)) catch |e| {
+                            s.writeError(e);
+                            return e;
+                        },
+                        else => {
+                            s.writeError(err);
+                            return err;
+                        },
                     };
                     s.own_device = true;
                     bind = .interface(lease.bindName());
+                    s.owners = .init(s.gpa, s.io);
+                    lookup = .{ .ctx = &s.owners, .find = findLinuxApp };
                     for (lease.dns[0..lease.dns_len], 0..) |ip, k| dns_buf[k] = .{ .addr = packet.v4(ip), .port = 53 };
                     if (lease.dns_len > 0) dns_servers = dns_buf[0..lease.dns_len];
                     log.info("device {s}, own traffic on {s}, {d} resolvers captured", .{ linux.device, lease.bindName(), lease.dns_len });
+                    for (lease.dns[0..lease.dns_len]) |ip| s.addDns(ip);
+                    for (core.ipstack.dns.Resolver.public_servers) |e| s.addDns(e.addr[12..16].*);
                     break :blk lease.fd;
                 } else return error.Unsupported,
                 .helper => if (builtin.os.tag.isDarwin()) blk: {
@@ -235,6 +261,7 @@ const Service = struct {
                 } else return error.Unsupported,
             };
             s.tun_fd = fd;
+            s.applyFirewall();
             const t = try tunnel.Tunnel.create(s.gpa, s.io, .{ .mtu = s.args.mtu, .bind = bind, .upstream_dns = dns_servers, .lookup = lookup });
             errdefer t.destroy();
             try t.setConfig(s.built.?.cfg);
@@ -280,7 +307,11 @@ const Service = struct {
         if (s.tun_fd) |fd| {
             // a clean stop lets the traffic go; "suspend" (and a crash,
             // which never gets here) leaves the device holding it
-            if (s.own_device and !s.keep_capture) linux.release(fd);
+            if (s.own_device and !s.keep_capture) {
+                linux.release(fd);
+                s.runTunTool(&.{"open"});
+            }
+            if (builtin.os.tag == .linux and s.own_device) s.owners.deinit();
             _ = c.close(fd);
         }
         s.tun_fd = null;
@@ -296,6 +327,56 @@ const Service = struct {
         s.built = null;
         for (s.server_ips.items) |ip| s.gpa.free(ip);
         s.server_ips.deinit(s.gpa);
+    }
+
+    fn addDns(s: *Service, ip: [4]u8) void {
+        for (s.dns4[0..s.dns4_len]) |have| if (std.mem.eql(u8, &have, &ip)) return;
+        if (s.dns4_len == s.dns4.len) return;
+        s.dns4[s.dns4_len] = ip;
+        s.dns4_len += 1;
+    }
+
+    /// The strict kill switch on Linux: an nftables table that outlives the
+    /// service (nft.zig), set and removed by blackwall-tun.
+    fn applyFirewall(s: *Service) void {
+        if (builtin.os.tag != .linux or !s.own_device) return;
+        if (s.killSwitch() != .strict) return s.runTunTool(&.{"open"});
+        var servers: std.ArrayList(u8) = .empty;
+        defer servers.deinit(s.gpa);
+        for (s.server_ips.items, 0..) |ip, i| {
+            if (i > 0) servers.append(s.gpa, ',') catch return;
+            servers.appendSlice(s.gpa, ip) catch return;
+        }
+        var dns: std.ArrayList(u8) = .empty;
+        defer dns.deinit(s.gpa);
+        for (s.dns4[0..s.dns4_len], 0..) |ip, i| {
+            var b: [16]u8 = undefined;
+            const t = std.fmt.bufPrint(&b, "{s}{d}.{d}.{d}.{d}", .{ if (i > 0) "," else "", ip[0], ip[1], ip[2], ip[3] }) catch return;
+            dns.appendSlice(s.gpa, t) catch return;
+        }
+        var argv_buf: [8][]const u8 = undefined;
+        var argv: std.ArrayList([]const u8) = .initBuffer(&argv_buf);
+        argv.appendSliceAssumeCapacity(&.{ "strict", "--servers", servers.items, "--dns", dns.items });
+        if (s.settings.allow_lan) argv.appendAssumeCapacity("--lan");
+        if (s.settings.ipv6 == .block) argv.appendAssumeCapacity("--ipv6-block");
+        s.runTunTool(argv.items);
+    }
+
+    /// blackwall-tun next to this executable, with `args`.
+    fn runTunTool(s: *Service, args: []const []const u8) void {
+        if (builtin.os.tag != .linux) return;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tool = tunToolPath(&path_buf) orelse return;
+        var argv_buf: [10][]const u8 = undefined;
+        var argv: std.ArrayList([]const u8) = .initBuffer(&argv_buf);
+        argv.appendAssumeCapacity(tool);
+        argv.appendSliceAssumeCapacity(args);
+        var child = std.process.spawn(s.io, .{ .argv = argv.items, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit }) catch |err| {
+            log.err("blackwall-tun {s}: {t}", .{ args[0], err });
+            return;
+        };
+        const term = child.wait(s.io) catch return;
+        if (term != .exited or term.exited != 0) log.err("blackwall-tun {s} failed", .{args[0]}) else log.info("kill switch: {s}", .{args[0]});
     }
 
     /// Why the service could not start, for the window to show.
@@ -432,6 +513,71 @@ fn findApp(ctx: *anyopaque, udp: bool, local: packet.Endpoint, remote: packet.En
     if (!builtin.os.tag.isDarwin()) return null;
     const searcher: *darwin.process.Searcher = @ptrCast(@alignCast(ctx));
     return searcher.find(udp, local.addr, local.port, remote.addr, remote.port, buf);
+}
+
+fn tunToolPath(out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    var self_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = c.readlink("/proc/self/exe", &self_buf, self_buf.len);
+    if (n <= 0) return null;
+    return std.fmt.bufPrint(out, "{s}/blackwall-tun", .{std.fs.path.dirname(self_buf[0..@intCast(n)]) orelse "."}) catch null;
+}
+
+/// The device from blackwall-tun, which holds CAP_NET_ADMIN (tun_main.zig).
+fn tunHelper(gpa: std.mem.Allocator, io: Io, o: linux.Options) !linux.Lease {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const helper = tunToolPath(&path_buf) orelse return error.NeedsAdministrator;
+
+    var pair: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &pair) != 0) return error.SocketFailed;
+    defer _ = c.close(pair[0]);
+    // ours must not leak into the child; the child's end must reach it
+    _ = c.fcntl(pair[0], c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
+    var fd_buf: [12]u8 = undefined;
+    var mtu_buf: [8]u8 = undefined;
+    var argv_buf: [9][]const u8 = undefined;
+    var argv: std.ArrayList([]const u8) = .initBuffer(&argv_buf);
+    argv.appendSliceAssumeCapacity(&.{ helper, "up", "--sock", try std.fmt.bufPrint(&fd_buf, "{d}", .{pair[1]}), "--mtu", try std.fmt.bufPrint(&mtu_buf, "{d}", .{o.mtu}) });
+    if (o.hold) argv.appendAssumeCapacity("--hold");
+    if (o.ipv6) argv.appendAssumeCapacity("--ipv6");
+    var child = std.process.spawn(io, .{ .argv = argv.items, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit }) catch {
+        _ = c.close(pair[1]);
+        return error.NeedsAdministrator;
+    };
+    _ = c.close(pair[1]);
+    defer _ = child.wait(io) catch {};
+
+    if (!core.sys.waitFd(pair[0], false, 15_000)) return error.Timeout;
+    var buf: [1024]u8 = undefined;
+    const got = fdpass.recvFd(pair[0], &buf) catch return error.NeedsAdministrator;
+    errdefer if (got.fd) |f| {
+        _ = c.close(f);
+    };
+    const line = std.mem.trim(u8, buf[0..got.len], " \r\n");
+    const Reply = struct { bind: []const u8 = "", dns: []const []const u8 = &.{}, @"error": []const u8 = "" };
+    const r = std.json.parseFromSlice(Reply, gpa, line, .{ .ignore_unknown_fields = true }) catch return error.BadReply;
+    defer r.deinit();
+    if (r.value.@"error".len > 0) {
+        log.err("blackwall-tun: {s}", .{r.value.@"error"});
+        // the capability is missing (never granted, or the file was replaced)
+        return error.NeedsAdministrator;
+    }
+    var lease: linux.Lease = .{ .fd = got.fd orelse return error.BadReply };
+    const bind = r.value.bind[0..@min(r.value.bind.len, 15)];
+    @memcpy(lease.bind[0..bind.len], bind);
+    for (r.value.dns) |text| {
+        if (lease.dns_len == lease.dns.len) break;
+        const ip = std.Io.net.Ip4Address.parse(text, 0) catch continue;
+        lease.dns[lease.dns_len] = ip.bytes;
+        lease.dns_len += 1;
+    }
+    return lease;
+}
+
+fn findLinuxApp(ctx: *anyopaque, udp: bool, local: packet.Endpoint, remote: packet.Endpoint, buf: []u8) ?[]u8 {
+    if (builtin.os.tag != .linux) return null;
+    const owners: *linux_proc.Searcher = @ptrCast(@alignCast(ctx));
+    return owners.find(udp, local.port, remote.port, buf);
 }
 
 /// IPv4 address of a server name, through the system resolver (used before
@@ -574,5 +720,7 @@ fn usage() error{Usage} {
 test {
     _ = routes;
     _ = linux;
+    _ = linux_proc;
+    _ = @import("nft.zig");
     if (builtin.os.tag.isDarwin()) _ = darwin.process;
 }

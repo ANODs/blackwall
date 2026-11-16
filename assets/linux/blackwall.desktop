@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=BLACKWALL
+Comment=VPN client with a route for every app
+Exec=@BIN@/blackwall
+Icon=@BIN@/blackwall.png
+Categories=Network;Security;
+StartupWMClass=blackwall
+Terminal=false

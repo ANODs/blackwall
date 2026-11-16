@@ -128,6 +128,24 @@ pub fn build(b: *std.Build) void {
         service_step.dependOn(&b.addInstallArtifact(sv, .{}).step);
     }
 
+    // Linux: the small program that holds CAP_NET_ADMIN and hands the TUN
+    // device to the service (src/service/tun_main.zig)
+    const tun_tool: ?*std.Build.Step.Compile = if (os == .linux and !target.result.abi.isAndroid()) b.addExecutable(.{
+        .name = "blackwall-tun",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/service/tun_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = strip,
+            .link_libc = true,
+            .imports = &.{.{ .name = "fdpass", .module = fdpass }},
+        }),
+    }) else null;
+    if (tun_tool) |t| {
+        b.installArtifact(t);
+        service_step.dependOn(&b.addInstallArtifact(t, .{}).step);
+    }
+
     // libproc (macOS): who holds a tunnel, for the conflict handling of the
     // helper and the window (src/helper/darwin/proc.zig)
     const libproc: ?*std.Build.Module = if (os == .macos) b.addTranslateC(.{
@@ -211,7 +229,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "routes", .module = routes } },
     }) })).step);
 
-    package(b, exe, service, helper, sign, update_pubkey.len > 0, lang, version, target.result);
+    package(b, exe, service, helper, tun_tool, sign, update_pubkey.len > 0, lang, version, target.result);
     android(b, optimize, strip, version);
 }
 
@@ -324,6 +342,7 @@ fn package(
     exe: *std.Build.Step.Compile,
     service: ?*std.Build.Step.Compile,
     helper: ?*std.Build.Step.Compile,
+    tun_tool: ?*std.Build.Step.Compile,
     /// the signing tool, and whether this build carries the update key
     sign_tool: *std.Build.Step.Compile,
     updater: bool,
@@ -422,11 +441,20 @@ fn package(
         .linux => if (t.abi.isAndroid()) {
             step.dependOn(&b.addFail("Android is built by `zig build android`").step);
         } else {
+            // the window, the service, blackwall-tun, and what puts them in
+            // the applications menu (assets/linux/install.sh)
+            const files = b.addWriteFiles();
+            _ = files.addCopyFile(exe.getEmittedBin(), exe.out_filename);
+            if (service) |sv| _ = files.addCopyFile(sv.getEmittedBin(), sv.out_filename);
+            if (tun_tool) |tt| _ = files.addCopyFile(tt.getEmittedBin(), tt.out_filename);
+            _ = files.addCopyFile(b.path("assets/linux/install.sh"), "install.sh");
+            _ = files.addCopyFile(b.path("assets/linux/blackwall.desktop"), "blackwall.desktop");
+            _ = files.addCopyFile(b.path("assets/icon/window.png"), "blackwall.png");
             const tar = b.addSystemCommand(&.{ "tar", "-czf" });
             const archive = tar.addOutputFileArg(b.fmt("{s}.tar.gz", .{base}));
             tar.addArg("-C");
-            tar.addDirectoryArg(exe.getEmittedBinDirectory());
-            tar.addArg(exe.out_filename);
+            tar.addDirectoryArg(files.getDirectory());
+            tar.addArgs(&.{ "blackwall", "blackwall-service", "blackwall-tun", "install.sh", "blackwall.desktop", "blackwall.png" });
             step.dependOn(&b.addInstallFileWithDir(archive, .{ .custom = "package" }, b.fmt("{s}.tar.gz", .{base})).step);
         },
         else => step.dependOn(&b.addFail(b.fmt("no package for {s}", .{os_name})).step),

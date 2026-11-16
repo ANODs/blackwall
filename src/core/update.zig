@@ -39,7 +39,8 @@ pub const Config = struct {
 pub const Package = enum {
     /// BLACKWALL.app inside a zip (macOS)
     app_zip,
-    /// the single executable inside a tar.gz (Linux)
+    /// the window inside a tar.gz, with the service and blackwall-tun next
+    /// to it (`companions`; Linux)
     tar_gz,
     /// the executable itself (Windows)
     exe,
@@ -366,6 +367,7 @@ pub const Install = struct {
             dir.rename(names.previous, dir, inst.name, io) catch {};
             return err;
         };
+        if (package == .tar_gz) swapCompanions(dir, io, names.staging);
         dir.deleteTree(io, names.staging) catch {};
     }
 
@@ -409,6 +411,7 @@ pub const Install = struct {
                     dir.rename(names.failed, dir, inst.name, io) catch {};
                     return err;
                 };
+                restoreCompanions(dir, io);
                 try writeMarker(dir, io, &names, .rejected, m.version);
                 // a running Windows executable cannot be deleted; the next start does it
                 dir.deleteTree(io, names.failed) catch {};
@@ -428,6 +431,7 @@ pub const Install = struct {
         var dir = inst.openParent(io) catch return;
         defer dir.close(io);
         dir.deleteTree(io, names.previous) catch |err| std.log.warn("update: old copy not removed: {t}", .{err});
+        dropCompanions(dir, io);
         dir.deleteFile(io, names.marker) catch {};
     }
 
@@ -462,6 +466,69 @@ fn readMarker(dir: Io.Dir, io: Io, name: []const u8, buf: []u8) !?Marker {
     var it = std.mem.tokenizeAny(u8, data, " \r\n");
     const state = std.meta.stringToEnum(MarkerState, it.next() orelse return null) orelse return null;
     return .{ .state = state, .version = it.next() orelse "" };
+}
+
+/// Files that travel with the window in a Linux package. The service is
+/// replaced with the window; blackwall-tun only when it changed, because a
+/// new file loses the network capability granted to the old one.
+const companions = [_][]const u8{ "blackwall-service", "blackwall-tun" };
+const keep_if_same = "blackwall-tun";
+
+fn swapCompanions(dir: Io.Dir, io: Io, staging: []const u8) void {
+    for (companions) |name| {
+        var staged_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        var prev_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const staged = std.fmt.bufPrint(&staged_buf, "{s}/{s}", .{ staging, name }) catch continue;
+        const prev = std.fmt.bufPrint(&prev_buf, "{s}.previous", .{name}) catch continue;
+        dir.access(io, staged, .{}) catch continue;
+        if (std.mem.eql(u8, name, keep_if_same) and sameFile(dir, io, staged, name)) continue;
+        dir.deleteFile(io, prev) catch {};
+        dir.rename(name, dir, prev, io) catch {};
+        dir.rename(staged, dir, name, io) catch |err| {
+            std.log.warn("update: {s} not replaced: {t}", .{ name, err });
+            dir.rename(prev, dir, name, io) catch {};
+        };
+    }
+}
+
+/// The window went back to its old copy: so do the files that came with it.
+fn restoreCompanions(dir: Io.Dir, io: Io) void {
+    for (companions) |name| {
+        var prev_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const prev = std.fmt.bufPrint(&prev_buf, "{s}.previous", .{name}) catch continue;
+        dir.access(io, prev, .{}) catch continue;
+        dir.rename(prev, dir, name, io) catch |err| std.log.warn("update: {s} not restored: {t}", .{ name, err });
+    }
+}
+
+fn dropCompanions(dir: Io.Dir, io: Io) void {
+    for (companions) |name| {
+        var prev_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const prev = std.fmt.bufPrint(&prev_buf, "{s}.previous", .{name}) catch continue;
+        dir.deleteFile(io, prev) catch {};
+    }
+}
+
+fn sameFile(dir: Io.Dir, io: Io, a: []const u8, b: []const u8) bool {
+    var ha: [32]u8 = undefined;
+    var hb: [32]u8 = undefined;
+    if (!hashFile(dir, io, a, &ha) or !hashFile(dir, io, b, &hb)) return false;
+    return std.mem.eql(u8, &ha, &hb);
+}
+
+fn hashFile(dir: Io.Dir, io: Io, path: []const u8, out: *[32]u8) bool {
+    var f = dir.openFile(io, path, .{}) catch return false;
+    defer f.close(io);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    var r = f.reader(io, &.{});
+    while (true) {
+        const n = r.interface.readSliceShort(&buf) catch return false;
+        if (n == 0) break;
+        h.update(buf[0..n]);
+    }
+    h.final(out);
+    return true;
 }
 
 /// Leftovers of an earlier update that finished or was interrupted.

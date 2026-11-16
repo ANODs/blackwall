@@ -20,8 +20,13 @@ const log = std.log.scoped(.link);
 
 /// The service exists for macOS and Linux; Windows keeps the in-window proxy.
 pub const supported = builtin.os.tag == .macos or (builtin.os.tag == .linux and !builtin.abi.isAndroid());
-/// Capturing all traffic needs the root helper, which exists on macOS only.
-pub const tun_supported = builtin.os.tag == .macos;
+/// Capturing all traffic: through the root helper on macOS; on Linux
+/// through blackwall-tun, which holds CAP_NET_ADMIN granted to it once (see
+/// `ensureCapabilities`) and hands the device to the service.
+pub const tun_supported = builtin.os.tag == .macos or (builtin.os.tag == .linux and !builtin.abi.isAndroid());
+/// Holding traffic from boot until the service is up is the helper's job.
+pub const hold_supported = builtin.os.tag == .macos;
+const on_linux = builtin.os.tag == .linux and !builtin.abi.isAndroid();
 
 /// A process id where processes are numbers (Windows never starts the service).
 const Pid = if (supported) c.pid_t else i32;
@@ -197,7 +202,7 @@ pub const Link = struct {
                 .restart => |o| restart: {
                     // never leave the traffic captured with nothing behind it
                     // while waiting for a password nobody may be there to type
-                    if (l.running and o.tun and !o.interactive and l.helperState() != .current) {
+                    if (l.running and o.tun and !o.interactive and !l.privileged()) {
                         l.sink(.kept);
                         break :restart;
                     }
@@ -205,7 +210,7 @@ pub const Link = struct {
                     l.start(o);
                 },
                 .stop => l.stop("stop", true),
-                .hold => |on| if (tun_supported) {
+                .hold => |on| if (hold_supported) {
                     var buf: [64]u8 = undefined;
                     const line = std.fmt.bufPrint(&buf, "{{\"cmd\":\"hold\",\"hold\":{}}}\n", .{on}) catch unreachable;
                     if (ipc.request(l.gpa, l.io, helper.socket_path, line, 3000)) |answer| l.gpa.free(answer) else |_| {}
@@ -234,10 +239,12 @@ pub const Link = struct {
             l.sink(.{ .status = st });
             return;
         }
-        if (tun_supported) if (l.helperReply()) |r| {
+        if (hold_supported) if (l.helperReply()) |r| {
             defer r.deinit();
             if (r.value.ok and r.value.up) return l.sink(.orphaned);
         };
+        // the device a service that is gone left behind keeps holding traffic
+        if (on_linux and linuxDevice()) return l.sink(.orphaned);
         l.sink(.idle);
     }
 
@@ -263,7 +270,7 @@ pub const Link = struct {
             l.sink(.{ .up = .{ .tun = l.tun, .socks_port = l.socks, .adopted = true, .stale = false } });
             return;
         }
-        if (o.tun) l.ensureHelper(o.interactive) catch |err| {
+        if (o.tun) (if (on_linux) l.ensureCapabilities(o.interactive) else l.ensureHelper(o.interactive)) catch |err| {
             log.err("helper: {t}", .{err});
             const why: Failure = switch (err) {
                 error.Refused, error.NeedsAdministrator => .need_admin,
@@ -309,9 +316,10 @@ pub const Link = struct {
         }
         l.running = false;
         // a service that died or was killed could not release the capture
-        if (tun_supported and std.mem.eql(u8, cmd, "stop")) {
+        if (hold_supported and std.mem.eql(u8, cmd, "stop")) {
             if (ipc.call(l.gpa, l.io, helper.socket_path, "down", 5000)) |line| l.gpa.free(line) else |_| {}
         }
+        if (on_linux and std.mem.eql(u8, cmd, "stop") and linuxDevice()) l.releaseDevice();
         if (report) l.sink(.{ .down = .{ .why = .stopped } });
     }
 
@@ -376,7 +384,7 @@ pub const Link = struct {
         var argv_buf: [10][]const u8 = undefined;
         var argv: std.ArrayList([]const u8) = .initBuffer(&argv_buf);
         argv.appendSliceAssumeCapacity(&.{ exe, "--config", l.config_dir });
-        if (o.tun) argv.appendSliceAssumeCapacity(&.{ "--tun", "helper" });
+        if (o.tun) argv.appendSliceAssumeCapacity(&.{ "--tun", if (on_linux) "auto" else "helper" });
         if (o.socks != 0) argv.appendSliceAssumeCapacity(&.{ "--socks", try std.fmt.bufPrint(&socks_buf, "{d}", .{o.socks}) });
         if (o.mtu != 0) argv.appendSliceAssumeCapacity(&.{ "--mtu", try std.fmt.bufPrint(&mtu_buf, "{d}", .{o.mtu}) });
 
@@ -433,9 +441,65 @@ pub const Link = struct {
         const name_end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
         const name = text[0..name_end];
         if (std.mem.eql(u8, name, "Conflict")) return .{ .why = .conflict, .detail = .of(std.mem.trim(u8, text[name_end..], " ")) };
-        if (std.mem.eql(u8, name, "HelperMissing")) return .{ .why = .need_admin };
+        if (std.mem.eql(u8, name, "HelperMissing") or std.mem.eql(u8, name, "NeedsAdministrator")) return .{ .why = .need_admin };
         if (name.len == 0) return .{ .why = default };
         return .{ .why = .failed, .detail = .of(name) };
+    }
+
+    /// Whether TUN mode can start without asking anyone.
+    fn privileged(l: *Link) bool {
+        if (on_linux) return l.capable();
+        return l.helperState() == .current;
+    }
+
+    // ------------------------------------------------------------ capabilities (Linux)
+
+    /// The device is set up by blackwall-tun, which needs CAP_NET_ADMIN. It
+    /// is granted to that file once, through polkit's password dialog. The
+    /// service runs without it, so updating the service asks for nothing;
+    /// only a changed blackwall-tun (the updater keeps an unchanged one)
+    /// asks again at the next Connect.
+    fn ensureCapabilities(l: *Link, interactive: bool) !void {
+        if (!on_linux) return error.Unsupported;
+        if (l.capable()) return;
+        if (!interactive) return error.NeedsAdministrator;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tun = try std.fmt.bufPrint(&path_buf, "{s}/blackwall-tun", .{l.bin_dir});
+        const pkexec = firstExisting(l.io, &.{ "/usr/bin/pkexec", "/bin/pkexec" }) orelse return error.NeedsAdministrator;
+        const setcap = firstExisting(l.io, &.{ "/usr/sbin/setcap", "/sbin/setcap", "/usr/bin/setcap" }) orelse return error.SetcapMissing;
+        var child = try std.process.spawn(l.io, .{
+            .argv = &.{ pkexec, setcap, "cap_net_admin+ep", tun },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        const term = try child.wait(l.io);
+        if (!l.capable()) {
+            // 126: the dialog was dismissed, 127: not authorized
+            return switch (term) {
+                .exited => |code| if (code == 126 or code == 127) error.Refused else error.NeedsAdministrator,
+                else => error.NeedsAdministrator,
+            };
+        }
+    }
+
+    /// blackwall-tun carries its file capability.
+    fn capable(l: *Link) bool {
+        if (!on_linux) return false;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const p = std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], "{s}/blackwall-tun", .{l.bin_dir}) catch return false;
+        path_buf[p.len] = 0;
+        var value: [64]u8 = undefined;
+        return getxattr(path_buf[0..p.len :0], "security.capability", &value, value.len) > 0;
+    }
+
+    /// Lets go of the device and the strict kill switch that a service
+    /// which is gone left holding the traffic.
+    fn releaseDevice(l: *Link) void {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tool = std.fmt.bufPrint(&path_buf, "{s}/blackwall-tun", .{l.bin_dir}) catch return;
+        var child = std.process.spawn(l.io, .{ .argv = &.{ tool, "release" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
+        _ = child.wait(l.io) catch {};
     }
 
     // ------------------------------------------------------------ helper (macOS)
@@ -542,6 +606,26 @@ pub const Link = struct {
         if (term != .exited or term.exited != 0) return error.Refused;
     }
 };
+
+extern "c" fn getxattr(path: [*:0]const u8, name: [*:0]const u8, value: [*]u8, size: usize) isize;
+
+/// Whether the service's device exists (Linux): it outlives a service that
+/// was killed, so that the traffic stays held.
+fn linuxDevice() bool {
+    if (!on_linux) return false;
+    const fd = c.open("/sys/class/net/blackwall0", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    if (fd < 0) return false;
+    _ = c.close(fd);
+    return true;
+}
+
+fn firstExisting(io: Io, paths: []const []const u8) ?[]const u8 {
+    for (paths) |p| {
+        std.Io.Dir.cwd().access(io, p, .{}) catch continue;
+        return p;
+    }
+    return null;
+}
 
 /// AppleScript that runs `<helper> install --uid <uid>` as root after the
 /// system's administrator prompt. The path is quoted for the shell by

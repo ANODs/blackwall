@@ -94,19 +94,22 @@ release is a single file of 4 to 11 MB.
 
 | | macOS (Apple Silicon) | Android 10+ | Linux (x64) | Windows (x64) |
 |---|---|---|---|---|
-| Capture all traffic (TUN) | Yes | Yes | Service only (`--tun auto`) | Not yet |
-| Routes per application | Yes | Yes | Not yet | Not yet |
+| Capture all traffic (TUN) | Yes | Yes | Yes | Not yet |
+| Routes per application | Yes | Yes | Yes | Not yet |
 | Local SOCKS5 proxy (`127.0.0.1:1080`) | Yes | No | Yes | Yes |
-| Protection after Disconnect | Yes | Yes | No | No |
-| Kill switch, on from boot | Yes | Android's own "Always-on VPN" | Service only | No |
+| Protection after Disconnect | Yes | Yes | Yes | No |
+| Kill switch | Yes (pf) | Android's own "Always-on VPN" | Yes (nftables) | No |
+| Traffic held from boot | Yes | Android's own "Always-on VPN" | No | No |
 | Menu bar / tray / notification | Yes | Yes | Built, untested | Built, untested |
 | Automatic updates | Yes | No | Yes | Yes |
 
 macOS is the platform used and tested every day. The Android app has been through an
 emulator (Android 16, arm64) from first start to a reboot with "Block connections without
-VPN" on, and not through daily use on a phone yet. The Windows and Linux builds pass the
-automatic tests on their own systems in CI; the Linux service's own tunnel is tested in a
-virtual machine.
+VPN" on, and not through daily use on a phone yet. On Linux the capture, the routes per
+application, the protection after Disconnect and the strict kill switch pass an end-to-end
+test in a virtual machine (Alpine, kernel 6.18); the window and the tray have not been
+through a real desktop yet. Linux needs kernel 5.7 or newer. The Windows build passes the
+automatic tests in CI and has not been through real use.
 
 ## Protocols and transports
 
@@ -142,6 +145,10 @@ The builds are not signed by Apple or Microsoft yet:
 - **macOS**: right-click the app, choose Open. The first connection in TUN mode asks for
   the administrator password once, to install the network helper.
 - **Windows**: SmartScreen, More info, Run anyway.
+- **Linux**: unpack the archive and run `./install.sh`, which puts BLACKWALL into the
+  applications menu for your user (no root). The first Connect in TUN mode asks for your
+  password once, through the system's dialog, to give `blackwall-tun` its network
+  permission.
 - **Android**: open the APK and allow the installation from that source. The first
   connection asks once whether the app may be a VPN.
 
@@ -235,9 +242,14 @@ A few details worth knowing:
 
 ## Security model
 
-- **Least privilege.** Only the helper runs as root, and it runs no shell and no command
-  the caller chooses. Every value it receives is validated before it reaches an `ioctl`,
-  a route message or a command line. It serves one user: the one who installed it.
+- **Least privilege.** On macOS only the helper runs as root, and it runs no shell and no
+  command the caller chooses. Every value it receives is validated before it reaches an
+  `ioctl`, a route message or a command line. It serves one user: the one who installed
+  it. On Linux nothing runs as root: `blackwall-tun` holds one capability,
+  `CAP_NET_ADMIN`, granted to that file once through polkit. It creates the device, its
+  routes and the kill switch's nftables table, hands the device to the service and exits.
+  The service and the window run as you, with no capability, so updating them asks for
+  nothing; the updater replaces `blackwall-tun` only when it changed.
 - **Stopping another VPN** is done only for a process whose identity (pid, start time,
   executable) was re-checked at the moment of stopping, and never for a system process.
 - **Updates are signed.** The updater installs a file only when its Ed25519 signature
@@ -346,8 +358,12 @@ docs/                      updates, Android, release notes
 
 ## Known limitations
 
-- Capturing all traffic and per-application routes work on macOS and Android; on Linux
-  the service captures everything, without routes per application and without the window.
+- Windows has the local proxy only: no capture, no routes per application.
+- Linux: a connection is matched to its application only for your own processes (another
+  user's daemons follow the default route); programs in Flatpak or Snap, and those
+  started through a wrapper script, appear under their real executable once they have had
+  traffic. The kill switch covers this machine's own traffic, not that of containers or
+  virtual machines it forwards.
 - Android: no automatic updates, no pinned server per application in the interface yet,
   and with "Block connections without VPN" on, Android itself cuts off the applications
   set to Direct.
@@ -362,7 +378,7 @@ docs/                      updates, Android, release notes
 
 ## Roadmap
 
-- Capture and per-application routes on Windows and Linux.
+- Capture and per-application routes on Windows.
 - Hysteria2, TUIC and WireGuard.
 - UDP over the remaining protocols.
 - A local DPI bypass route.
