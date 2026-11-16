@@ -69,6 +69,10 @@ Files per release `v<version>-<lang>`:
 | Windows x86_64 | `BLACKWALL-<version>-<lang>-windows-x86_64.exe` | `….exe.sig` |
 | Linux x86_64 | `BLACKWALL-<version>-<lang>-linux-x86_64.tar.gz` | `….tar.gz.sig` |
 
+Android installs from Google Play are updated by Play: the same release workflow uploads
+the App Bundle there (docs/android.md, Google Play). The APK from the releases has no
+updater.
+
 Signing by hand (for example to re-sign a release):
 
 ```sh
