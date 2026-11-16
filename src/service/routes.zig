@@ -58,6 +58,11 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
         if (app.route == .default) continue;
         try rules.append(a, .{ .app = try a.dupe(u8, app.id), .choice = choiceOf(app.route, ids.items, has_main) });
     }
+    var domains: std.ArrayList(tunnel.DomainRule) = .empty;
+    for (state.domains.items) |d| {
+        if (d.route == .default) continue;
+        try domains.append(a, .{ .suffix = try a.dupe(u8, d.name), .choice = choiceOf(d.route, ids.items, has_main) });
+    }
     const default: tunnel.Choice = if (standby)
         // only the applications with a rule are held back
         .direct
@@ -65,7 +70,7 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
         .default => if (has_main) .main else .block,
         else => |r| choiceOf(r, ids.items, has_main),
     };
-    var cfg: tunnel.Config = .{ .default = default, .rules = rules.items, .outbounds = obs.items, .main = main.items };
+    var cfg: tunnel.Config = .{ .default = default, .rules = rules.items, .domains = domains.items, .outbounds = obs.items, .main = main.items };
     // in standby everything without a rule goes direct, so a flow that
     // cannot be attributed might be one of the held applications': refuse it
     if (standby) cfg.unknown = .block;
@@ -84,6 +89,10 @@ pub fn uses(cfg: tunnel.Config, i: u16) bool {
     for (cfg.rules) |r| {
         if (r.choice == .outbound and r.choice.outbound == i) return true;
         main = main or r.choice == .main;
+    }
+    for (cfg.domains) |d| {
+        if (d.choice == .outbound and d.choice.outbound == i) return true;
+        main = main or d.choice == .main;
     }
     return main and std.mem.indexOfScalar(u16, cfg.main, i) != null;
 }
@@ -207,6 +216,9 @@ test "routes: in standby the applications with a rule are held, the rest goes di
     (try s.addApp("/Applications/Pinned.app", "Pinned", "")).route = .{ .server = s.servers.items[0].id };
     (try s.addApp("/Applications/Steam.app", "Steam", "")).route = .direct;
     (try s.addApp("/Applications/Off.app", "Off", "")).route = .block;
+    (try s.addDomain("vpn-only.example")).route = .auto;
+    (try s.addDomain("local.example")).route = .direct;
+    _ = try s.addDomain("unset.example");
     s.settings.default_route = .auto;
     s.settings.standby = true;
     var b = try build(gpa, &s);
@@ -219,4 +231,8 @@ test "routes: in standby the applications with a rule are held, the rest goes di
     try std.testing.expectEqual(tunnel.Choice.block, b.cfg.rules[1].choice);
     try std.testing.expectEqual(tunnel.Choice.direct, b.cfg.rules[2].choice);
     try std.testing.expectEqual(tunnel.Choice.block, b.cfg.rules[3].choice);
+    // sites held to the VPN are held too; a site without a route is no rule
+    try std.testing.expectEqual(2, b.cfg.domains.len);
+    try std.testing.expectEqual(tunnel.Choice.block, b.cfg.domains[0].choice);
+    try std.testing.expectEqual(tunnel.Choice.direct, b.cfg.domains[1].choice);
 }

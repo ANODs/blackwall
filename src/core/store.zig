@@ -35,6 +35,11 @@ const RuleDto = struct {
     route: model.Route,
 };
 
+const DomainDto = struct {
+    name: []const u8,
+    route: model.Route,
+};
+
 const File = struct {
     version: u32 = version,
     next_id: u32 = 1,
@@ -42,6 +47,7 @@ const File = struct {
     subs: []const SubDto = &.{},
     servers: []const ServerDto = &.{},
     rules: []const RuleDto = &.{},
+    domains: []const DomainDto = &.{},
 };
 
 pub fn serialize(gpa: std.mem.Allocator, s: *const model.State) ![]u8 {
@@ -52,7 +58,9 @@ pub fn serialize(gpa: std.mem.Allocator, s: *const model.State) ![]u8 {
     var subs: std.ArrayList(SubDto) = .empty;
     var servers: std.ArrayList(ServerDto) = .empty;
     var rules: std.ArrayList(RuleDto) = .empty;
+    var domains: std.ArrayList(DomainDto) = .empty;
     if (!s.demo) {
+        for (s.domains.items) |d| try domains.append(a, .{ .name = d.name, .route = d.route });
         for (s.subs.items) |sub| try subs.append(a, .{ .id = sub.id, .name = sub.name, .url = sub.url, .updated_unix = sub.updated_unix });
         for (s.servers.items) |*sv| try servers.append(a, .{
             .id = sv.id,
@@ -85,6 +93,7 @@ pub fn serialize(gpa: std.mem.Allocator, s: *const model.State) ![]u8 {
         .subs = subs.items,
         .servers = servers.items,
         .rules = rules.items,
+        .domains = domains.items,
     };
     return std.json.Stringify.valueAlloc(gpa, file, .{ .whitespace = .indent_2 });
 }
@@ -125,6 +134,10 @@ pub fn deserialize(gpa: std.mem.Allocator, s: *model.State, bytes: []const u8) !
     for (f.rules) |d| {
         const app = try s.addApp(d.app_id, d.name, d.path);
         app.route = d.route;
+    }
+    for (f.domains) |d| {
+        const dom = s.addDomain(d.name) catch continue;
+        dom.route = d.route;
     }
 }
 
@@ -168,6 +181,8 @@ test "round trip keeps rules, pinned server and settings" {
     (try a.addApp("org.telegram.desktop", "Telegram", "/Applications/Telegram.app")).route = .{ .server = sv_id };
     (try a.addApp("com.example.game", "Game", "")).route = .direct;
     _ = try a.addApp("com.example.norule", "No rule", "");
+    (try a.addDomain("youtube.com")).route = .direct;
+    (try a.addDomain("work.example")).route = .{ .server = sv_id };
 
     const bytes = try serialize(gpa, &a);
     defer gpa.free(bytes);
@@ -182,6 +197,9 @@ test "round trip keeps rules, pinned server and settings" {
     try std.testing.expectEqualStrings("NL", &b.servers.items[0].country);
     try std.testing.expectEqual(2, b.apps.items.len);
     try std.testing.expect(b.appById("org.telegram.desktop").?.route.eql(.{ .server = sv_id }));
+    try std.testing.expectEqual(2, b.domains.items.len);
+    try std.testing.expect(b.domainByName("youtube.com").?.route == .direct);
+    try std.testing.expect(b.domainByName("work.example").?.route.eql(.{ .server = sv_id }));
     try std.testing.expect(b.newId() > sv_id);
 }
 

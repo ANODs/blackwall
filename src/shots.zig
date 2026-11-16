@@ -13,12 +13,14 @@ var step: usize = 0;
 var picture: ?dvui.Picture = null;
 
 const settle = 10;
-const Action = enum { none, off, click_route, open_add, add_keys };
+const Action = enum { none, off, click_route, rules, add_site, open_add, add_keys };
 const plan = [_]struct { app.Screen, Action, []const u8 }{
     .{ .connect, .off, "1-connect-off" },
     .{ .connect, .none, "2-connect-on" },
     .{ .apps, .none, "3-apps" },
     .{ .apps, .click_route, "4-apps-route-menu" },
+    .{ .apps, .rules, "4b-apps-rules" },
+    .{ .apps, .add_site, "4c-apps-add-site" },
     .{ .servers, .none, "5-servers" },
     .{ .stats, .none, "6-stats" },
     .{ .settings, .none, "7-settings" },
@@ -58,7 +60,13 @@ pub fn before() bool {
             app.engine.status = .connected;
             app.engine.session_secs = 764;
         },
-        .open_add => servers.show_add = true,
+        .rules => @import("ui/screens/apps.zig").filter = 2,
+        .add_site => @import("ui/screens/apps.zig").adding = true,
+        .open_add => {
+            @import("ui/screens/apps.zig").filter = 0;
+            @import("ui/screens/apps.zig").adding = false;
+            servers.show_add = true;
+        },
         .add_keys => {
             servers.show_add = false;
             app.addFromText(sample_keys) catch |err| std.log.err("add keys: {t}", .{err});
@@ -72,7 +80,7 @@ pub fn before() bool {
             if (phase == 4) _ = app.win.addEventMouseButton(.left, .press) catch {};
             if (phase == 5) _ = app.win.addEventMouseButton(.left, .release) catch {};
         }
-    } else if (phase == 0) {
+    } else if (phase == 0 and p[1] != .add_site) {
         _ = app.win.addEventMouseMotion(.{ .pt = .{ .x = 2, .y = 2 } }) catch {};
         _ = app.win.addEventKey(.{ .code = .escape, .action = .down, .mod = .none }) catch {};
     }

@@ -54,6 +54,7 @@ pub const Strings = struct {
 
     // servers
     add_subscription: []const u8,
+    add_site: []const u8,
     refresh: []const u8,
     remove: []const u8,
     fastest: []const u8,
@@ -192,6 +193,7 @@ const en: Strings = .{
     .search = "Search",
 
     .add_subscription = "Add subscription",
+    .add_site = "Add a site",
     .refresh = "Refresh",
     .remove = "Remove",
     .fastest = "Fastest",
@@ -321,6 +323,7 @@ const ru: Strings = .{
     .search = "Поиск",
 
     .add_subscription = "Добавить подписку",
+    .add_site = "Добавить сайт",
     .refresh = "Обновить",
     .remove = "Удалить",
     .fastest = "Самый быстрый",
@@ -450,6 +453,7 @@ const zh: Strings = .{
     .search = "搜索",
 
     .add_subscription = "添加订阅",
+    .add_site = "添加网站",
     .refresh = "刷新",
     .remove = "删除",
     .fastest = "最快",

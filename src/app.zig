@@ -1121,6 +1121,25 @@ pub fn setRoute(app: *model.App, route: model.Route) void {
     if (!service_on and !want_on and engine.status == .disconnected) startGuard();
 }
 
+pub fn setDomainRoute(d: *model.Domain, route: model.Route) void {
+    d.route = route;
+    if (state.demo) return;
+    markDirty();
+    if (!service_on and !want_on and engine.status == .disconnected) startGuard();
+}
+
+/// A site rule from what the user typed; false when it is not a host name.
+pub fn addDomain(text: []const u8) bool {
+    _ = state.addDomain(text) catch return false;
+    if (!state.demo) markDirty();
+    return true;
+}
+
+pub fn removeDomain(index: usize) void {
+    state.removeDomain(index);
+    if (!state.demo) markDirty();
+}
+
 /// With the VPN off, hold the applications that may only use the VPN.
 fn startGuard() void {
     if (!canGuard()) {

@@ -86,6 +86,36 @@ pub const Route = union(enum) {
     }
 };
 
+/// A site and everything under it ("example.com" covers "www.example.com"),
+/// with a route. It applies to the applications without a rule of their own.
+pub const Domain = struct {
+    /// lower case, no leading "*." or dots
+    name: []const u8,
+    route: Route = .default,
+};
+
+/// The form a domain rule keeps: lower case, without "*.", surrounding dots,
+/// a scheme or a path. Null when it is not a host name.
+pub fn normalizeDomain(text: []const u8, out: []u8) ?[]const u8 {
+    var t = std.mem.trim(u8, text, " \t\r\n");
+    if (std.mem.indexOf(u8, t, "://")) |i| t = t[i + 3 ..];
+    if (std.mem.indexOfAny(u8, t, "/?#")) |i| t = t[0..i];
+    if (std.mem.lastIndexOfScalar(u8, t, ':')) |i| {
+        // a port after a name (not an IPv6 address)
+        if (std.mem.indexOfScalar(u8, t[0..i], ':') == null) t = t[0..i];
+    }
+    if (std.mem.startsWith(u8, t, "*.")) t = t[2..];
+    t = std.mem.trim(u8, t, ".");
+    if (t.len == 0 or t.len > out.len or t.len > 253) return null;
+    for (t, 0..) |ch, i| {
+        const c = std.ascii.toLower(ch);
+        if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_')) return null;
+        out[i] = c;
+    }
+    if (std.mem.indexOf(u8, out[0..t.len], "..") != null) return null;
+    return out[0..t.len];
+}
+
 pub const App = struct {
     /// Stable identity: bundle id / package name / executable path.
     id: []const u8,
@@ -142,6 +172,8 @@ pub const State = struct {
     servers: std.ArrayList(Server) = .empty,
     subs: std.ArrayList(Subscription) = .empty,
     apps: std.ArrayList(App) = .empty,
+    /// rules by site, in the order they were added
+    domains: std.ArrayList(Domain) = .empty,
     settings: Settings = .{},
     next_id: u32 = 1,
     /// true while the bundled sample data is shown (no real subscription yet)
@@ -161,6 +193,28 @@ pub const State = struct {
         s.subs.deinit(s.gpa);
         for (s.apps.items) |a| s.freeApp(a);
         s.apps.deinit(s.gpa);
+        for (s.domains.items) |d| s.gpa.free(d.name);
+        s.domains.deinit(s.gpa);
+    }
+
+    /// The rule for `text` (normalized), made when there is none yet.
+    pub fn addDomain(s: *State, text: []const u8) !*Domain {
+        var buf: [253]u8 = undefined;
+        const name = normalizeDomain(text, &buf) orelse return error.BadDomain;
+        if (s.domainByName(name)) |d| return d;
+        try s.domains.append(s.gpa, .{ .name = try s.gpa.dupe(u8, name) });
+        return &s.domains.items[s.domains.items.len - 1];
+    }
+
+    pub fn domainByName(s: *State, name: []const u8) ?*Domain {
+        for (s.domains.items) |*d| if (std.mem.eql(u8, d.name, name)) return d;
+        return null;
+    }
+
+    pub fn removeDomain(s: *State, index: usize) void {
+        if (index >= s.domains.items.len) return;
+        s.gpa.free(s.domains.items[index].name);
+        _ = s.domains.orderedRemove(index);
     }
 
     fn freeServer(s: *State, sv: Server) void {
@@ -221,8 +275,14 @@ pub const State = struct {
 
     /// Whether any application has a rule that must hold while the VPN is
     /// off: through the VPN only, or no network at all.
+    /// Some application or site may only use the VPN (or nothing): it is
+    /// held while the VPN is off.
     pub fn hasProtectedApps(s: *const State) bool {
         for (s.apps.items) |a| switch (a.route) {
+            .auto, .server, .block => return true,
+            .default, .direct, .dpi => {},
+        };
+        for (s.domains.items) |d| switch (d.route) {
             .auto, .server, .block => return true,
             .default, .direct, .dpi => {},
         };
@@ -320,6 +380,7 @@ pub const State = struct {
         if (s.settings.selected_server == server_id) return true;
         for (s.servers.items) |sv| if (sv.id == server_id and sv.favorite) return true;
         for (s.apps.items) |a| if (a.route == .server and a.route.server == server_id) return true;
+        for (s.domains.items) |d| if (d.route == .server and d.route.server == server_id) return true;
         return false;
     }
 
@@ -331,6 +392,9 @@ pub const State = struct {
                 if (s.settings.selected_server == sv.id) s.settings.selected_server = null;
                 for (s.apps.items) |*a| {
                     if (a.route == .server and a.route.server == sv.id) a.route = .default;
+                }
+                for (s.domains.items) |*d| {
+                    if (d.route == .server and d.route.server == sv.id) d.route = .default;
                 }
                 s.freeServer(sv);
                 _ = s.servers.orderedRemove(i);
@@ -402,4 +466,22 @@ test "applySubscription keeps ids and pinned servers" {
         .{ .name = "NL-1", .host = "a.example", .port = 443, .protocol = .vless },
     });
     try std.testing.expectEqual(1, s.servers.items.len);
+}
+
+test "domain rules keep the bare host name" {
+    var buf: [253]u8 = undefined;
+    try std.testing.expectEqualStrings("example.com", normalizeDomain("  *.Example.COM. ", &buf).?);
+    try std.testing.expectEqualStrings("youtube.com", normalizeDomain("https://www.youtube.com/watch?v=1", &buf).?[4..]);
+    try std.testing.expectEqualStrings("api.example.org", normalizeDomain("api.example.org:8443", &buf).?);
+    try std.testing.expect(normalizeDomain("", &buf) == null);
+    try std.testing.expect(normalizeDomain("bad name.com", &buf) == null);
+    try std.testing.expect(normalizeDomain("a..b", &buf) == null);
+    var s: State = .init(std.testing.allocator);
+    defer s.deinit();
+    const d = try s.addDomain("YouTube.com");
+    d.route = .direct;
+    try std.testing.expectEqual(d, try s.addDomain("*.youtube.com"));
+    try std.testing.expectEqual(1, s.domains.items.len);
+    s.removeDomain(0);
+    try std.testing.expectEqual(0, s.domains.items.len);
 }

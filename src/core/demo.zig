@@ -46,6 +46,13 @@ pub fn load(s: *model.State, sub_name: []const u8) !void {
         .{ "Music", .direct },
         .{ "Mail", .auto },
     };
+    // and a few sites, as one would set them
+    const sites = [_]struct { []const u8, model.Route }{
+        .{ "youtube.com", .{ .server = ids[0] } },
+        .{ "gosuslugi.ru", .direct },
+        .{ "ads.example.com", .block },
+    };
+    for (sites) |site| (s.addDomain(site[0]) catch continue).route = site[1];
     var online: usize = 0;
     for (s.apps.items) |*a| {
         for (rules) |r| {

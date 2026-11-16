@@ -44,9 +44,18 @@ pub const Rule = struct {
     choice: Choice,
 };
 
+/// A site and everything under it, for the applications without a rule
+/// of their own.
+pub const DomainRule = struct {
+    /// lower case, no leading dot: "example.com" covers "a.example.com"
+    suffix: []const u8,
+    choice: Choice,
+};
+
 pub const Config = struct {
     default: Choice = .direct,
     rules: []const Rule = &.{},
+    domains: []const DomainRule = &.{},
     outbounds: []const proxy.Outbound = &.{},
     /// Flows whose owner could not be identified; null: as `default`. Set
     /// where `default` is direct but some applications must never be.
@@ -93,6 +102,8 @@ pub const Tunnel = struct {
     cfg_mutex: Io.Mutex = .init,
     cfg_arena: std.heap.ArenaAllocator,
     cfg: Config = .{},
+    /// `cfg.domains` by suffix, in `cfg_arena`
+    domain_map: std.StringHashMapUnmanaged(Choice) = .empty,
 
     apps_mutex: Io.Mutex = .init,
     apps: std.StringHashMapUnmanaged(*AppStats) = .empty,
@@ -176,6 +187,8 @@ pub const Tunnel = struct {
         var arena: std.heap.ArenaAllocator = .init(t.gpa);
         errdefer arena.deinit();
         const copy = try deepCopy(arena.allocator(), cfg);
+        var map: std.StringHashMapUnmanaged(Choice) = .empty;
+        for (copy.domains) |d| try map.put(arena.allocator(), d.suffix, d.choice);
         var members: [failover.max_members]proxy.Outbound = undefined;
         var n: usize = 0;
         for (copy.main) |i| {
@@ -190,6 +203,7 @@ pub const Tunnel = struct {
         t.cfg_arena.deinit();
         t.cfg_arena = arena;
         t.cfg = copy;
+        t.domain_map = map;
     }
 
     /// Index into the configuration's `main` list of the server in use.
@@ -240,7 +254,13 @@ pub const Tunnel = struct {
         for (cfg.outbounds, obs) |src, *dst| dst.* = try src.dupe(a);
         const ex = try a.alloc([]const u8, cfg.dns_exclusions.len);
         for (cfg.dns_exclusions, ex) |src, *dst| dst.* = try a.dupe(u8, src);
-        return .{ .default = cfg.default, .unknown = cfg.unknown, .rules = rules, .outbounds = obs, .main = try a.dupe(u16, cfg.main), .dns_exclusions = ex, .drop_quic = cfg.drop_quic };
+        const doms = try a.alloc(DomainRule, cfg.domains.len);
+        for (cfg.domains, doms) |src, *dst| {
+            const suffix = try a.dupe(u8, src.suffix);
+            for (suffix) |*ch| ch.* = std.ascii.toLower(ch.*);
+            dst.* = .{ .suffix = suffix, .choice = src.choice };
+        }
+        return .{ .default = cfg.default, .unknown = cfg.unknown, .rules = rules, .domains = doms, .outbounds = obs, .main = try a.dupe(u16, cfg.main), .dns_exclusions = ex, .drop_quic = cfg.drop_quic };
     }
 
     const Decision = struct {
@@ -256,11 +276,15 @@ pub const Tunnel = struct {
 
     /// Where the traffic of `app` goes, as a snapshot safe to keep. `app`
     /// is the flow's identity chain (see `AppLookup`): its own rule wins,
-    /// then the rule of the nearest application that started it.
-    fn decide(t: *Tunnel, app: ?[]const u8) Decision {
+    /// then the rule of the nearest application that started it, then the
+    /// rule of the site `name` (the destination's name, when known). A site
+    /// never takes an application with a rule elsewhere: one held to the
+    /// VPN stays there whatever it connects to.
+    fn decide(t: *Tunnel, app: ?[]const u8, name: ?[]const u8) Decision {
         t.cfg_mutex.lockUncancelable(t.io);
         defer t.cfg_mutex.unlock(t.io);
         var choice = if (app == null) t.cfg.unknown orelse t.cfg.default else t.cfg.default;
+        var ruled = false;
         if (app) |chain| {
             var ids = std.mem.splitScalar(u8, chain, 0);
             found: while (ids.next()) |id| {
@@ -268,17 +292,38 @@ pub const Tunnel = struct {
                 for (t.cfg.rules) |r| {
                     if (std.mem.eql(u8, r.app, id)) {
                         choice = r.choice;
+                        ruled = true;
                         break :found;
                     }
                 }
             }
         }
+        // a flow of unknown origin where those are held back (standby) may
+        // be a held application's: a site may only block it further
+        const held_unknown = app == null and t.cfg.unknown != null;
+        if (!ruled) if (name) |n| if (t.domainChoice(n)) |site| {
+            if (!held_unknown or site == .block) choice = site;
+        };
         return switch (choice) {
             .direct => .{ .snap = .of(.direct) },
             .block => .{ .snap = .of(.block) },
             .outbound => |i| .{ .snap = if (i < t.cfg.outbounds.len) .of(t.cfg.outbounds[i]) else .of(.block) },
             .main => if (t.group.current()) |s| .{ .snap = s, .main = true } else .{ .snap = .of(.block) },
         };
+    }
+
+    /// The rule of `name` or of the nearest site above it. The caller
+    /// holds `cfg_mutex`.
+    fn domainChoice(t: *Tunnel, name: []const u8) ?Choice {
+        if (t.domain_map.count() == 0 or name.len == 0 or name.len > 253) return null;
+        var buf: [253]u8 = undefined;
+        const lower = std.ascii.lowerString(&buf, std.mem.trimEnd(u8, name, "."));
+        var rest: []const u8 = lower;
+        while (true) {
+            if (t.domain_map.get(rest)) |site| return site;
+            const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+            rest = rest[dot + 1 ..];
+        }
     }
 
     fn appStats(t: *Tunnel, app: []const u8) ?*AppStats {
@@ -337,15 +382,16 @@ pub const Tunnel = struct {
         const remote = conn.remote();
         var name_buf: [255]u8 = undefined;
         var target: proxy.Target = undefined;
+        var name: ?[]const u8 = null;
         if (dns.isFake(&remote.addr)) {
             // a fake address from before a restart: make the app resolve again
-            const name = t.fake.lookup(&remote.addr, &name_buf) orelse return conn.reject();
-            target = .fromDomain(name, remote.port);
+            name = t.fake.lookup(&remote.addr, &name_buf) orelse return conn.reject();
+            target = .fromDomain(name.?, remote.port);
         } else {
             target = .fromEndpoint(remote);
         }
 
-        const where = t.decide(app);
+        const where = t.decide(app, name);
         const ob = where.snap.get();
         var rb: [tls13.min_read_buffer]u8 = undefined;
         var wb: [4096]u8 = undefined;
@@ -481,7 +527,9 @@ pub const Tunnel = struct {
         var app_buf: [2048]u8 = undefined;
         const app = t.findApp(true, src, dst, &app_buf);
         const stats = if (app) |a| t.appStats(ownApp(a)) else null;
-        const snap = t.decide(app).snap;
+        var name_buf: [255]u8 = undefined;
+        const name = if (dns.isFake(&dst.addr)) t.fake.lookup(&dst.addr, &name_buf) else null;
+        const snap = t.decide(app, name).snap;
         switch (snap.outbound) {
             .block => t.rememberDrop(key, stats),
             .direct => t.startDirect(key, payload, stats),
@@ -948,11 +996,11 @@ test "routing: rule beats default, unknown outbound blocks" {
         },
         .outbounds = &.{.{ .vless = .{ .host = "nl.example", .port = 443, .uuid = @splat(1) } }},
     });
-    try std.testing.expect(t.decide("/Applications/Steam.app").snap.outbound == .direct);
-    try std.testing.expect(t.decide("/Applications/Other.app").snap.outbound == .vless);
-    try std.testing.expectEqualStrings("nl.example", t.decide(null).snap.get().vless.host);
-    try std.testing.expect(t.decide("/Applications/Bad.app").snap.outbound == .block);
-    try std.testing.expect(!t.decide(null).main);
+    try std.testing.expect(t.decide("/Applications/Steam.app", null).snap.outbound == .direct);
+    try std.testing.expect(t.decide("/Applications/Other.app", null).snap.outbound == .vless);
+    try std.testing.expectEqualStrings("nl.example", t.decide(null, null).snap.get().vless.host);
+    try std.testing.expect(t.decide("/Applications/Bad.app", null).snap.outbound == .block);
+    try std.testing.expect(!t.decide(null, null).main);
 }
 
 test "tunnel: QUIC is dropped whatever the protocol, not leaked" {
@@ -964,8 +1012,8 @@ test "tunnel: QUIC is dropped whatever the protocol, not leaked" {
         .outbounds = &.{try proxy.outboundFromLink(link, "tj.example", 443)},
     });
     // the copy keeps nothing of the caller's strings
-    try std.testing.expect(t.decide(null).snap.outbound == .trojan);
-    try std.testing.expectEqualStrings("tj.example", t.decide(null).snap.get().trojan.host);
+    try std.testing.expect(t.decide(null, null).snap.outbound == .trojan);
+    try std.testing.expectEqualStrings("tj.example", t.decide(null, null).snap.get().trojan.host);
 
     const app: Endpoint = .{ .addr = packet.v4(.{ 198, 18, 0, 1 }), .port = 50000 };
     const there: Endpoint = .{ .addr = packet.v4(.{ 203, 0, 113, 9 }), .port = 443 };
@@ -977,6 +1025,55 @@ test "tunnel: QUIC is dropped whatever the protocol, not leaked" {
     try std.testing.expectEqual(1, t.udp.count());
     try std.testing.expect(t.udp.get(.{ .app = app, .remote = there }).?.sock == null);
     try std.testing.expectEqual(0, t.sessions.count());
+}
+
+test "tunnel: sites take the applications without a rule, never the others" {
+    const t = try Tunnel.create(std.testing.allocator, std.testing.io, .{});
+    defer t.destroy();
+    const obs = [_]proxy.Outbound{.{ .vless = .{ .host = "nl.example", .port = 443, .uuid = @splat(1) } }};
+    try t.setConfig(.{
+        .default = .{ .outbound = 0 },
+        .rules = &.{
+            .{ .app = "/Applications/Bank.app", .choice = .{ .outbound = 0 } },
+            .{ .app = "/Applications/Game.app", .choice = .direct },
+        },
+        .domains = &.{
+            .{ .suffix = "YouTube.com", .choice = .direct },
+            .{ .suffix = "ads.example", .choice = .block },
+            .{ .suffix = "work.example", .choice = .{ .outbound = 0 } },
+        },
+        .outbounds = &obs,
+    });
+    const browser = "/Applications/Browser.app";
+    // a site and everything under it, in any case; its neighbours not
+    try std.testing.expect(t.decide(browser, "youtube.com").snap.outbound == .direct);
+    try std.testing.expect(t.decide(browser, "i.YTIMG.www.youtube.com.").snap.outbound == .direct);
+    try std.testing.expect(t.decide(browser, "notyoutube.com").snap.outbound == .vless);
+    try std.testing.expect(t.decide(browser, "com").snap.outbound == .vless);
+    try std.testing.expect(t.decide(browser, "x.ads.example").snap.outbound == .block);
+    try std.testing.expect(t.decide(browser, null).snap.outbound == .vless);
+    // an application's own rule (or its parent's) is never overridden
+    try std.testing.expect(t.decide("/Applications/Bank.app", "youtube.com").snap.outbound == .vless);
+    try std.testing.expect(t.decide("/usr/bin/curl\x00/Applications/Bank.app", "youtube.com").snap.outbound == .vless);
+    try std.testing.expect(t.decide("/Applications/Game.app", "work.example").snap.outbound == .direct);
+    // a flow whose application is unknown follows the site
+    try std.testing.expect(t.decide(null, "youtube.com").snap.outbound == .direct);
+
+    // standby: unknown flows are held back; a site may block them, not let them out
+    try t.setConfig(.{
+        .default = .direct,
+        .unknown = .block,
+        .rules = &.{.{ .app = "/Applications/Bank.app", .choice = .block }},
+        .domains = &.{
+            .{ .suffix = "youtube.com", .choice = .direct },
+            .{ .suffix = "work.example", .choice = .block },
+        },
+    });
+    try std.testing.expect(t.decide(null, "youtube.com").snap.outbound == .block);
+    try std.testing.expect(t.decide(null, "other.example").snap.outbound == .block);
+    try std.testing.expect(t.decide(browser, "youtube.com").snap.outbound == .direct);
+    try std.testing.expect(t.decide(browser, "work.example").snap.outbound == .block);
+    try std.testing.expect(t.decide("/Applications/Bank.app", "youtube.com").snap.outbound == .block);
 }
 
 test "tunnel: a flow without a rule follows the application that started it" {
@@ -991,11 +1088,11 @@ test "tunnel: a flow without a rule follows the application that started it" {
         .outbounds = &.{.{ .vless = .{ .host = "nl.example", .port = 443, .uuid = @splat(1) } }},
     });
     // a tool run by a shell run by a new version of the CLI that Claude started
-    try std.testing.expect(t.decide("/usr/bin/curl\x00/bin/zsh\x00/Users/a/claude-code/2.2.0/claude.app\x00/Applications/Claude.app").snap.outbound == .block);
+    try std.testing.expect(t.decide("/usr/bin/curl\x00/bin/zsh\x00/Users/a/claude-code/2.2.0/claude.app\x00/Applications/Claude.app", null).snap.outbound == .block);
     // its own rule comes first
-    try std.testing.expect(t.decide("/Applications/Xcode.app\x00/bin/zsh\x00/Applications/Claude.app").snap.outbound == .vless);
+    try std.testing.expect(t.decide("/Applications/Xcode.app\x00/bin/zsh\x00/Applications/Claude.app", null).snap.outbound == .vless);
     // nobody in the chain has a rule
-    try std.testing.expect(t.decide("/usr/bin/curl\x00/bin/zsh\x00/Applications/Terminal.app").snap.outbound == .direct);
+    try std.testing.expect(t.decide("/usr/bin/curl\x00/bin/zsh\x00/Applications/Terminal.app", null).snap.outbound == .direct);
     try std.testing.expectEqualStrings("/usr/bin/curl", Tunnel.ownApp("/usr/bin/curl\x00/bin/zsh"));
 }
 
@@ -1008,13 +1105,13 @@ test "tunnel: the main route uses the group's server and blocks without one" {
         .{ .vless = .{ .host = "reserve.example", .port = 443, .uuid = @splat(1) } },
     };
     try t.setConfig(.{ .default = .main, .outbounds = &obs, .main = &.{ 1, 2 } });
-    const d = t.decide(null);
+    const d = t.decide(null, null);
     try std.testing.expect(d.main);
     try std.testing.expectEqualStrings("main.example", d.snap.get().vless.host);
     try std.testing.expectEqual(0, t.mainInUse());
     // no main server at all: the route blocks, it never goes direct
     try t.setConfig(.{ .default = .main, .outbounds = &obs });
-    try std.testing.expect(t.decide(null).snap.outbound == .block);
+    try std.testing.expect(t.decide(null, null).snap.outbound == .block);
 }
 
 test "DNS through the tunnel: fake answer goes back to the asking app" {
