@@ -9,6 +9,9 @@
 //!   {"cmd":"stop"}     -> {"ok":true}   shut down and release the TUN
 //!   {"cmd":"suspend"}  -> {"ok":true}   shut down but leave the helper's
 //!                                        capture to the kill switch (restarts)
+//!   {"cmd":"ping","host":"h","port":443} -> {"ms":42} or {"ms":null}
+//!                                        TCP connect time from the real
+//!                                        address, past the TUN
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -75,7 +78,12 @@ pub const Status = struct {
 
 pub const Request = struct {
     cmd: []const u8,
+    /// "ping"
+    host: []const u8 = "",
+    port: u16 = 0,
 };
+
+pub const PingReply = struct { ms: ?u32 = null };
 
 pub const CallError = error{ Unsupported, Timeout, ReadFailed, WriteFailed, ReplyTooLong, WrongPeer } ||
     std.Io.net.UnixAddress.InitError || std.Io.net.UnixAddress.ConnectError || std.mem.Allocator.Error;

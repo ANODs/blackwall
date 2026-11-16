@@ -1,10 +1,12 @@
-//! libblackwall.so: the one native function the Android shell calls.
+//! libblackwall.so: the native functions the Android shell calls.
 //!
 //!   dev.blackwall.Core.start(int fd)
+//!   dev.blackwall.Core.qr(ByteBuffer gray, int w, int h, ByteBuffer out)
 //!
 //! `fd` is one end of a socket pair; the session (session.zig) serves it on
-//! its own thread until the shell closes the other end. The function takes
-//! nothing but a number, so nothing here touches the JNI environment.
+//! its own thread until the shell closes the other end. `qr` reads a QR
+//! code in a camera frame or a picture (direct buffers: the only thing of
+//! the JNI environment used is their address).
 
 const std = @import("std");
 const core = @import("core");
@@ -51,4 +53,29 @@ fn serve(fd: c_int) void {
     s.run();
     s.deinit();
     _ = c.close(fd);
+}
+
+/// JNIEnv: a pointer to the table of the environment's functions.
+const JniEnv = *const *const [240]?*const anyopaque;
+const GetDirectBufferAddress = *const fn (JniEnv, ?*anyopaque) callconv(.c) ?[*]u8;
+const GetDirectBufferCapacity = *const fn (JniEnv, ?*anyopaque) callconv(.c) i64;
+
+/// The text of a QR code in `gray` (w×h bytes) into `out`: its length, or
+/// -1 when there is none.
+export fn Java_dev_blackwall_Core_qr(env: JniEnv, class: ?*anyopaque, gray: ?*anyopaque, w: c_int, h: c_int, out: ?*anyopaque) callconv(.c) c_int {
+    _ = class;
+    const fns = env.*;
+    const address: GetDirectBufferAddress = @ptrCast(@alignCast(fns[230] orelse return -1));
+    const capacity: GetDirectBufferCapacity = @ptrCast(@alignCast(fns[231] orelse return -1));
+    if (w <= 0 or h <= 0) return -1;
+    const n: usize = @intCast(w * h);
+    const in_ptr = address(env, gray) orelse return -1;
+    if (capacity(env, gray) < n) return -1;
+    const out_ptr = address(env, out) orelse return -1;
+    const out_len: usize = @intCast(@max(0, capacity(env, out)));
+    var text_buf: [4096]u8 = undefined;
+    const text = core.qr.decode(std.heap.c_allocator, in_ptr[0..n], @intCast(w), @intCast(h), &text_buf) catch return -1;
+    if (text.len > out_len) return -1;
+    @memcpy(out_ptr[0..text.len], text);
+    return @intCast(text.len);
 }

@@ -176,6 +176,9 @@ const Service = struct {
     /// who owns a connection (Linux, `--tun auto`)
     owners: if (builtin.os.tag == .linux) linux_proc.Searcher else if (on_windows) win_owner.Searcher else void = undefined,
     stopping: std.atomic.Value(bool) = .init(false),
+    /// "ping" requests being measured; the tunnel (its dialer and resolver)
+    /// outlives them
+    pings: std.atomic.Value(u32) = .init(0),
 
     /// The kill switch the helper holds. In standby direct traffic must
     /// pass (strict would stop it) and a crash must not release the
@@ -379,6 +382,10 @@ const Service = struct {
     }
 
     fn shutdown(s: *Service) void {
+        // a ping gives up within its timeout (plus a lookup)
+        var waited: u32 = 0;
+        while (s.pings.load(.acquire) > 0 and waited < 100) : (waited += 1)
+            s.io.sleep(.fromMilliseconds(50), .awake) catch break;
         if (s.socks) |p| {
             p.stop();
             s.gpa.destroy(p);
@@ -598,7 +605,8 @@ const Service = struct {
     fn serveIpc(s: *Service, server: *std.Io.net.Server) void {
         while (!s.stopping.load(.acquire)) {
             const conn = server.accept(s.io) catch continue;
-            defer conn.close(s.io);
+            var conn_kept = false;
+            defer if (!conn_kept) conn.close(s.io);
             if (!s.peerAllowed(conn.socket.handle)) continue;
             var rb: [1024]u8 = undefined;
             var r = conn.reader(s.io, &rb);
@@ -617,6 +625,25 @@ const Service = struct {
             } else if (std.mem.eql(u8, cmd, "reload")) {
                 s.loadConfig() catch |err| log.err("reload: {t}", .{err});
                 w.interface.writeAll("{\"ok\":true}\n") catch {};
+            } else if (std.mem.eql(u8, cmd, "ping")) {
+                // measured on a thread of its own: a slow server must not
+                // hold the window's status calls
+                const job = s.gpa.create(PingJob) catch continue;
+                const host = s.gpa.dupe(u8, req.value.host[0..@min(req.value.host.len, 253)]) catch {
+                    s.gpa.destroy(job);
+                    continue;
+                };
+                job.* = .{ .s = s, .conn = conn, .host = host, .port = req.value.port };
+                _ = s.pings.fetchAdd(1, .acq_rel);
+                if (std.Thread.spawn(.{ .stack_size = core.sys.stackSize(128 * 1024) }, PingJob.run, .{job})) |th| {
+                    th.detach();
+                    conn_kept = true;
+                } else |_| {
+                    _ = s.pings.fetchSub(1, .acq_rel);
+                    s.gpa.free(host);
+                    s.gpa.destroy(job);
+                    w.interface.writeAll("{\"ms\":null}\n") catch {};
+                }
             } else if (std.mem.eql(u8, cmd, "stop") or std.mem.eql(u8, cmd, "suspend")) {
                 s.keep_capture = std.mem.eql(u8, cmd, "suspend");
                 w.interface.writeAll("{\"ok\":true}\n") catch {};
@@ -629,6 +656,46 @@ const Service = struct {
             w.interface.flush() catch {};
         }
     }
+
+    const ping_timeout_ms = 2500;
+
+    /// One "ping": the TCP connect time to a server the way the tunnel
+    /// reaches servers — bound to the physical interface and resolved
+    /// through its resolver — so the window, whose own sockets go into
+    /// the TUN, sees the server from the real address and not through
+    /// the server it is connected to.
+    const PingJob = struct {
+        s: *Service,
+        conn: std.Io.net.Stream,
+        host: []u8,
+        port: u16,
+
+        fn run(j: *PingJob) void {
+            const s = j.s;
+            defer {
+                j.conn.close(s.io);
+                s.gpa.free(j.host);
+                s.gpa.destroy(j);
+                _ = s.pings.fetchSub(1, .acq_rel);
+            }
+            const d: proxy.Dialer = if (s.t) |t| t.dialer else .{};
+            const reply: ipc.PingReply = .{ .ms = measure(s.io, d, j.host, j.port) };
+            var wb: [64]u8 = undefined;
+            var w = j.conn.writer(s.io, &wb);
+            std.json.Stringify.value(reply, .{}, &w.interface) catch return;
+            w.interface.writeByte('\n') catch return;
+            w.interface.flush() catch {};
+        }
+
+        fn measure(io: Io, d: proxy.Dialer, host: []const u8, port: u16) ?u32 {
+            if (host.len == 0 or port == 0) return null;
+            const addr = d.resolve(io, host) catch return null;
+            const began = Io.Clock.awake.now(io);
+            const stream = core.sys.connectTcp(&addr, port, d.bind, ping_timeout_ms) catch return null;
+            stream.close(io);
+            return @intCast(std.math.clamp(began.untilNow(io, .awake).toMilliseconds(), 1, 9999));
+        }
+    };
 
     fn peerAllowed(s: *Service, fd: c.fd_t) bool {
         _ = s;

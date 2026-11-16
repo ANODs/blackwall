@@ -305,6 +305,16 @@ public class Main extends Activity implements Core.Listener {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         if (request == 1 && result == RESULT_OK) connect();
+        if (request == 3 && result == RESULT_OK && data != null && data.getData() != null) {
+            final android.net.Uri uri = data.getData();
+            new Thread(() -> {
+                final String text = Scanner.fromPicture(this, uri);
+                runOnUiThread(() -> {
+                    if (text == null) toast(getString(R.string.qr_none));
+                    else scanned(text);
+                });
+            }, "qr").start();
+        }
     }
 
     private void connect() {
@@ -370,7 +380,40 @@ public class Main extends Activity implements Core.Listener {
                 .setView(box)
                 .setPositiveButton(R.string.add, (dlg, w) -> core.send("add", "text", in.getText().toString()))
                 .setNegativeButton(R.string.cancel, null)
+                .setNeutralButton(R.string.qr, (dlg, w) -> qrChoice())
                 .show();
+    }
+
+    // ------------------------------------------------------------ QR codes
+
+    private void qrChoice() {
+        String[] items = {getString(R.string.qr_camera), getString(R.string.qr_picture)};
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.qr)
+                .setItems(items, (d, which) -> {
+                    if (which == 0) camera();
+                    else startActivityForResult(new Intent(Intent.ACTION_GET_CONTENT).setType("image/*").addCategory(Intent.CATEGORY_OPENABLE), 3);
+                })
+                .show();
+    }
+
+    private void camera() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, 4);
+            return;
+        }
+        new Scanner(this, this::scanned).show();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        if (request == 4 && results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) camera();
+    }
+
+    /** What a scan found: added as it is. */
+    private void scanned(String text) {
+        if (text == null) return;
+        core.send("add", "text", text);
     }
 
     private final class ServerAdapter extends BaseAdapter {
@@ -568,9 +611,17 @@ public class Main extends Activity implements Core.Listener {
     private final class AppAdapter extends BaseAdapter {
         private final ArrayList<AppInfo> rows = new ArrayList<>();
         private final HashMap<String, String> routes = new HashMap<>();
+        /** sites with their routes, in the order they were added */
+        private final ArrayList<String[]> sites = new ArrayList<>();
         private boolean direct;
 
         void set(JSONObject state) {
+            sites.clear();
+            JSONArray ss = state.optJSONArray("sites");
+            for (int i = 0; ss != null && i < ss.length(); i++) {
+                JSONObject o = ss.optJSONObject(i);
+                sites.add(new String[]{o.optString("name"), o.optString("route")});
+            }
             routes.clear();
             JSONArray rules = state.optJSONArray("rules");
             for (int i = 0; rules != null && i < rules.length(); i++) {
@@ -587,14 +638,15 @@ public class Main extends Activity implements Core.Listener {
             notifyDataSetChanged();
         }
 
+        /** Rows: all others, adding a site, the sites, then the applications. */
         @Override
         public int getCount() {
-            return rows.size() + 1;
+            return 2 + sites.size() + rows.size();
         }
 
         @Override
         public Object getItem(int i) {
-            return i == 0 ? null : rows.get(i - 1);
+            return i < 2 + sites.size() ? null : rows.get(i - 2 - sites.size());
         }
 
         @Override
@@ -637,28 +689,77 @@ public class Main extends Activity implements Core.Listener {
                 });
                 return old;
             }
-            final AppInfo a = rows.get(i - 1);
+            if (i == 1) {
+                h.icon.setImageDrawable(glyph(Glyph.PLUS, DIM, 22));
+                h.icon.setScaleType(ImageView.ScaleType.CENTER);
+                h.name.setText(R.string.add_site);
+                h.star.setImageDrawable(null);
+                old.setOnClickListener(v -> siteDialog());
+                return old;
+            }
+            if (i < 2 + sites.size()) {
+                final String[] site = sites.get(i - 2);
+                h.icon.setImageDrawable(glyph(Glyph.GLOBE, DIM, 22));
+                h.icon.setScaleType(ImageView.ScaleType.CENTER);
+                h.name.setText(site[0]);
+                h.star.setImageDrawable(routeGlyph(site[1].equals("default") ? null : site[1]));
+                old.setOnClickListener(v -> routeMenu(v, true, (route) -> {
+                    if (route == null) core.send("unsite", "name", site[0]);
+                    else core.send("site", "name", site[0], "route", route);
+                }));
+                return old;
+            }
+            final AppInfo a = rows.get(i - 2 - sites.size());
             h.icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
             h.icon.setImageDrawable(a.icon);
             h.name.setText(a.name);
-            String route = routes.get(a.pkg);
-            if (route == null) h.star.setImageDrawable(glyph(Glyph.DOT, LINE, 20));
-            else if (route.equals("direct")) h.star.setImageDrawable(glyph(Glyph.DIRECT, TEXT, 20));
-            else if (route.equals("block")) h.star.setImageDrawable(glyph(Glyph.BLOCK, RED, 20));
-            else h.star.setImageDrawable(glyph(Glyph.GLOBE, TEXT, 20));
-            old.setOnClickListener(v -> {
-                final String[] names = {"default", "vpn", "direct", "block"};
-                int[] labels = {R.string.r_default, R.string.r_vpn, R.string.r_direct, R.string.r_block};
-                PopupMenu m = new PopupMenu(Main.this, v, Gravity.END);
-                for (int k = 0; k < names.length; k++) m.getMenu().add(0, k, k, labels[k]);
-                m.setOnMenuItemClickListener(it -> {
-                    core.send("rule", "app", a.pkg, "name", a.name, "route", names[it.getItemId()]);
-                    return true;
-                });
-                m.show();
-            });
+            h.star.setImageDrawable(routeGlyph(routes.get(a.pkg)));
+            old.setOnClickListener(v -> routeMenu(v, false, (route) -> core.send("rule", "app", a.pkg, "name", a.name, "route", route)));
             return old;
         }
+    }
+
+    private interface Picked {
+        /** null: remove (sites only) */
+        void route(String route);
+    }
+
+    private Drawable routeGlyph(String route) {
+        if (route == null) return glyph(Glyph.DOT, LINE, 20);
+        if (route.equals("direct")) return glyph(Glyph.DIRECT, TEXT, 20);
+        if (route.equals("dpi")) return glyph(Glyph.BOLT, TEXT, 20);
+        if (route.equals("block")) return glyph(Glyph.BLOCK, RED, 20);
+        return glyph(Glyph.GLOBE, TEXT, 20);
+    }
+
+    private void routeMenu(View anchor, boolean removable, final Picked picked) {
+        final String[] names = {"default", "vpn", "direct", "dpi", "block"};
+        int[] labels = {R.string.r_default, R.string.r_vpn, R.string.r_direct, R.string.r_dpi, R.string.r_block};
+        PopupMenu m = new PopupMenu(this, anchor, Gravity.END);
+        for (int k = 0; k < names.length; k++) m.getMenu().add(0, k, k, labels[k]);
+        if (removable) m.getMenu().add(0, names.length, names.length, R.string.remove);
+        m.setOnMenuItemClickListener(it -> {
+            int k = it.getItemId();
+            picked.route(k < names.length ? names[k] : null);
+            return true;
+        });
+        m.show();
+    }
+
+    private void siteDialog() {
+        final EditText in = new EditText(this);
+        in.setHint(R.string.site_hint);
+        in.setSingleLine();
+        in.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        FrameLayout box = new FrameLayout(this);
+        box.setPadding(dp(20), dp(12), dp(20), 0);
+        box.addView(in);
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.add_site)
+                .setView(box)
+                .setPositiveButton(R.string.add, (dlg, w) -> core.send("site", "name", in.getText().toString().trim(), "route", "vpn"))
+                .setNegativeButton(R.string.cancel, null)
+                .show();
     }
 
     // ------------------------------------------------------------ settings

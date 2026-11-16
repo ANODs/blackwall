@@ -21,7 +21,10 @@
 //!   select {id}                   server for the main route (0: the fastest)
 //!   star {id}                     toggle a server's place in the reserve
 //!   rule {app, name, route, id}   route of an application: default, vpn,
-//!                                 direct, block, server (+ id)
+//!                                 direct, dpi, block, server (+ id)
+//!   site {name, route, id}        a site's rule (made when new; route as
+//!                                 for "rule"); answered with the state
+//!   unsite {name}                 forget a site's rule
 //!   set {key, on | value}         failover, guard, ipv6
 //!   ping                          measure every server
 //!   connect / disconnect          the user's switch; answered with a plan
@@ -45,7 +48,9 @@
 //! the VPN is off but applications must stay held (standby), only those
 //! applications are let in, where everything is refused. The owner of a
 //! flow is asked for only when rules differ inside the tunnel (a pinned
-//! server, or no network).
+//! server, no network, the DPI bypass). The DPI bypass happens inside the
+//! tunnel, so applications on it enter the VPN; so does everything while
+//! there are rules for sites, which only the tunnel can see.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -276,6 +281,18 @@ pub const Session = struct {
             s.changed();
         } else if (is(m.cmd, "rule")) {
             s.setRule(m);
+        } else if (is(m.cmd, "site")) {
+            const d = s.state.addDomain(m.name) catch return s.sendState();
+            d.route = routeOf(m);
+            s.changed();
+        } else if (is(m.cmd, "unsite")) {
+            var buf: [253]u8 = undefined;
+            const name = model.normalizeDomain(m.name, &buf) orelse return;
+            for (s.state.domains.items, 0..) |d, i| if (std.mem.eql(u8, d.name, name)) {
+                s.state.removeDomain(i);
+                break;
+            };
+            s.changed();
         } else if (is(m.cmd, "set")) {
             s.setSetting(m);
         } else if (is(m.cmd, "ping")) {
@@ -399,20 +416,36 @@ pub const Session = struct {
         s.changed();
     }
 
-    fn setRule(s: *Session, m: Cmd) void {
-        if (m.app.len == 0) return;
-        const route: model.Route = if (std.mem.eql(u8, m.route, "vpn"))
+    fn routeOf(m: Cmd) model.Route {
+        return if (std.mem.eql(u8, m.route, "vpn"))
             .auto
         else if (std.mem.eql(u8, m.route, "direct"))
             .direct
+        else if (std.mem.eql(u8, m.route, "dpi"))
+            .dpi
         else if (std.mem.eql(u8, m.route, "block"))
             .block
         else if (std.mem.eql(u8, m.route, "server"))
             .{ .server = m.id }
         else
             .default;
+    }
+
+    fn routeName(r: model.Route) []const u8 {
+        return switch (r) {
+            .default => "default",
+            .auto => "vpn",
+            .direct => "direct",
+            .dpi => "dpi",
+            .block => "block",
+            .server => "server",
+        };
+    }
+
+    fn setRule(s: *Session, m: Cmd) void {
+        if (m.app.len == 0) return;
         const app = s.state.addApp(m.app, if (m.name.len > 0) m.name else m.app, "") catch return;
-        app.route = route;
+        app.route = routeOf(m);
         s.changed();
     }
 
@@ -439,9 +472,16 @@ pub const Session = struct {
         const Sv = struct { id: u32, sub: u32, name: []const u8, proto: []const u8, cc: []const u8, ping: ?u16, pinging: bool, star: bool, ok: bool };
         const Sub = struct { id: u32, name: []const u8, link: bool, failed: bool, updated: i64 };
         const Rule = struct { app: []const u8, route: []const u8, id: u32 };
+        const Site = struct { name: []const u8, route: []const u8, id: u32 };
         var servers: std.ArrayList(Sv) = .empty;
         var subs: std.ArrayList(Sub) = .empty;
         var rules: std.ArrayList(Rule) = .empty;
+        var sites: std.ArrayList(Site) = .empty;
+        for (s.state.domains.items) |d| sites.append(a, .{
+            .name = d.name,
+            .route = routeName(d.route),
+            .id = if (d.route == .server) d.route.server else 0,
+        }) catch return;
         for (s.state.servers.items) |*sv| servers.append(a, .{
             .id = sv.id,
             .sub = sv.sub_id,
@@ -464,13 +504,7 @@ pub const Session = struct {
             if (app.route == .default) continue;
             rules.append(a, .{
                 .app = app.id,
-                .route = switch (app.route) {
-                    .auto => "vpn",
-                    .direct, .dpi => "direct",
-                    .block => "block",
-                    .server => "server",
-                    .default => unreachable,
-                },
+                .route = routeName(app.route),
                 .id = if (app.route == .server) app.route.server else 0,
             }) catch return;
         }
@@ -481,6 +515,7 @@ pub const Session = struct {
             .servers = servers.items,
             .subs = subs.items,
             .rules = rules.items,
+            .sites = sites.items,
             .selected = st.selected_server orelse 0,
             .current = if (cur) |sv| sv.id else 0,
             .failover = st.failover,
@@ -503,11 +538,14 @@ pub const Session = struct {
         var only: std.ArrayList([]const u8) = .empty;
         var except: std.ArrayList([]const u8) = .empty;
         // without a default through the VPN only the applications with a
-        // rule of their own enter it, as in standby
-        const narrow = st.standby or st.default_route == .direct or st.default_route == .dpi;
+        // rule of their own enter it, as in standby; sites are seen only
+        // inside the tunnel, so with rules for them everything enters
+        const sites = !st.standby and s.hasSites();
+        const narrow = !sites and (st.standby or st.default_route == .direct or st.default_route == .dpi);
         for (s.state.apps.items) |app| switch (app.route) {
-            .auto, .server, .block => if (narrow) only.append(a, app.id) catch return false,
-            .direct, .dpi => if (!narrow) except.append(a, app.id) catch return false,
+            .auto, .server, .block, .dpi => if (narrow) only.append(a, app.id) catch return false,
+            // the bypass is done in the tunnel; direct is Android's own
+            .direct => if (!narrow) except.append(a, app.id) catch return false,
             .default => {},
         };
         const need = s.active and (!narrow or only.items.len > 0);
@@ -543,11 +581,19 @@ pub const Session = struct {
     // ------------------------------------------------------------ the tunnel
 
     /// Whether flows inside the tunnel are treated differently by application.
+    fn hasSites(s: *Session) bool {
+        for (s.state.domains.items) |d| if (d.route != .default) return true;
+        return false;
+    }
+
     fn needsOwners(s: *Session) bool {
         if (s.state.settings.standby) return false;
+        const sites = s.hasSites();
         for (s.state.apps.items) |app| switch (app.route) {
-            .server, .block => return true,
-            else => {},
+            .server, .block, .dpi => return true,
+            // an application's own rule wins over a site's
+            .auto, .direct => if (sites) return true,
+            .default => {},
         };
         // a default that goes direct lets in only applications with rules,
         // all of which use the main server unless the above said otherwise
@@ -977,6 +1023,56 @@ test "the shell's side of a session: keys, rules, plans" {
     sh.say("{\"cmd\":\"rule\",\"app\":\"org.blocked\",\"route\":\"default\"}");
     try sh.untilRule("org.blocked", false);
     try std.testing.expect(!s.ask_owners.load(.acquire));
+
+    // the DPI bypass is done in the tunnel: that application stays in the
+    // VPN, and flows are asked about
+    sh.say("{\"cmd\":\"rule\",\"app\":\"org.direct\",\"route\":\"dpi\"}");
+    {
+        const p = try sh.expect("plan");
+        defer p.deinit();
+        try std.testing.expectEqual(1, p.value.object.get("except").?.array.items.len);
+    }
+    // the shell sets the VpnService up anew for the plan
+    var tun2: [2]c.fd_t = undefined;
+    try std.testing.expectEqual(0, c.socketpair(c.AF.UNIX, c.SOCK.DGRAM, 0, &tun2));
+    defer _ = c.close(tun2[1]);
+    sh.say(try std.fmt.bufPrint(&line, "{{\"cmd\":\"up\",\"fd\":{d},\"mtu\":1500}}", .{tun2[0]}));
+    (try sh.expect("status")).deinit();
+    try std.testing.expect(s.ask_owners.load(.acquire));
+    sh.say("{\"cmd\":\"rule\",\"app\":\"org.direct\",\"route\":\"direct\"}");
+    (try sh.expect("plan")).deinit();
+
+    // a site: in the state, and with the default going direct everything
+    // still enters the VPN, where the site is seen
+    sh.say("{\"cmd\":\"set\",\"key\":\"default\",\"value\":\"direct\"}");
+    {
+        const p = try sh.expect("plan");
+        defer p.deinit();
+        // only the applications with a rule for the VPN
+        try std.testing.expect(p.value.object.get("only").?.array.items.len > 0);
+    }
+    sh.say("{\"cmd\":\"site\",\"name\":\"*.YouTube.com\",\"route\":\"vpn\"}");
+    {
+        const p = try sh.expect("plan");
+        defer p.deinit();
+        try std.testing.expectEqual(0, p.value.object.get("only").?.array.items.len);
+    }
+    {
+        const st = try sh.expect("state");
+        defer st.deinit();
+        const sites = st.value.object.get("sites").?.array.items;
+        try std.testing.expectEqual(1, sites.len);
+        try std.testing.expectEqualStrings("youtube.com", sites[0].object.get("name").?.string);
+        try std.testing.expectEqualStrings("vpn", sites[0].object.get("route").?.string);
+    }
+    sh.say("{\"cmd\":\"unsite\",\"name\":\"youtube.com\"}");
+    {
+        const p = try sh.expect("plan");
+        defer p.deinit();
+        try std.testing.expect(p.value.object.get("only").?.array.items.len > 0);
+    }
+    sh.say("{\"cmd\":\"set\",\"key\":\"default\",\"value\":\"vpn\"}");
+    (try sh.expect("plan")).deinit();
 
     // disconnect: the application that may only use the VPN stays held
     sh.say("{\"cmd\":\"disconnect\"}");

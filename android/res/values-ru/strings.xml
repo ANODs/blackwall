@@ -36,4 +36,11 @@
     <string name="s_always_d">Android сам держит VPN включённым с загрузки и блокирует всё мимо него: включите «Постоянная VPN» и «Блокировать соединения без VPN» для BLACKWALL в настройках системы.</string>
     <string name="s_privacy">Политика конфиденциальности</string>
     <string name="s_privacy_d">Разработчику ничего не отправляется: ни аналитики, ни аккаунтов. Ключи и правила остаются на этом устройстве.</string>
+    <string name="r_dpi">Обход DPI</string>
+    <string name="add_site">Добавить сайт</string>
+    <string name="site_hint">example.com</string>
+    <string name="qr">QR-код</string>
+    <string name="qr_camera">Камера</string>
+    <string name="qr_picture">Картинка</string>
+    <string name="qr_none">QR-код не найден</string>
 </resources>

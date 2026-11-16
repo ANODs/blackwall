@@ -445,6 +445,8 @@ const Target = struct { id: u32, host: []u8, port: u16 };
 
 const ProbeJob = struct {
     targets: []Target,
+    /// measured by the service: its sockets bypass the TUN, ours do not
+    via_service: bool,
     next: std.atomic.Value(usize) = .init(0),
     workers_left: std.atomic.Value(usize),
 };
@@ -471,7 +473,7 @@ pub fn probeAll() void {
     const job = gpa.create(ProbeJob) catch return;
     const targets = list.toOwnedSlice(gpa) catch return;
     const n = @min(probe_workers, targets.len);
-    job.* = .{ .targets = targets, .workers_left = .init(n) };
+    job.* = .{ .targets = targets, .via_service = service_on, .workers_left = .init(n) };
     probing = true;
     for (0..n) |_| {
         const t = std.Thread.spawn(.{}, probeThread, .{job}) catch {
@@ -487,7 +489,8 @@ fn probeThread(job: *ProbeJob) void {
         const i = job.next.fetchAdd(1, .monotonic);
         if (i >= job.targets.len) break;
         const t = job.targets[i];
-        pushResult(.{ .ping = .{ .id = t.id, .ms = probe(t.host, t.port) } });
+        const ms = if (job.via_service) servicePing(t.host, t.port) orelse probe(t.host, t.port) else probe(t.host, t.port);
+        pushResult(.{ .ping = .{ .id = t.id, .ms = ms } });
     }
     finishWorker(job);
 }
@@ -501,6 +504,29 @@ fn finishWorker(job: *ProbeJob) void {
 }
 
 const probe_timeout_ms = 2500;
+
+/// The service's measurement: `null` only when it could not be asked
+/// (an older service, or none), `.{ null }` when the server is unreachable.
+fn servicePing(host: []const u8, port: u16) ??u16 {
+    var line: Io.Writer.Allocating = .init(gpa);
+    defer line.deinit();
+    std.json.Stringify.value(core.ipc.Request{ .cmd = "ping", .host = host, .port = port }, .{}, &line.writer) catch return null;
+    line.writer.writeByte('\n') catch return null;
+    var path_buf: [256]u8 = undefined;
+    const answer = core.ipc.request(gpa, io, core.ipc.socketPath(&path_buf, config_dir), line.written(), probe_timeout_ms + 2000) catch |err| switch (err) {
+        // asked, but the measurement did not come back in time
+        error.Timeout => return @as(?u16, null),
+        else => return null,
+    };
+    defer gpa.free(answer);
+    const r = std.json.parseFromSlice(core.ipc.PingReply, gpa, answer, .{ .ignore_unknown_fields = true }) catch return null;
+    defer r.deinit();
+    // an older service answers {"error":"unknown command"}
+    if (std.mem.indexOf(u8, answer, "\"ms\"") == null) return null;
+    const ms = r.value.ms orelse return @as(?u16, null);
+    const out: u16 = @intCast(@min(ms, 9999));
+    return @as(?u16, out);
+}
 
 /// TCP connect time in milliseconds, or null when unreachable.
 /// std's connect has no timeout on POSIX yet, so the connect runs as a

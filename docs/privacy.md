@@ -35,6 +35,12 @@ route to a particular application it asks Android which application owns a conne
 The list of installed applications is read to let you pick them, and never leaves the
 device.
 
+The camera is used only when you choose to scan a QR code to add a subscription: the
+frames are read on the device to find the code and dropped at once; nothing is stored or
+sent. A picture you choose for the same purpose is read the same way. On computers the
+same button reads a picture on the clipboard or what is on the screen, on the device,
+for the same purpose only.
+
 ## Changes and contact
 
 Changes to this policy appear in this file, with the history kept by the repository:

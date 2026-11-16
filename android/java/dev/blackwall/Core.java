@@ -61,6 +61,19 @@ final class Core {
 
     private static native void start(int fd);
 
+    /** The QR code in a grayscale picture (w×h bytes): its length in `out`, or -1. */
+    private static native int qr(java.nio.ByteBuffer gray, int w, int h, java.nio.ByteBuffer out);
+
+    /** The text of a QR code in `gray` (a direct buffer of w×h bytes), or null. */
+    static String readQr(java.nio.ByteBuffer gray, int w, int h) {
+        java.nio.ByteBuffer out = java.nio.ByteBuffer.allocateDirect(4096);
+        int n = qr(gray, w, h, out);
+        if (n <= 0) return null;
+        byte[] b = new byte[n];
+        out.get(b, 0, n);
+        return new String(b, StandardCharsets.UTF_8);
+    }
+
     final Context app;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService out = Executors.newSingleThreadExecutor();
