@@ -10,8 +10,8 @@ $cfg = Join-Path $env:RUNNER_TEMP 'bwcfg'
 New-Item -ItemType Directory -Force $cfg | Out-Null
 $failed = $false
 
-function Config([string]$route, [string]$rules = '') {
-    $json = '{"version":1,"next_id":1,"settings":{"default_route":{"' + $route + '":{}},"kill_switch":"off","ipv6":"block"},"subs":[],"servers":[],"rules":[' + $rules + ']}'
+function Config([string]$route, [string]$rules = '', [string]$kill = 'off') {
+    $json = '{"version":1,"next_id":1,"settings":{"default_route":{"' + $route + '":{}},"kill_switch":"' + $kill + '","ipv6":"block","allow_lan":false},"subs":[],"servers":[],"rules":[' + $rules + ']}'
     Set-Content -Path (Join-Path $cfg 'config.json') -Value $json -Encoding ascii
 }
 
@@ -116,6 +116,35 @@ Check "it stopped ($((Get-Service BLACKWALL).Status))" ((Get-Service BLACKWALL).
 Check 'the adapter went with it' ($null -eq (Get-NetAdapter -Name 'BLACKWALL' -ErrorAction SilentlyContinue))
 $code = Fetch
 Check "the network is back ($code)" ($code -eq '200')
+Write-Host "== the kill switch holds the traffic when the service dies"
+$svc = Join-Path $Bin 'blackwall-service.exe'
+# whatever happens below, the machine gets its network back
+Start-Process -WindowStyle Hidden -FilePath pwsh -ArgumentList '-NoProfile', '-Command', "Start-Sleep 90; & '$svc' --release"
+Config 'direct' '' 'selective'
+& sc.exe start BLACKWALL --tun wintun | Out-Null
+Start-Sleep -Seconds 6
+$code = Fetch
+Check "selective: through the tunnel ($code)" ($code -eq '200')
+Get-Process blackwall-service -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 3
+Check 'the adapter went with it' ($null -eq (Get-NetAdapter -Name 'BLACKWALL' -ErrorAction SilentlyContinue))
+$code = Fetch
+Check "nothing goes out directly ($code)" ($code -ne '200')
+& sc.exe start BLACKWALL --release | Out-Null
+Start-Sleep -Seconds 4
+$code = Fetch
+Check "released: the network is back ($code)" ($code -eq '200')
+
+Config 'direct' '' 'strict'
+& sc.exe start BLACKWALL --tun wintun | Out-Null
+Start-Sleep -Seconds 6
+$code = Fetch
+Check "strict: a direct route does not work ($code)" ($code -ne '200')
+& sc.exe stop BLACKWALL | Out-Null
+Start-Sleep -Seconds 5
+$code = Fetch
+Check "a clean stop lets the traffic go ($code)" ($code -eq '200')
+
 & (Join-Path $Bin 'blackwall-service.exe') uninstall
 Check 'uninstalled' ($null -eq (Get-Service BLACKWALL -ErrorAction SilentlyContinue))
 

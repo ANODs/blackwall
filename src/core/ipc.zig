@@ -94,6 +94,7 @@ pub fn call(gpa: std.mem.Allocator, io: Io, socket_path: []const u8, cmd: []cons
 
 /// `call` with a whole request line (JSON object and newline) of the caller's.
 pub fn request(gpa: std.mem.Allocator, io: Io, socket_path: []const u8, req: []const u8, timeout_ms: i64) CallError![]u8 {
+    if (comptime @import("builtin").os.tag == .windows) return requestWindows(gpa, io, socket_path, req, timeout_ms);
     if (comptime !sys.supported) return error.Unsupported;
     const addr = try std.Io.net.UnixAddress.init(socket_path);
     const s = try addr.connect(io);
@@ -128,6 +129,35 @@ pub fn request(gpa: std.mem.Allocator, io: Io, socket_path: []const u8, req: []c
         }
         if (out.items.len + @as(usize, @intCast(n)) > max_reply) return error.ReplyTooLong;
         try out.appendSlice(gpa, buf[0..@intCast(n)]);
+    }
+    out.shrinkRetainingCapacity(std.mem.indexOfScalar(u8, out.items, '\n') orelse out.items.len);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Windows: the same over an AF_UNIX socket (std.Io.net, AFD). Who may
+/// connect is decided by the folder the socket file is in (the user's
+/// profile), so there is no peer to check.
+fn requestWindows(gpa: std.mem.Allocator, io: Io, socket_path: []const u8, req: []const u8, timeout_ms: i64) CallError![]u8 {
+    const afd = @import("afd.zig");
+    const addr = try std.Io.net.UnixAddress.init(socket_path);
+    const s = try addr.connect(io);
+    defer s.close(io);
+    var wb: [256]u8 = undefined;
+    var w = s.writer(io, &wb);
+    w.interface.writeAll(req) catch return error.WriteFailed;
+    w.interface.flush() catch return error.WriteFailed;
+
+    const start = Io.Clock.awake.now(io);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var buf: [4096]u8 = undefined;
+    while (std.mem.indexOfScalar(u8, out.items, '\n') == null) {
+        const left = timeout_ms - start.untilNow(io, .awake).toMilliseconds();
+        if (left <= 0 or !afd.wait(s.socket.handle, false, @intCast(@min(left, std.math.maxInt(i32))))) return error.Timeout;
+        const n = afd.recv(s.socket.handle, &buf) catch return error.ReadFailed;
+        if (n == 0) break;
+        if (out.items.len + n > max_reply) return error.ReplyTooLong;
+        try out.appendSlice(gpa, buf[0..n]);
     }
     out.shrinkRetainingCapacity(std.mem.indexOfScalar(u8, out.items, '\n') orelse out.items.len);
     return out.toOwnedSlice(gpa);

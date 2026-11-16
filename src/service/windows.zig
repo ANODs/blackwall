@@ -154,8 +154,9 @@ pub const Options = struct {
 pub const Lease = struct {
     adapter: wintun.Adapter,
     device: wintun.Device,
-    /// the adapter's interface index
+    /// the adapter's interface index and LUID
     index: u32,
+    luid: u64 = 0,
     /// the physical interface our own sockets must stay on
     bind_index: u32,
     /// the network's resolvers; routed into the adapter, reached by us
@@ -184,7 +185,7 @@ pub fn up(o: Options) !Lease {
     _ = ConvertInterfaceLuidToIndex(&luid, &index);
     if (index == bind_index) return error.NoNetwork; // only our own adapter routes anywhere
 
-    var lease: Lease = .{ .adapter = a, .device = undefined, .index = index, .bind_index = bind_index };
+    var lease: Lease = .{ .adapter = a, .device = undefined, .index = index, .luid = luid, .bind_index = bind_index };
     lease.dns_len = resolvers(bind_index, &lease.dns);
 
     try addAddress(luid, SockaddrInet.v4(tun_addr), tun_prefix);

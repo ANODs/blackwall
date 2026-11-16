@@ -36,6 +36,7 @@ const linux = @import("linux.zig");
 const linux_proc = @import("linux_proc.zig");
 const win = @import("windows.zig");
 const win_owner = @import("win_owner.zig");
+const wfp = @import("wfp.zig");
 const on_windows = builtin.os.tag == .windows;
 const darwin = if (builtin.os.tag.isDarwin()) struct {
     const process = @import("darwin/process.zig");
@@ -233,7 +234,7 @@ const Service = struct {
             if (!packet.isV4(&addr)) return null;
             return std.fmt.allocPrint(s.gpa, "{d}.{d}.{d}.{d}", .{ addr[12], addr[13], addr[14], addr[15] }) catch null;
         }
-        return resolve4(s.gpa, host);
+        return resolve4(s.gpa, s.io, host);
     }
 
     fn start(s: *Service) !void {
@@ -364,6 +365,7 @@ const Service = struct {
         for (lease.dns[0..lease.dns_len]) |ip| s.addDns(ip);
         for (core.ipstack.dns.Resolver.public_servers) |e| s.addDns(e.addr[12..16].*);
         log.info("adapter {d}, own traffic on interface {d}, {d} resolvers captured", .{ lease.index, lease.bind_index, lease.dns_len });
+        s.applyFirewall();
         s.owners = .init(s.gpa, s.io);
         const lookup: tunnel.AppLookup = .{ .ctx = &s.owners, .find = findWinApp };
         const t = try tunnel.Tunnel.create(s.gpa, s.io, .{ .mtu = s.args.mtu, .bind = .{ .index = lease.bind_index }, .upstream_dns = dns_servers, .lookup = lookup });
@@ -389,6 +391,8 @@ const Service = struct {
                     l.device.deinit();
                     win.down(l);
                     s.owners.deinit();
+                    // a clean stop lets the traffic go; "suspend" leaves it held
+                    if (!s.keep_capture) wfp.clear();
                 }
                 s.lease = null;
             } else s.device.deinit();
@@ -429,6 +433,7 @@ const Service = struct {
     /// The strict kill switch on Linux: an nftables table that outlives the
     /// service (nft.zig), set and removed by blackwall-tun.
     fn applyFirewall(s: *Service) void {
+        if (comptime on_windows) return s.applyWfp();
         if (builtin.os.tag != .linux or !s.own_device) return;
         if (s.killSwitch() != .strict) return s.runTunTool(&.{"open"});
         var servers: std.ArrayList(u8) = .empty;
@@ -450,6 +455,37 @@ const Service = struct {
         if (s.settings.allow_lan) argv.appendAssumeCapacity("--lan");
         if (s.settings.ipv6 == .block) argv.appendAssumeCapacity("--ipv6-block");
         s.runTunTool(argv.items);
+    }
+
+    /// Windows: filters that hold the traffic when the service is gone
+    /// (wfp.zig); off removes them.
+    fn applyWfp(s: *Service) void {
+        if (comptime !on_windows) return;
+        const lease = s.lease orelse return;
+        const mode: wfp.Mode = switch (s.killSwitch()) {
+            .off => return wfp.clear(),
+            .selective => .selective,
+            .strict => .strict,
+        };
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = std.process.executablePath(s.io, &exe_buf) catch return log.err("kill switch: no executable path", .{});
+        var servers: [32][4]u8 = undefined;
+        var count: usize = 0;
+        for (s.server_ips.items) |ip| {
+            if (count == servers.len) break;
+            const a = std.Io.net.Ip4Address.parse(ip, 0) catch continue;
+            servers[count] = a.bytes;
+            count += 1;
+        }
+        wfp.apply(.{
+            .mode = mode,
+            .luid = lease.luid,
+            .service_exe = exe_buf[0..n],
+            .servers4 = servers[0..count],
+            .dns4 = s.dns4[0..s.dns4_len],
+            .allow_lan = s.settings.allow_lan,
+            .ipv6_block = s.settings.ipv6 == .block,
+        }) catch |err| log.err("kill switch: {t}", .{err});
     }
 
     /// blackwall-tun next to this executable, with `args`.
@@ -682,9 +718,22 @@ fn findLinuxApp(ctx: *anyopaque, udp: bool, local: packet.Endpoint, remote: pack
 
 /// IPv4 address of a server name, through the system resolver (used before
 /// the TUN takes over DNS). Caller frees.
-fn resolve4(gpa: std.mem.Allocator, host: []const u8) ?[]const u8 {
+fn resolve4(gpa: std.mem.Allocator, io: Io, host: []const u8) ?[]const u8 {
     if (std.Io.net.Ip4Address.parse(host, 0)) |_| return gpa.dupe(u8, host) catch null else |_| {}
-    if (comptime on_windows) return null; // the kill switch there is not built yet
+    if (comptime on_windows) {
+        const name = std.Io.net.HostName.init(host) catch return null;
+        var results: [16]std.Io.net.HostName.LookupResult = undefined;
+        var q: Io.Queue(std.Io.net.HostName.LookupResult) = .init(&results);
+        name.lookup(io, &q, .{ .port = 0, .family = .ip4 }) catch return null;
+        while (q.getOne(io)) |r| switch (r) {
+            .address => |a| if (a == .ip4) {
+                const b = a.ip4.bytes;
+                return std.fmt.allocPrint(gpa, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch null;
+            },
+            .canonical_name => {},
+        } else |_| return null;
+        return null;
+    }
     var name: [256:0]u8 = @splat(0);
     if (host.len >= name.len) return null;
     @memcpy(name[0..host.len], host);
@@ -800,6 +849,7 @@ fn serve(init: std.process.Init, argv: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--release")) {
             // let go of what a service that is gone still holds
             linux.remove();
+            wfp.clear();
             return;
         } else if (std.mem.eql(u8, arg, "--bind")) {
             args.bind = val;
@@ -879,5 +929,6 @@ test {
     _ = @import("nft.zig");
     _ = win;
     _ = win_owner;
+    _ = wfp;
     if (builtin.os.tag.isDarwin()) _ = darwin.process;
 }

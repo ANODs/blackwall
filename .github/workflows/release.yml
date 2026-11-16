@@ -94,6 +94,16 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+      # Windows: the app carries wintun.dll (the WireGuard project's signed driver library,
+      # www.wintun.net), pinned by its hash
+      - name: Wintun
+        if: matrix.platform.name == 'windows'
+        shell: bash
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/wintun.zip" https://www.wintun.net/builds/wintun-0.14.1.zip
+          echo "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  $RUNNER_TEMP/wintun.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/wintun.zip" -d "$RUNNER_TEMP"
+          echo "WINTUN_ARG=-Dwintun=$RUNNER_TEMP/wintun/bin/amd64/wintun.dll" >> "$GITHUB_ENV"
       - name: Package
         shell: bash
         env:
@@ -107,7 +117,9 @@ jobs:
           else
             echo "::warning::BLACKWALL_UPDATE_KEY / BLACKWALL_UPDATE_PUBKEY not set: built without auto-update"
           fi
-          zig build package -Dlang=${{ matrix.lang }} ${{ matrix.platform.target }} -Doptimize=ReleaseSafe "${update[@]}"
+          extra=()
+          if [ -n "${WINTUN_ARG:-}" ]; then extra=("$WINTUN_ARG"); fi
+          zig build package -Dlang=${{ matrix.lang }} ${{ matrix.platform.target }} -Doptimize=ReleaseSafe "${update[@]}" "${extra[@]}"
       - uses: actions/upload-artifact@v7
         with:
           name: pkg-${{ matrix.lang }}-${{ matrix.platform.name }}

@@ -316,6 +316,7 @@ pub const Link = struct {
     /// `cmd` is "stop" (release the TUN) or "suspend" (leave the capture to
     /// the kill switch while another service takes over).
     fn stop(l: *Link, cmd: []const u8, report: bool) void {
+        const was_running = l.running;
         if (l.running) {
             if (ipc.call(l.gpa, l.io, l.socketPath(), cmd, 5000)) |line| l.gpa.free(line) else |_| {}
             // it undoes the TUN and the helper's state before it exits
@@ -331,6 +332,8 @@ pub const Link = struct {
             if (ipc.call(l.gpa, l.io, helper.socket_path, "down", 5000)) |line| l.gpa.free(line) else |_| {}
         }
         if (on_linux and std.mem.eql(u8, cmd, "stop") and linuxDevice()) l.releaseDevice();
+        // Windows: the filters a service that died left holding the traffic
+        if (on_windows and !was_running and std.mem.eql(u8, cmd, "stop")) scm.start(&.{"--release"}) catch {};
         if (report) l.sink(.{ .down = .{ .why = .stopped } });
     }
 
