@@ -8,7 +8,7 @@
 <p align="center">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Zig 0.17.1" src="https://img.shields.io/badge/zig-0.17.1-f7a41d">
-  <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-lightgrey">
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Android%20%C2%B7%20Windows-lightgrey">
   <img alt="Languages" src="https://img.shields.io/badge/interface-English%20%C2%B7%20%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9%20%C2%B7%20%E4%B8%AD%E6%96%87-lightgrey">
 </p>
 
@@ -25,7 +25,7 @@ the VPN never quietly falls back to your real address.
 
 It is one codebase with its own data plane: the TCP/IP stack, the TLS 1.3 and REALITY
 handshakes, HTTP/2 and every protocol are implemented in this repository, in Zig. A
-release is a single file of 4 to 11 MB.
+release is a single file of 3 to 11 MB.
 
 > **You bring the servers.** BLACKWALL is a client. It does not sell, provide or
 > recommend VPN servers, and it has no account, no backend and no analytics.
@@ -74,7 +74,8 @@ release is a single file of 4 to 11 MB.
 - Protection after Disconnect: applications with a VPN rule of their own stay offline
   while the VPN is off.
 - Hold from boot (macOS): traffic is held from the moment the system starts until the
-  VPN is up, so applications that launch at login cannot get out first.
+  VPN is up, so applications that launch at login cannot get out first. On Android the
+  system's own "Always-on VPN" does the same.
 - Detection of another VPN that stands in the way, with a way to stop it.
 
 **Everyday use**
@@ -150,7 +151,9 @@ The builds are not signed by Apple or Microsoft yet:
   password once, through the system's dialog, to give `blackwall-tun` its network
   permission.
 - **Android**: open the APK and allow the installation from that source. The first
-  connection asks once whether the app may be a VPN.
+  connection asks once whether the app may be a VPN. The app is also on its way to
+  Google Play; the APK from here and the app from Google Play are signed differently, so
+  one does not update the other.
 
 Every release file has a `.sig` next to it, an Ed25519 signature the updater checks
 before it installs anything. See [docs/updates.md](docs/updates.md).
@@ -312,7 +315,9 @@ zig build test
 
 The suite covers the protocol code against recorded and scripted peers, the TCP/IP stack,
 the routing table, the recovery logic and the release tooling, and runs on macOS, Linux and
-Windows in CI.
+Windows in CI on every push. The Linux capture, routes per application, protection after
+Disconnect and the strict kill switch also have an end-to-end test in a virtual machine,
+and the Android app is checked in an emulator.
 
 Two tools help when working on the data plane:
 
@@ -378,11 +383,13 @@ docs/                      updates, Android, release notes
 
 ## Roadmap
 
-- Capture and per-application routes on Windows.
-- Hysteria2, TUIC and WireGuard.
-- UDP over the remaining protocols.
-- A local DPI bypass route.
-- Rules by domain in addition to rules by application.
+- **0.2** — UDP over Trojan, VMess and Shadowsocks; rules by domain; a local DPI bypass
+  route.
+- **0.4** — Windows: capture through Wintun, routes per application, a kill switch on WFP.
+  The network layer already runs on Windows; the rest is in progress.
+- **0.5** — WireGuard.
+- **0.6** — QUIC and Hysteria2.
+- **0.7** — TUIC.
 
 ## Contributing
 
