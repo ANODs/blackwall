@@ -25,7 +25,7 @@ the VPN never quietly falls back to your real address.
 
 It is one codebase with its own data plane: the TCP/IP stack, the TLS 1.3 and REALITY
 handshakes, HTTP/2 and every protocol are implemented in this repository, in Zig. A
-release is a single file of 3 to 13 MB.
+release is a single file of 3 to 14 MB.
 
 > **You bring the servers.** BLACKWALL is a client. It does not sell, provide or
 > recommend VPN servers, and it has no account, no backend and no analytics.
