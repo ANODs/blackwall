@@ -104,6 +104,111 @@ if (BW.worker && !BW.fresh) {
   fetch(BW.worker + '/releases').then(r => r.ok ? r.json() : null).then(applyReleases).catch(() => {});
 }
 
+/* ---------- benchmarks: the numbers of tools/bench/run.py, baked in at build time ---------- */
+(() => {
+  const sec = $('#bench'), B = BW.bench;
+  if (!sec) return;
+  if (!B || !B.local) { sec.hidden = true; return; }
+  const T = sec.dataset, bars = $('#bx-bars'), unit = $('#bx-unit'), hint = $('#bx-hint');
+  const legend = $('#bx-legend'), note = $('#bx-note'), setBox = $('#bx-set');
+  const el = (tag, cls, text) => { const e = d.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const num = (v, digits) => new Intl.NumberFormat(BW.lang, { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(v);
+  const ver = id => (B.clients.find(c => c.id === id) || {}).version || '';
+  const SUB = { blackwall: 'Zig', happ: 'Xray ' + ver('happ'), xray: 'v2rayN · v2RayTun', singbox: 'Hiddify' };
+  const sets = { reality: B.local.protocols.reality, ss2022: B.local.protocols.ss2022, remote: B.remote && B.remote.results };
+  if (sets.remote) { $('[data-s="remote"]', setBox).hidden = false; $('[data-m="latency"]').hidden = false; }
+  const remote = () => set === 'remote';
+  const M = {
+    memory: { unit: () => T.uMemory, lower: true, get: r => r.peak_mb, under: r => r.idle_mb,
+              text: r => num(r.idle_mb, 1) + ' <em>/ ' + num(r.peak_mb, 1) + '</em>' },
+    start: { unit: () => T.uStart, lower: true, get: r => r.start_ms, text: r => num(r.start_ms, 1) },
+    cpu: { unit: () => T.uCpu, lower: true, get: r => r.cpu_ms_per_gb, text: r => num(r.cpu_ms_per_gb, 0) },
+    speed: { unit: () => remote() ? T.uSpeedRemote : T.uSpeed, lower: false,
+             get: r => r.mbps == null ? null : remote() ? r.mbps : r.mbps / 1000,
+             text: r => remote() ? num(r.mbps, 1) : num(r.mbps / 1000, 2) },
+    latency: { unit: () => T.uLatency, lower: true, get: r => r.handshake_ms, text: r => num(r.handshake_ms, 0) },
+    size: { unit: () => T.uSize, lower: true },
+  };
+  let metric = 'memory', set = 'reality';
+
+  function rows() {
+    if (metric === 'size') {
+      const a = (B.sizes && B.sizes.app_mb) || {};
+      return [['blackwall', 'BLACKWALL', 'Zig'], ['happ', 'Happ', 'Xray · sing-box'], ['v2raytun', 'v2RayTun', 'Xray'], ['hiddify', 'Hiddify', 'sing-box']]
+        .filter(([id]) => a[id]).map(([id, name, sub]) => ({ id, name, sub, v: a[id], text: num(a[id], 1) }));
+    }
+    const res = sets[set] || {}, m = M[metric];
+    return B.clients.filter(c => res[c.id] && m.get(res[c.id]) != null).map(c => ({
+      id: c.id, name: c.name, sub: SUB[c.id], v: m.get(res[c.id]),
+      under: m.under ? m.under(res[c.id]) : null, text: m.text(res[c.id]),
+    }));
+  }
+
+  function footnote() {
+    let date = remote() ? B.remote.date : B.local.date;
+    try { date = new Intl.DateTimeFormat(BW.lang, { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }).format(new Date(date + 'T00:00:00Z')); } catch (e) {}
+    if (!remote()) return T.stand.replace('{machine}', B.machine).replace('{date}', date).replace('{xray}', ver('xray'));
+    let country = B.remote.country;
+    try { country = new Intl.DisplayNames([BW.lang], { type: 'region' }).of(country) || country; } catch (e) {}
+    return T.remoteNote.replace('{date}', date).replace('{country}', country)
+      .replace('{protocol}', B.remote.protocol).replace('{rtt}', num(B.remote.rtt_ms, 0));
+  }
+
+  function draw() {
+    const m = M[metric], rs = rows();
+    const max = Math.max(...rs.map(r => r.v), 1e-9);
+    const width = v => Math.max(v / max * 100, 0.8).toFixed(2) + '%';
+    bars.textContent = '';
+    rs.forEach(r => {
+      const row = el('div', 'bxr' + (r.id === 'blackwall' ? ' me' : ''));
+      const name = el('div', 'bxn');
+      name.append(el('b', '', r.name), el('span', '', r.sub || ''));
+      const track = el('div', 'bxt'), full = el('i', r.under != null ? 'f' : ''), part = r.under != null ? el('i') : null;
+      track.append(full);
+      if (part) track.append(part);
+      const value = el('div', 'bxv');
+      value.innerHTML = r.text;  // formatted numbers only
+      row.append(name, track, value);
+      bars.append(row);
+      const grow = () => { full.style.width = width(r.v); if (part) part.style.width = width(r.under); };
+      if (reduce) grow(); else requestAnimationFrame(() => requestAnimationFrame(grow));
+    });
+    unit.textContent = m.unit();
+    hint.textContent = m.lower ? T.lower : T.higher;
+    legend.hidden = metric !== 'memory';
+    setBox.style.visibility = metric === 'size' ? 'hidden' : '';
+    note.textContent = footnote();
+  }
+
+  const press = (box, attr, value) => $$('button', box).forEach(b => b.setAttribute('aria-pressed', String(b.dataset[attr] === value)));
+  $$('#bx-metric button').forEach(b => b.addEventListener('click', () => {
+    metric = b.dataset.m;
+    press($('#bx-metric'), 'm', metric);
+    draw();
+  }));
+  $$('button', setBox).forEach(b => b.addEventListener('click', () => {
+    set = b.dataset.s;
+    if (metric === 'latency' && !remote()) { metric = 'memory'; press($('#bx-metric'), 'm', metric); }
+    press(setBox, 's', set);
+    draw();
+  }));
+
+  // the bars grow the first time they are seen, the headline numbers rise in turn
+  const hero = $('.bx-hero', sec);
+  if ('IntersectionObserver' in window && !reduce) {
+    const io = new IntersectionObserver(es => es.forEach(e => {
+      if (!e.isIntersecting) return;
+      io.unobserve(e.target);
+      if (e.target === hero) hero.classList.add('in'); else draw();
+    }), { rootMargin: '0px 0px -12% 0px' });
+    io.observe(hero);
+    io.observe(bars);
+  } else {
+    hero.classList.add('in');
+    draw();
+  }
+})();
+
 /* ---------- statistics: what the worker has counted, open to everyone ---------- */
 (() => {
   const sec = $('#stats');

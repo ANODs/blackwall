@@ -132,6 +132,39 @@
   </div>
 </section>
 
+<section class="sec" id="bench" data-stand="{{bench_stand}}" data-remote-note="{{bench_remote_note}}"
+  data-idle="{{bench_idle}}" data-peak="{{bench_peak}}" data-lower="{{bench_lower}}" data-higher="{{bench_higher}}"
+  data-u-memory="{{bench_u_memory}}" data-u-start="{{bench_u_start}}" data-u-size="{{bench_u_size}}" data-u-cpu="{{bench_u_cpu}}"
+  data-u-speed="{{bench_u_speed}}" data-u-speed-remote="{{bench_u_speed_remote}}" data-u-latency="{{bench_u_latency}}">
+  <div class="wrap">
+    <h2 class="rv">{{bench_h}}</h2>
+    <div class="bx-hero">
+{{@bench_hero}}
+    </div>
+    <div class="bx rv" style="--i:2">
+      <div class="bx-top">
+        <div class="seg" id="bx-metric" role="group" aria-label="{{bench_h}}">
+          <button type="button" data-m="memory" aria-pressed="true">{{bench_t_memory}}</button>
+          <button type="button" data-m="start">{{bench_t_start}}</button>
+          <button type="button" data-m="size">{{bench_t_size}}</button>
+          <button type="button" data-m="cpu">{{bench_t_cpu}}</button>
+          <button type="button" data-m="speed">{{bench_t_speed}}</button>
+          <button type="button" data-m="latency" hidden>{{bench_t_latency}}</button>
+        </div>
+        <div class="seg" id="bx-set" role="group">
+          <button type="button" data-s="reality" aria-pressed="true">{{bench_stand_reality}}</button>
+          <button type="button" data-s="ss2022">{{bench_stand_ss}}</button>
+          <button type="button" data-s="remote" hidden>{{bench_remote}}</button>
+        </div>
+      </div>
+      <div class="bx-unit"><span id="bx-unit"></span><span id="bx-hint"></span></div>
+      <div class="bx-legend" id="bx-legend" hidden><i class="sw sw-solid"></i>{{bench_idle}}<i class="sw sw-faint"></i>{{bench_peak}}</div>
+      <div class="bx-bars" id="bx-bars"></div>
+      <p class="bx-foot"><span id="bx-note"></span> <a href="{{@repo_url}}/tree/main/tools/bench" rel="noopener">{{bench_how}}</a></p>
+    </div>
+  </div>
+</section>
+
 <section class="sec" id="download">
   <div class="wrap">
     <div class="dl-head">

@@ -177,6 +177,47 @@ def jsonld(cfg: dict, strings: dict, lang: str, url: str, base: str, releases: d
     return json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
 
 
+def bench_data() -> dict | None:
+    """site/data/bench.json, written by tools/bench/run.py."""
+    p = SITE / "data" / "bench.json"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def bench_hero(bench: dict | None, strings: dict, lang: str) -> str:
+    """The headline ratios, written into the page so that they are read without scripts.
+    Each is against the best of the other clients, and the smallest over both protocols."""
+    if not bench or "local" not in bench:
+        return ""
+    protos = [p for p in bench["local"]["protocols"].values()]
+
+    def ratio(key: str) -> float | None:
+        rs = []
+        for res in protos:
+            ours = (res.get("blackwall") or {}).get(key)
+            theirs = [v[key] for k, v in res.items() if k != "blackwall" and v and v.get(key)]
+            if ours and theirs:
+                rs.append(min(theirs) / ours)
+        return min(rs) if rs else None
+
+    apps = (bench.get("sizes") or {}).get("app_mb") or {}
+    others = [v for k, v in apps.items() if k != "blackwall" and v]
+    items = [
+        ("memory", ratio("idle_mb")),
+        ("peak", ratio("peak_mb")),
+        ("start", ratio("start_ms")),
+        ("size", min(others) / apps["blackwall"] if apps.get("blackwall") and others else None),
+    ]
+    out = []
+    for key, r in items:
+        if not r or r < 1.2:
+            continue
+        num = f"{r:.0f}×" if r >= 10 else f"{r:.1f}×"
+        if lang == "ru":
+            num = num.replace(".", ",")
+        out.append(f'<div><b>{num}</b><span>{html.escape(strings["bench_x_" + key])}</span></div>')
+    return "\n".join(out)
+
+
 def write_sitemap(base: str) -> None:
     def loc(l: str) -> str:
         return base + ("" if l == "en" else l + "/")
@@ -228,6 +269,7 @@ def build(offline: bool = False, releases: dict | None = None) -> dict:
     font_ext = fonts[-1].suffix[1:]  # woff2 when both are there
 
     base = cfg["base_url"].rstrip("/") + "/"
+    bench = bench_data()
     for name, page in PAGES.items():
         template = (SRC / name).read_text()
         for lang in LANGS:
@@ -240,8 +282,10 @@ def build(offline: bool = False, releases: dict | None = None) -> dict:
                 "repo": cfg["repo"],
                 "worker": cfg.get("worker_url", "").rstrip("/"),
                 "releases": releases,
+                "bench": bench,
             }
             ctx = {
+                "bench_hero": bench_hero(bench, strings[lang], lang),
                 "lang": lang,
                 "root": root,
                 "url": base + path,
