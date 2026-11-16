@@ -29,84 +29,98 @@
     "protocols": {
       "reality": {
         "blackwall": {
-          "start_ms": 3.5,
+          "start_ms": 3.3,
           "idle_mb": 1.2,
           "idle_wakeups": 0.5,
-          "mbps": 4578,
-          "cpu_ms_per_gb": 173,
-          "energy_j_per_gb": 0.7,
-          "par_mbps": 13433,
-          "handshake_ms": 2.1,
-          "peak_mb": 5.1
+          "mbps": 4630.0,
+          "cpu_ms_per_gb": 191.0,
+          "energy_j_per_gb": 0.72,
+          "par_mbps": 14819,
+          "handshake_ms": 2.6,
+          "peak_mb": 5.1,
+          "requests": 119,
+          "failed": 0
         },
         "happ": {
-          "start_ms": 10.9,
-          "idle_mb": 11.3,
+          "start_ms": 11.8,
+          "idle_mb": 11.5,
           "idle_wakeups": 0.0,
-          "mbps": 4595,
-          "cpu_ms_per_gb": 223,
-          "energy_j_per_gb": 0.71,
-          "par_mbps": 9006,
-          "handshake_ms": 2.2,
-          "peak_mb": 24.4
+          "mbps": 4635.0,
+          "cpu_ms_per_gb": 246.0,
+          "energy_j_per_gb": 0.77,
+          "par_mbps": 11309,
+          "handshake_ms": 3.0,
+          "peak_mb": 25.4,
+          "requests": 119,
+          "failed": 0
         },
         "xray": {
-          "start_ms": 11.5,
-          "idle_mb": 11.3,
+          "start_ms": 8.5,
+          "idle_mb": 11.4,
           "idle_wakeups": 0.0,
-          "mbps": 4604,
-          "cpu_ms_per_gb": 240,
-          "energy_j_per_gb": 0.73,
-          "par_mbps": 9167,
-          "handshake_ms": 2.2,
-          "peak_mb": 26.0
+          "mbps": 4596.0,
+          "cpu_ms_per_gb": 258.0,
+          "energy_j_per_gb": 0.75,
+          "par_mbps": 13993,
+          "handshake_ms": 2.7,
+          "peak_mb": 26.5,
+          "requests": 119,
+          "failed": 0
         },
         "singbox": null
       },
       "ss2022": {
         "blackwall": {
-          "start_ms": 3.2,
+          "start_ms": 2.7,
           "idle_mb": 1.2,
           "idle_wakeups": 0.5,
-          "mbps": 4601,
-          "cpu_ms_per_gb": 617,
-          "energy_j_per_gb": 3.58,
-          "par_mbps": 15306,
-          "handshake_ms": 1.6,
-          "peak_mb": 5.3
+          "mbps": 4568.0,
+          "cpu_ms_per_gb": 272.0,
+          "energy_j_per_gb": 1.38,
+          "par_mbps": 15366,
+          "handshake_ms": 1.8,
+          "peak_mb": 5.1,
+          "requests": 119,
+          "failed": 0
         },
         "happ": {
-          "start_ms": 9.2,
-          "idle_mb": 11.4,
+          "start_ms": 10.4,
+          "idle_mb": 11.6,
           "idle_wakeups": 0.0,
-          "mbps": 4483,
-          "cpu_ms_per_gb": 496,
-          "energy_j_per_gb": 1.9,
-          "par_mbps": 15101,
-          "handshake_ms": 1.6,
-          "peak_mb": 25.2
+          "mbps": 4478.0,
+          "cpu_ms_per_gb": 522.0,
+          "energy_j_per_gb": 2.07,
+          "par_mbps": 13618,
+          "handshake_ms": 1.8,
+          "peak_mb": 24.6,
+          "requests": 119,
+          "failed": 0
         },
         "xray": {
-          "start_ms": 10.8,
-          "idle_mb": 11.0,
+          "start_ms": 9.8,
+          "idle_mb": 11.1,
           "idle_wakeups": 0.0,
-          "mbps": 4517,
-          "cpu_ms_per_gb": 492,
-          "energy_j_per_gb": 1.84,
-          "par_mbps": 15074,
-          "handshake_ms": 1.5,
-          "peak_mb": 25.1
+          "mbps": 4488.0,
+          "cpu_ms_per_gb": 517.0,
+          "energy_j_per_gb": 2.05,
+          "par_mbps": 14365,
+          "handshake_ms": 1.8,
+          "peak_mb": 25.8,
+          "requests": 119,
+          "failed": 0
         },
         "singbox": {
-          "start_ms": 23.3,
-          "idle_mb": 12.0,
+          "start_ms": 25.3,
+          "idle_mb": 12.4,
           "idle_wakeups": 0.0,
-          "mbps": 4494,
-          "cpu_ms_per_gb": 477,
-          "energy_j_per_gb": 1.83,
-          "par_mbps": 12355,
-          "handshake_ms": 1.6,
-          "peak_mb": 19.2
+          "mbps": 4456.0,
+          "cpu_ms_per_gb": 509.0,
+          "energy_j_per_gb": 1.97,
+          "par_mbps": 13956,
+          "handshake_ms": 1.9,
+          "peak_mb": 19.3,
+          "requests": 119,
+          "failed": 0
         }
       }
     }
@@ -125,7 +139,7 @@
       "hiddify": 155.9
     },
     "download_mb": {
-      "blackwall": 5.5
+      "blackwall": 5.6
     }
   }
 }
