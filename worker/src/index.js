@@ -210,20 +210,30 @@ async function regenerate(r, req, env, ctx) {
       },
     };
   };
-  const number = n => ({ element(e) { e.setInnerContent(nf.format(n)); } });
-  const show = { element(e) { e.removeAttribute('hidden'); } };
+  // the page names the release it was built with (in <head>, so it is read before the body);
+  // an older list, from the cache or the copy kept while GitHub refuses, never replaces it
+  let baked = null;
+  const older = (a, b) => {
+    const x = a.split('.').map(Number), y = b.split('.').map(Number);
+    for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i];
+    return false;
+  };
+  const useRel = () => rel && !(baked && older(rel.version, baked));
+  const number = n => ({ element(e) { if (useRel()) e.setInnerContent(nf.format(n)); } });
+  const show = { element(e) { if (useRel()) e.removeAttribute('hidden'); } };
   let rw = new HTMLRewriter()
     .on('html', { element(e) { try { nf = new Intl.NumberFormat(e.getAttribute('lang') || 'en'); } catch (err) {} } })
-    .on('script#bw', jsonScript(d => { if (rel) d.releases = rel; if (st) d.stats = st; d.fresh = true; }))
+    .on('meta[name="bw-version"]', { element(e) { baked = e.getAttribute('content'); } })
+    .on('script#bw', jsonScript(d => { if (useRel()) d.releases = rel; if (st) d.stats = st; d.fresh = true; }))
     .on('script[type="application/ld+json"]', jsonScript(d => {
-      if (!rel) return;
+      if (!useRel()) return;
       d.softwareVersion = rel.version;
       if (rel.downloads.total > 0) {
         d.interactionStatistic = { '@type': 'InteractionCounter', interactionType: 'https://schema.org/DownloadAction', userInteractionCount: rel.downloads.total };
       }
     }));
   if (rel) {
-    rw = rw.on('[data-ver]', { element(e) { e.setInnerContent('v' + rel.version); } });
+    rw = rw.on('[data-ver]', { element(e) { if (useRel()) e.setInnerContent('v' + rel.version); } });
     if (rel.downloads.total > 0) rw = rw.on('#count', show).on('#count-n', number(rel.downloads.total));
   }
   if (st) {

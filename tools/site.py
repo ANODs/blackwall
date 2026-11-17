@@ -159,6 +159,7 @@ def jsonld(cfg: dict, strings: dict, lang: str, url: str, base: str, releases: d
         "@type": "SoftwareApplication",
         "name": "BLACKWALL",
         "description": strings["description"],
+        "featureList": strings["seo_features"].split(";"),
         "url": url,
         "image": f"{base}assets/icon-512.png",
         "screenshot": f"{base}assets/og-{lang}.png",

@@ -67,8 +67,15 @@ function countUp(el, to) {
   })(t0);
 }
 
+// a release list older than the one the page was built with (a cache) never replaces it
+const older = (a, b) => {
+  const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i];
+  return false;
+};
 function applyReleases(rel) {
   if (!rel || !rel.files || !rel.files[BW.lang]) return;
+  if (BW.releases && BW.releases.version && older(rel.version, BW.releases.version)) return;
   const files = rel.files[BW.lang];
   $$('[data-dl]').forEach(a => { if (files[a.dataset.dl]) a.href = files[a.dataset.dl].url; });
   $$('[data-size]').forEach(el => { el.textContent = mb((files[el.dataset.size] || {}).size, el.dataset.mb); });
