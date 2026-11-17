@@ -20,6 +20,7 @@ import android.system.OsConstants;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.util.ArrayList;
 import java.util.Locale;
 
 /**
@@ -118,10 +119,18 @@ public class Tunnel extends VpnService implements Core.Listener {
                 // be its broadcast address
                 .addAddress("198.18.0.1", 15)
                 .addDnsServer("198.18.0.2")
-                .addRoute("0.0.0.0", 0)
                 .setMetered(false)
                 .setConfigureIntent(open());
         try {
+            if (plan.optBoolean("lan")) {
+                // the router, printers and casting stay reachable, as on a computer
+                for (String r : outsideLan()) {
+                    String[] p = r.split("/");
+                    b.addRoute(p[0], Integer.parseInt(p[1]));
+                }
+            } else {
+                b.addRoute("0.0.0.0", 0);
+            }
             // "block" needs nothing: a family the VPN has no address for is refused
             switch (plan.optString("ipv6")) {
                 case "tunnel":
@@ -169,6 +178,44 @@ public class Tunnel extends VpnService implements Core.Listener {
         } catch (Exception e) {
             gone();
         }
+    }
+
+    /** Local, link-local and multicast IPv4: what stays outside the VPN. */
+    private static final String[] LAN = {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255/32"};
+
+    /**
+     * Every IPv4 prefix outside {@link #LAN}, as few as possible: each half
+     * of a range that overlaps the local ones is split again. Works on every
+     * Android version (Builder.excludeRoute needs 13).
+     */
+    static java.util.List<String> outsideLan() {
+        long[][] lan = new long[LAN.length][2];
+        for (int i = 0; i < LAN.length; i++) {
+            String[] p = LAN[i].split("/");
+            String[] o = p[0].split("\\.");
+            long a = (Long.parseLong(o[0]) << 24) | (Long.parseLong(o[1]) << 16) | (Long.parseLong(o[2]) << 8) | Long.parseLong(o[3]);
+            int len = Integer.parseInt(p[1]);
+            lan[i][0] = a;
+            lan[i][1] = a + (1L << (32 - len)) - 1;
+        }
+        java.util.List<String> out = new ArrayList<>();
+        split(0, 0, lan, out);
+        return out;
+    }
+
+    private static void split(long start, int len, long[][] lan, java.util.List<String> out) {
+        long end = start + (1L << (32 - len)) - 1;
+        boolean overlaps = false;
+        for (long[] r : lan) {
+            if (r[0] <= start && end <= r[1]) return; // wholly local
+            if (r[0] <= end && start <= r[1]) overlaps = true;
+        }
+        if (!overlaps) {
+            out.add(((start >> 24) & 255) + "." + ((start >> 16) & 255) + "." + ((start >> 8) & 255) + "." + (start & 255) + "/" + len);
+            return;
+        }
+        split(start, len + 1, lan, out);
+        split(start + (1L << (31 - len)), len + 1, lan, out);
     }
 
     /** Another VPN took over, or the user switched this one off in the system. */

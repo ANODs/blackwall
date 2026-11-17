@@ -218,7 +218,9 @@ final class Core {
         boolean carrying = o.optBoolean("up") && !o.optBoolean("standby");
         long down = o.optLong("down"), up = o.optLong("sent");
         if (carrying && upSince != 0 && now > lastAt && down >= lastDown) {
-            double dt = (now - lastAt) / 1000.0;
+            // after a quiet spell (no status while nothing moved) the bytes
+            // are from the last second only
+            double dt = Math.min((now - lastAt) / 1000.0, 1.0);
             rateDown = (down - lastDown) / dt;
             rateUp = (up - lastUp) / dt;
         } else {

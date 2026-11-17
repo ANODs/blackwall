@@ -164,6 +164,9 @@ pub const Session = struct {
     probing: bool = false,
     ticker: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    /// the window is on screen and shows the time connected: a status every
+    /// second; otherwise only when something changed
+    watching: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: std.mem.Allocator, io: Io, fd: c.fd_t) Session {
         return .{ .gpa = gpa, .io = io, .fd = fd, .state = .init(gpa) };
@@ -260,6 +263,8 @@ pub const Session = struct {
             s.sendState();
         } else if (is(m.cmd, "state")) {
             s.sendState();
+        } else if (is(m.cmd, "watch")) {
+            s.watching.store(m.on, .release);
         } else if (is(m.cmd, "net")) {
             s.setUpstream(m.dns);
         } else if (is(m.cmd, "add")) {
@@ -552,7 +557,7 @@ pub const Session = struct {
         const mtu: u16 = if (st.mtu >= 1280) st.mtu else 1500;
 
         var h = std.hash.Wyhash.init(0);
-        h.update(&.{ @intFromBool(need), @intFromBool(narrow), @intFromEnum(st.ipv6) });
+        h.update(&.{ @intFromBool(need), @intFromBool(narrow), @intFromEnum(st.ipv6), @intFromBool(st.allow_lan) });
         h.update(std.mem.asBytes(&mtu));
         for (only.items) |p| {
             h.update(p);
@@ -574,6 +579,8 @@ pub const Session = struct {
             .except = except.items,
             .ipv6 = @tagName(st.ipv6),
             .mtu = mtu,
+            // the local network stays outside the VPN, as on a computer
+            .lan = st.allow_lan,
         });
         return true;
     }
@@ -673,7 +680,15 @@ pub const Session = struct {
         s.built = b;
     }
 
+    /// What a status says, to tell whether there is anything new to say.
+    const Seen = struct { down: u64 = 0, sent: u64 = 0, active: u32 = 0, server: u32 = 0, switches: u32 = 0, standby: bool = false };
+
+    /// A status a second while something moves or the window watches; one
+    /// more when it stops (the speed falls to zero); then silence, so an
+    /// idle VPN costs the phone nothing but this thread's sleep.
     fn tick(s: *Session) void {
+        var last: Seen = .{};
+        var quiet = true;
         while (!s.stopping.load(.acquire)) {
             s.io.sleep(.fromMilliseconds(1000), .awake) catch {};
             s.mutex.lockUncancelable(s.io);
@@ -681,17 +696,29 @@ pub const Session = struct {
             const t = s.t orelse continue;
             const b = s.built orelse continue;
             const i = t.mainInUse();
-            s.emit(.{
-                .ev = "status",
-                .up = true,
-                .standby = s.state.settings.standby,
+            const now: Seen = .{
                 .down = t.meter.down.load(.monotonic),
                 .sent = t.meter.up.load(.monotonic),
                 .active = t.meter.active.load(.monotonic),
                 .server = if (i < b.cfg.main.len) b.ids[b.cfg.main[i]] else 0,
                 .switches = t.mainSwitches(),
-                .fault = @tagName(t.meter.fault.swap(.none, .monotonic)),
+                .standby = s.state.settings.standby,
+            };
+            const fault = t.meter.fault.swap(.none, .monotonic);
+            const moved = !std.meta.eql(now, last) or fault != .none;
+            if (moved or !quiet or s.watching.load(.acquire)) s.emit(.{
+                .ev = "status",
+                .up = true,
+                .standby = now.standby,
+                .down = now.down,
+                .sent = now.sent,
+                .active = now.active,
+                .server = now.server,
+                .switches = now.switches,
+                .fault = @tagName(fault),
             });
+            quiet = !moved;
+            last = now;
         }
     }
 

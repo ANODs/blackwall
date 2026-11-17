@@ -7,7 +7,10 @@
 // HTTPS so that VLESS + REALITY + Vision runs the way it does on real sites: the inner
 // TLS is what Vision's direct mode is for. HTTP/1.1 only, no logging.
 //
-//	go run tools/bench/target.go <port> <out-dir-for-cert>
+//	go run tools/bench/target.go <port> <out-dir-for-cert> [<plain-http-port>]
+//
+// The plain HTTP port serves the same paths without TLS, for the Android probe
+// (tools/bench/probe.zig), which reaches the site by IP through the client under test.
 package main
 
 import (
@@ -85,6 +88,10 @@ func main() {
 		TLSConfig:    &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
 		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 		ErrorLog:     log.New(os.Stderr, "", 0),
+	}
+	if len(os.Args) > 3 {
+		plain := &http.Server{Addr: "127.0.0.1:" + os.Args[3], Handler: h, ErrorLog: log.New(os.Stderr, "", 0)}
+		go func() { log.Fatal(plain.ListenAndServe()) }()
 	}
 	log.Fatal(srv.ListenAndServeTLS("", ""))
 }

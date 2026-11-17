@@ -141,5 +141,70 @@
     "download_mb": {
       "blackwall": 5.6
     }
+  },
+  "android": {
+    "date": "2026-11-17",
+    "device": "Android 16 emulator (arm64), on Apple M4 Pro, macOS 26.6.2",
+    "protocol": "Shadowsocks 2022",
+    "clients": {
+      "dev.blackwall": {
+        "name": "BLACKWALL",
+        "version": "0.2.2",
+        "idle_pss_mb": 17.3,
+        "peak_rss_mb": 124.7,
+        "idle_cpu_ms_s": 0.83,
+        "mbps": 457,
+        "par_mbps": 749,
+        "cpu_ms_per_gb": 12803,
+        "handshake_ms": 1.7,
+        "apk_mb": 3.0,
+        "installed_mb": 3.1
+      },
+      "dev.blackwall.next": {
+        "name": "BLACKWALL (next)",
+        "version": "0.2.2 + quiet status, LAN outside the VPN",
+        "idle_pss_mb": 23.2,
+        "peak_rss_mb": 125.8,
+        "idle_cpu_ms_s": 0.17,
+        "mbps": 443,
+        "par_mbps": 734,
+        "cpu_ms_per_gb": 13175,
+        "handshake_ms": 1.8,
+        "apk_mb": 3.0,
+        "installed_mb": 3.1
+      },
+      "moe.nb4a": {
+        "name": "NekoBox",
+        "version": "1.4.2",
+        "idle_pss_mb": 96.2,
+        "peak_rss_mb": 374.6,
+        "idle_cpu_ms_s": 0.5,
+        "mbps": 399,
+        "par_mbps": 1088,
+        "cpu_ms_per_gb": 12629,
+        "handshake_ms": 1.8,
+        "apk_mb": 14.5,
+        "installed_mb": 44.1
+      },
+      "app.hiddify.com": {
+        "name": "Hiddify",
+        "version": "5.5.5",
+        "idle_pss_mb": 181.5,
+        "peak_rss_mb": 526.4,
+        "idle_cpu_ms_s": 9.17,
+        "mbps": 247,
+        "par_mbps": 822,
+        "cpu_ms_per_gb": 27766,
+        "handshake_ms": 2.0,
+        "apk_mb": 61.0,
+        "installed_mb": 222.2
+      }
+    },
+    "baseline": {
+      "direct_mbps": 660,
+      "direct_par_mbps": 1415,
+      "note": "the emulator's own network, no VPN"
+    },
+    "note": "sing-box (NekoBox, Hiddify) sets MTU 9000 on its tun; BLACKWALL 1500"
   }
 }

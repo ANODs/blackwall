@@ -120,11 +120,14 @@ public class Main extends Activity implements Core.Listener {
         super.onStart();
         core.listen(this);
         core.send("state");
+        // the time connected ticks on screen; hidden, the core goes quiet
+        core.send("watch", "on", true);
         refresh();
     }
 
     @Override
     protected void onStop() {
+        core.send("watch", "on", false);
         core.unlisten(this);
         super.onStop();
     }
