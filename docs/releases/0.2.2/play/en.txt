@@ -1,0 +1,1 @@
+Fixes for the desktop apps, and the report for bug reports in Settings: the recent log saved to Downloads without links, keys or the addresses of servers and sites.

@@ -90,10 +90,10 @@ jobs:
       matrix:
         lang: [en, ru, zh]
         platform:
-          # macOS builds for the machine it runs on: an explicit target makes Zig treat the
-          # build as a cross build, and then the SDK's own libraries (libobjc) are not found.
-          # The CPU is fixed to the oldest Apple Silicon instead.
-          - { name: macos, runner: macos-latest, target: -Dcpu=apple_m1 }
+          # macOS: an explicit oldest system and CPU. Built for the runner's own macOS, the
+          # app would ask for that version (26.7 in November 2026) and refuse to start on
+          # anything older; build.zig points the linker at the SDK's libobjc for this.
+          - { name: macos, runner: macos-latest, target: -Dtarget=aarch64-macos.13.0 -Dcpu=apple_m1 }
           - { name: windows, runner: ubuntu-latest, target: -Dtarget=x86_64-windows }
           - { name: linux, runner: ubuntu-latest, target: -Dtarget=x86_64-linux-gnu }
     runs-on: ${{ matrix.platform.runner }}

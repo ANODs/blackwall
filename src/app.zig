@@ -1329,8 +1329,11 @@ fn installStaged(v: std.SemanticVersion) void {
         setReconnectMark();
     }
     inst.relaunch(gpa, io) catch |err| {
-        // the new version is in place and takes over at the next start
-        std.log.err("update: relaunch failed: {t}", .{err});
+        // a copy that does not start now would not start at the next login
+        // either, and could not roll itself back: put this one back
+        std.log.err("update: {s} does not start ({t}); keeping this version", .{ version, err });
+        inst.undo(io, version) catch |e| std.log.err("update: previous version not put back: {t}", .{e});
+        updateFailed(v);
         if (was_on) {
             _ = takeReconnectMark();
             engine.disconnect();

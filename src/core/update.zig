@@ -399,22 +399,7 @@ pub const Install = struct {
                 return .verifying;
             },
             .launched => {
-                dir.access(io, names.previous, .{}) catch {
-                    // nothing to go back to
-                    dir.deleteFile(io, names.marker) catch {};
-                    return .{ .normal = null };
-                };
-                try dir.deleteTree(io, names.failed);
-                try dir.rename(inst.name, dir, names.failed, io);
-                dir.rename(names.previous, dir, inst.name, io) catch |err| {
-                    // never leave the user without an app at its usual place
-                    dir.rename(names.failed, dir, inst.name, io) catch {};
-                    return err;
-                };
-                restoreCompanions(dir, io);
-                try writeMarker(dir, io, &names, .rejected, m.version);
-                // a running Windows executable cannot be deleted; the next start does it
-                dir.deleteTree(io, names.failed) catch {};
+                if (!try inst.putBack(dir, io, &names, m.version)) return .{ .normal = null };
                 return .rolled_back;
             },
             .rejected => {
@@ -422,6 +407,38 @@ pub const Install = struct {
                 return .{ .normal = parseVersion(m.version) };
             },
         }
+    }
+
+    /// The fresh copy aside, the previous one back at its place, and its
+    /// version marked so it is not installed again. False when there was
+    /// no previous copy to go back to.
+    fn putBack(inst: Install, dir: Io.Dir, io: Io, names: *const Names, version: []const u8) !bool {
+        dir.access(io, names.previous, .{}) catch {
+            dir.deleteFile(io, names.marker) catch {};
+            return false;
+        };
+        try dir.deleteTree(io, names.failed);
+        try dir.rename(inst.name, dir, names.failed, io);
+        dir.rename(names.previous, dir, inst.name, io) catch |err| {
+            // never leave the user without an app at its usual place
+            dir.rename(names.failed, dir, inst.name, io) catch {};
+            return err;
+        };
+        restoreCompanions(dir, io);
+        try writeMarker(dir, io, names, .rejected, version);
+        // a running Windows executable cannot be deleted; the next start does it
+        dir.deleteTree(io, names.failed) catch {};
+        return true;
+    }
+
+    /// The swapped-in copy could not even be started: put the running one
+    /// back now, while it still runs (otherwise nothing would start at all).
+    pub fn undo(inst: Install, io: Io, version: []const u8) !void {
+        var names: Names = .{};
+        try names.init(inst.name);
+        var dir = try inst.openParent(io);
+        defer dir.close(io);
+        _ = try inst.putBack(dir, io, &names, version);
     }
 
     /// The fresh version started fine: drop the old copy.
@@ -552,6 +569,74 @@ fn checkStaged(gpa: std.mem.Allocator, io: Io, staging: Io.Dir, package: Package
     const bin = try staging.readFileAlloc(io, exe_path, gpa, .limited(max_asset_bytes));
     defer gpa.free(bin);
     if (!hasStamp(bin, version)) return error.VersionMismatch;
+    // macOS refuses to start an app built for a newer system than its own
+    if (package == .app_zip) if (machoMinOs(bin)) |need| if (systemVersion()) |have| {
+        if (need.order(have) == .gt) return error.NeedsNewerSystem;
+    };
+}
+
+/// The oldest macOS a Mach-O executable starts on (LC_BUILD_VERSION, or
+/// LC_VERSION_MIN_MACOSX in older files); null when it says nothing.
+pub fn machoMinOs(bin: []const u8) ?SemanticVersion {
+    if (bin.len < 32 or std.mem.readInt(u32, bin[0..4], .little) != 0xfeedfacf) return null;
+    const ncmds = std.mem.readInt(u32, bin[16..20], .little);
+    var at: usize = 32;
+    for (0..ncmds) |_| {
+        if (at + 16 > bin.len) return null;
+        const cmd = std.mem.readInt(u32, bin[at..][0..4], .little);
+        const size = std.mem.readInt(u32, bin[at + 4 ..][0..4], .little);
+        const packed_version: ?u32 = switch (cmd) {
+            0x32 => std.mem.readInt(u32, bin[at + 12 ..][0..4], .little),
+            0x24 => std.mem.readInt(u32, bin[at + 8 ..][0..4], .little),
+            else => null,
+        };
+        if (packed_version) |v| return .{ .major = v >> 16, .minor = (v >> 8) & 0xff, .patch = v & 0xff };
+        if (size < 8) return null;
+        at += size;
+    }
+    return null;
+}
+
+/// This Mac's macOS version; null elsewhere or when it cannot be read.
+fn systemVersion() ?SemanticVersion {
+    if (comptime builtin.os.tag != .macos) return null;
+    var buf: [32]u8 = undefined;
+    var len: usize = buf.len;
+    if (std.c.sysctlbyname("kern.osproductversion", &buf, &len, null, 0) != 0) return null;
+    return parseLooseVersion(std.mem.sliceTo(buf[0..len], 0));
+}
+
+/// "26.6.2" or "26.6"
+fn parseLooseVersion(text: []const u8) ?SemanticVersion {
+    var it = std.mem.splitScalar(u8, text, '.');
+    var parts: [3]usize = .{ 0, 0, 0 };
+    var n: usize = 0;
+    while (it.next()) |p| : (n += 1) {
+        if (n == 3) return null;
+        parts[n] = std.fmt.parseInt(usize, p, 10) catch return null;
+    }
+    if (n < 2) return null;
+    return .{ .major = parts[0], .minor = parts[1], .patch = parts[2] };
+}
+
+test "the oldest macOS an executable asks for" {
+    var bin: [32 + 24 + 32]u8 = @splat(0);
+    std.mem.writeInt(u32, bin[0..4], 0xfeedfacf, .little);
+    std.mem.writeInt(u32, bin[16..20], 2, .little);
+    // LC_UUID first, then LC_BUILD_VERSION platform macOS, minos 26.7.2, sdk 26.5
+    std.mem.writeInt(u32, bin[32..36], 0x1b, .little);
+    std.mem.writeInt(u32, bin[36..40], 24, .little);
+    std.mem.writeInt(u32, bin[56..60], 0x32, .little);
+    std.mem.writeInt(u32, bin[60..64], 32, .little);
+    std.mem.writeInt(u32, bin[64..68], 1, .little);
+    std.mem.writeInt(u32, bin[68..72], (26 << 16) | (7 << 8) | 2, .little);
+    std.mem.writeInt(u32, bin[72..76], (26 << 16) | (5 << 8), .little);
+    const v = machoMinOs(&bin).?;
+    try testing.expectEqual(.gt, v.order(parseLooseVersion("26.6.2").?));
+    try testing.expectEqual(.eq, v.order(parseLooseVersion("26.7.2").?));
+    try testing.expectEqual(.lt, parseLooseVersion("13.0").?.order(parseLooseVersion("26.6").?));
+    try testing.expect(machoMinOs("not a mach-o file at all, really....") == null);
+    try testing.expect(parseLooseVersion("26") == null);
 }
 
 fn runTool(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) !void {

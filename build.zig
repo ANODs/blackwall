@@ -85,6 +85,13 @@ pub fn build(b: *std.Build) void {
     if (lang == .zh) exe.root_module.addAnonymousImport("font_cjk", .{ .root_source_file = b.path("assets/fonts/NotoSansSC-Regular.ttf") });
     if (update_repo.len > 0 and update_pubkey.len == 0)
         exe.step.dependOn(&b.addFail("-Dupdate-repo needs -Dupdate-pubkey (see docs/updates.md)").step);
+    // A macOS target with an explicit OS version (releases: -Dtarget=aarch64-macos.13.0,
+    // so they start on Macs older than the build machine) is a cross build for Zig. DVUI
+    // still finds the SDK's frameworks, but libobjc, which they depend on, is then looked
+    // for outside the SDK.
+    if (os == .macos and !target.query.isNativeOs())
+        if (std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result)) |sdk|
+            exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

@@ -103,7 +103,7 @@ release is a single file of 3 to 14 MB.
 
 ## Platform support
 
-| | macOS (Apple Silicon) | Android 10+ | Linux (x64) | Windows (x64) |
+| | macOS 13+ (Apple Silicon) | Android 10+ | Linux (x64) | Windows (x64) |
 |---|---|---|---|---|
 | Capture all traffic (TUN) | Yes | Yes | Yes | Yes (Wintun) |
 | Routes per application | Yes | Yes | Yes | Yes |
@@ -153,7 +153,7 @@ comes in three languages; pick the one you read.
 
 | System | File |
 |---|---|
-| macOS (Apple Silicon) | `BLACKWALL-<version>-<lang>-macos-arm64.zip` |
+| macOS 13+ (Apple Silicon) | `BLACKWALL-<version>-<lang>-macos-arm64.zip` |
 | Windows (x64) | `BLACKWALL-<version>-<lang>-windows-x86_64.exe` |
 | Linux (x64) | `BLACKWALL-<version>-<lang>-linux-x86_64.tar.gz` |
 | Android 10+ (arm64, x86_64) | `BLACKWALL-<version>-android.apk` (every language in one file) |
