@@ -69,6 +69,11 @@ release is a single file of 3 to 14 MB.
 **Servers**
 
 - Subscriptions by link, or keys pasted one by one. Several subscriptions at once.
+- A provider's "Auto" (an Xray balancer in a JSON subscription, as Remnawave, Marzban and
+  3x-ui serve it) is one entry: its servers measured one by one, the fastest in use, the
+  others its reserve. Names are kept across refreshes, so the choice survives a changed
+  list, and a refresh never drops the connection. The provider's title, refresh period
+  (`profile-update-interval`), announcement and support link are read from the headers.
 - A QR code instead of typing: from the camera or a picture on Android, from the clipboard
   or the screen on a computer, read by a decoder in this repository.
 - Latency for every server; "Fastest" picks one for you.

@@ -1,0 +1,1 @@
+A provider's "Auto" is one entry with all its servers: the fastest carries the traffic, the others take over. Refreshes never drop the connection; the provider's title, refresh period and support link are read.

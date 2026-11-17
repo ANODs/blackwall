@@ -118,7 +118,7 @@ fn serverPill() void {
         var hb = dvui.box(@src(), .{ .dir = .horizontal }, .{});
         defer hb.deinit();
         if (app.shownServer()) |sv| {
-            w.countryTag(@src(), sv.country, .{});
+            w.serverTag(@src(), sv, .{});
             w.gap(@src(), 10, 0);
             w.text(@src(), sv.name, th.medium(14), th.text, .{});
             if (sv.ping_ms) |ms| {

@@ -255,16 +255,26 @@ final class Core {
 
     private static final int BODY_MAX = 4 << 20;
 
-    /** A subscription's body, through the system's HTTP stack and trust store. */
+    /**
+     * A subscription's body, through the system's HTTP stack and trust store,
+     * with what the provider says in its headers (title, refresh period,
+     * announcement, support link). Providers pick the format by the
+     * User-Agent: Xray JSON, with their "Auto" groups, for the clients they know.
+     */
     private void fetch(JSONObject o) {
         String text = null;
+        String title = null, interval = null, announce = null, support = null;
         HttpURLConnection c = null;
         try {
             c = (HttpURLConnection) new URL(o.getString("url")).openConnection();
             c.setConnectTimeout(15000);
             c.setReadTimeout(20000);
-            c.setRequestProperty("User-Agent", "blackwall/" + version(app));
+            c.setRequestProperty("User-Agent", "BLACKWALL/" + version(app));
             if (c.getResponseCode() == 200) {
+                title = c.getHeaderField("profile-title");
+                interval = c.getHeaderField("profile-update-interval");
+                announce = c.getHeaderField("announce");
+                support = c.getHeaderField("support-url");
                 try (InputStream in = c.getInputStream()) {
                     ByteArrayOutputStream body = new ByteArrayOutputStream();
                     byte[] buf = new byte[16384];
@@ -278,7 +288,7 @@ final class Core {
         } finally {
             if (c != null) c.disconnect();
         }
-        if (text != null) send("body", "id", o.optInt("id"), "text", text);
+        if (text != null) send("body", "id", o.optInt("id"), "text", text, "title", title, "interval", interval, "announce", announce, "support", support);
         else send("body", "id", o.optInt("id"));
     }
 

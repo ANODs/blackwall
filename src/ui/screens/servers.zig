@@ -156,11 +156,14 @@ fn serverRow(sv: *model.Server, i: usize) void {
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer row.deinit();
-        w.countryTag(@src(), sv.country, .{});
+        w.serverTag(@src(), sv, .{});
         w.gap(@src(), 12, 0);
         w.text(@src(), sv.name, th.medium(13.5), if (sv.available) th.text else th.text3, .{});
         w.gap(@src(), 10, 0);
-        w.text(@src(), sv.protocol.label(), th.mono(10.5), th.text3, .{ .expand = .horizontal });
+        // a group: how many servers it chooses among
+        var label_buf: [8]u8 = undefined;
+        const label = if (sv.isGroup()) std.fmt.bufPrint(&label_buf, "×{d}", .{sv.members.len}) catch "" else sv.protocol.label();
+        w.text(@src(), label, th.mono(10.5), th.text3, .{ .expand = .horizontal });
 
         if (!sv.available) {
             w.icon(@src(), .block, 13, th.text3, .{});

@@ -44,12 +44,31 @@ pub const Server = struct {
     available: bool = true,
     /// Raw link as received. Treated as a secret: never logged or exported.
     link: []const u8 = "",
+    /// A group from the subscription ("⚡ Auto 3": a balancer of several
+    /// servers). Shown and chosen as one server; connected through the
+    /// reserve logic, best member first. Empty for a plain server. `link`,
+    /// `host` and `port` are then those of the first member.
+    members: []Member = &.{},
 
     // runtime, not persisted
+    /// a group's is its best member's
     ping_ms: ?u16 = null,
     ping_state: enum { unknown, testing, ok, failed } = .unknown,
     /// this build can carry its protocol and transport (set by the app)
     carried: bool = true,
+
+    pub fn isGroup(sv: *const Server) bool {
+        return sv.members.len > 0;
+    }
+};
+
+/// One server of a group. The link is a secret, as a server's.
+pub const Member = struct {
+    link: []const u8,
+    host: []const u8,
+    port: u16,
+    // runtime
+    ping_ms: ?u16 = null,
 };
 
 pub const Subscription = struct {
@@ -63,6 +82,13 @@ pub const Subscription = struct {
     total_bytes: ?u64 = null,
     expire_unix: ?i64 = null,
     last_error: bool = false,
+    /// From the provider's headers: refresh every this many hours (0: only
+    /// when asked), a note for the Settings, where to get help.
+    update_hours: u16 = 0,
+    announce: []const u8 = "",
+    support_url: []const u8 = "",
+    // runtime: the last automatic refresh attempt, so a failing one waits
+    tried_unix: i64 = 0,
 };
 
 /// Where the traffic of an application goes.
@@ -167,6 +193,15 @@ pub const Settings = struct {
     standby: bool = false,
 };
 
+/// What a provider says about its subscription in the answer's headers
+/// (decoded already); null where it said nothing.
+pub const SubMeta = struct {
+    title: ?[]const u8 = null,
+    update_hours: ?u16 = null,
+    announce: ?[]const u8 = null,
+    support_url: ?[]const u8 = null,
+};
+
 pub const State = struct {
     gpa: std.mem.Allocator,
     servers: std.ArrayList(Server) = .empty,
@@ -186,10 +221,7 @@ pub const State = struct {
     pub fn deinit(s: *State) void {
         for (s.servers.items) |sv| s.freeServer(sv);
         s.servers.deinit(s.gpa);
-        for (s.subs.items) |sub| {
-            s.gpa.free(sub.name);
-            s.gpa.free(sub.url);
-        }
+        for (s.subs.items) |sub| s.freeSub(sub);
         s.subs.deinit(s.gpa);
         for (s.apps.items) |a| s.freeApp(a);
         s.apps.deinit(s.gpa);
@@ -221,6 +253,44 @@ pub const State = struct {
         s.gpa.free(sv.name);
         s.gpa.free(sv.host);
         s.gpa.free(sv.link);
+        s.freeMembers(sv.members);
+    }
+
+    fn freeMembers(s: *State, members: []Member) void {
+        for (members) |m| {
+            s.gpa.free(m.link);
+            s.gpa.free(m.host);
+        }
+        s.gpa.free(members);
+    }
+
+    fn freeSub(s: *State, sub: Subscription) void {
+        s.gpa.free(sub.name);
+        s.gpa.free(sub.url);
+        s.gpa.free(sub.announce);
+        s.gpa.free(sub.support_url);
+    }
+
+    fn dupeMembers(s: *State, from: []const NewMember) ![]Member {
+        const out = try s.gpa.alloc(Member, from.len);
+        var n: usize = 0;
+        errdefer {
+            for (out[0..n]) |m| {
+                s.gpa.free(m.link);
+                s.gpa.free(m.host);
+            }
+            s.gpa.free(out);
+        }
+        for (from) |m| {
+            const link = try s.gpa.dupe(u8, m.link);
+            const host = s.gpa.dupe(u8, m.host) catch |err| {
+                s.gpa.free(link);
+                return err;
+            };
+            out[n] = .{ .link = link, .host = host, .port = m.port };
+            n += 1;
+        }
+        return out;
     }
 
     fn freeApp(s: *State, a: App) void {
@@ -264,8 +334,10 @@ pub const State = struct {
     /// The server the default route currently resolves to.
     pub fn currentServer(s: *State) ?*Server {
         if (s.settings.selected_server) |id| {
-            // a server this build cannot carry is no choice at all
-            if (s.serverById(id)) |sv| if (sv.available and sv.carried) return sv;
+            // a server this build cannot carry is no choice at all; one
+            // that left its subscription stays until Disconnect (see
+            // `dropVanishedChoice`)
+            if (s.serverById(id)) |sv| if (sv.carried) return sv;
         }
         if (s.fastest()) |sv| return sv;
         for (s.servers.items) |*sv| if (sv.available and sv.carried) return sv;
@@ -312,6 +384,12 @@ pub const State = struct {
         return &s.subs.items[s.subs.items.len - 1];
     }
 
+    pub const NewMember = struct {
+        link: []const u8,
+        host: []const u8,
+        port: u16,
+    };
+
     pub const NewServer = struct {
         name: []const u8,
         host: []const u8,
@@ -320,9 +398,13 @@ pub const State = struct {
         security: Security = .none,
         country: [2]u8 = "??".*,
         link: []const u8 = "",
+        /// a group: its servers, the first one's also in the fields above
+        members: []const NewMember = &.{},
     };
 
     pub fn addServer(s: *State, sub_id: u32, n: NewServer) !*Server {
+        const members = try s.dupeMembers(n.members);
+        errdefer s.freeMembers(members);
         try s.servers.append(s.gpa, .{
             .id = s.newId(),
             .sub_id = sub_id,
@@ -333,37 +415,71 @@ pub const State = struct {
             .security = n.security,
             .country = n.country,
             .link = try s.gpa.dupe(u8, n.link),
+            .members = members,
         });
         return &s.servers.items[s.servers.items.len - 1];
     }
 
     /// Replace the server list of a subscription with a freshly validated one.
-    /// Servers are matched by host:port:protocol so ids, favorites and the
-    /// rules pointing at them survive. Servers that vanished stay in the list
-    /// marked unavailable while something still references them.
+    /// A server keeps its id, star and the rules pointing at it when the
+    /// same one comes again: the same name at the same address, else the
+    /// same name alone (providers that keep names stable, as groups whose
+    /// servers change, are followed by name). Servers that vanished stay in
+    /// the list, marked unavailable, while something still references them.
     pub fn applySubscription(s: *State, sub_id: u32, fresh: []const NewServer) !void {
         for (s.servers.items) |*sv| {
             if (sv.sub_id == sub_id) sv.available = false;
         }
-        for (fresh) |n| {
-            var found: ?*Server = null;
+        // matched in two rounds, so that an exact match is never taken by a
+        // namesake first
+        const matched = try s.gpa.alloc(?u32, fresh.len);
+        defer s.gpa.free(matched);
+        for (fresh, matched) |n, *m| {
+            m.* = null;
             for (s.servers.items) |*sv| {
-                if (sv.sub_id == sub_id and sv.port == n.port and sv.protocol == n.protocol and
+                if (sv.sub_id == sub_id and !sv.available and sv.port == n.port and sv.protocol == n.protocol and
                     std.mem.eql(u8, sv.host, n.host) and std.mem.eql(u8, sv.name, n.name))
                 {
-                    found = sv;
+                    sv.available = true;
+                    m.* = sv.id;
                     break;
                 }
             }
-            if (found) |sv| {
-                sv.available = true;
-                s.gpa.free(sv.link);
-                sv.link = try s.gpa.dupe(u8, n.link);
-                sv.security = n.security;
-                sv.country = n.country;
-            } else {
-                _ = try s.addServer(sub_id, n);
+        }
+        for (fresh, matched) |n, *m| {
+            if (m.* != null) continue;
+            for (s.servers.items) |*sv| {
+                if (sv.sub_id == sub_id and !sv.available and std.mem.eql(u8, sv.name, n.name)) {
+                    sv.available = true;
+                    m.* = sv.id;
+                    break;
+                }
             }
+        }
+        for (fresh, matched) |n, m| {
+            const sv = if (m) |id| s.serverById(id).? else {
+                _ = try s.addServer(sub_id, n);
+                continue;
+            };
+            const link = try s.gpa.dupe(u8, n.link);
+            errdefer s.gpa.free(link);
+            const host = try s.gpa.dupe(u8, n.host);
+            errdefer s.gpa.free(host);
+            const members = try s.dupeMembers(n.members);
+            // the member pings stay with their servers until measured again
+            for (members) |*nm| for (sv.members) |old| {
+                if (std.mem.eql(u8, old.link, nm.link)) nm.ping_ms = old.ping_ms;
+            };
+            s.gpa.free(sv.link);
+            s.gpa.free(sv.host);
+            s.freeMembers(sv.members);
+            sv.link = link;
+            sv.host = host;
+            sv.members = members;
+            sv.port = n.port;
+            sv.protocol = n.protocol;
+            sv.security = n.security;
+            sv.country = n.country;
         }
         // drop vanished servers nobody refers to
         var i: usize = 0;
@@ -378,6 +494,7 @@ pub const State = struct {
 
     pub fn isReferenced(s: *State, server_id: u32) bool {
         if (s.settings.selected_server == server_id) return true;
+        if (s.settings.auto_server == server_id) return true;
         for (s.servers.items) |sv| if (sv.id == server_id and sv.favorite) return true;
         for (s.apps.items) |a| if (a.route == .server and a.route.server == server_id) return true;
         for (s.domains.items) |d| if (d.route == .server and d.route.server == server_id) return true;
@@ -402,12 +519,116 @@ pub const State = struct {
         }
         for (s.subs.items, 0..) |sub, idx| {
             if (sub.id == sub_id) {
-                s.gpa.free(sub.name);
-                s.gpa.free(sub.url);
+                s.freeSub(sub);
                 _ = s.subs.orderedRemove(idx);
                 break;
             }
         }
+    }
+
+    /// After Disconnect: a chosen server that left its subscription meanwhile
+    /// is given up (the next connection takes the fastest), and the servers
+    /// nobody refers to any more go. True when something changed.
+    pub fn dropVanishedChoice(s: *State) bool {
+        var changed = false;
+        if (s.settings.selected_server) |id| if (s.serverById(id)) |sv| if (!sv.available) {
+            s.settings.selected_server = null;
+            changed = true;
+        };
+        if (s.settings.auto_server) |id| if (s.serverById(id)) |sv| if (!sv.available) {
+            s.settings.auto_server = null;
+            changed = true;
+        };
+        var i: usize = 0;
+        while (i < s.servers.items.len) {
+            const sv = s.servers.items[i];
+            if (sv.sub_id != 0 and !sv.available and !s.isReferenced(sv.id)) {
+                s.freeServer(sv);
+                _ = s.servers.orderedRemove(i);
+                changed = true;
+            } else i += 1;
+        }
+        return changed;
+    }
+
+    /// What the provider said about the subscription in its headers.
+    pub fn applyMeta(s: *State, sub_id: u32, meta: SubMeta) !void {
+        const sub = s.subById(sub_id) orelse return;
+        if (meta.title) |t| if (t.len > 0) {
+            const name = try s.gpa.dupe(u8, t);
+            s.gpa.free(sub.name);
+            sub.name = name;
+        };
+        if (meta.update_hours) |h| sub.update_hours = h;
+        if (meta.announce) |t| {
+            const text = try s.gpa.dupe(u8, t);
+            s.gpa.free(sub.announce);
+            sub.announce = text;
+        }
+        if (meta.support_url) |t| {
+            const text = try s.gpa.dupe(u8, t);
+            s.gpa.free(sub.support_url);
+            sub.support_url = text;
+        }
+    }
+
+    /// A subscription due for its provider's periodic refresh, at `now`
+    /// (seconds); it is marked tried. Null when none is.
+    pub fn dueForRefresh(s: *State, now: i64) ?*Subscription {
+        for (s.subs.items) |*sub| {
+            if (sub.url.len == 0 or sub.update_hours == 0) continue;
+            const every: i64 = @as(i64, sub.update_hours) * 3600;
+            if (now - sub.updated_unix < every) continue;
+            // a failing provider is asked again after a quarter of the period
+            if (now - sub.tried_unix < @max(@divTrunc(every, 4), 300)) continue;
+            sub.tried_unix = now;
+            return sub;
+        }
+        return null;
+    }
+
+    /// One connection-time measurement to make: a server, or a group member.
+    pub const ProbeTarget = struct { id: u32, member: ?u8, host: []u8, port: u16 };
+
+    /// Everything to measure now, marked as being measured; the caller owns
+    /// the hosts and the list.
+    pub fn probeTargets(s: *State, gpa: std.mem.Allocator) ![]ProbeTarget {
+        var list: std.ArrayList(ProbeTarget) = .empty;
+        errdefer {
+            for (list.items) |t| gpa.free(t.host);
+            list.deinit(gpa);
+        }
+        for (s.servers.items) |*sv| {
+            if (!sv.available or sv.host.len == 0) continue;
+            sv.ping_state = .testing;
+            if (sv.members.len == 0) {
+                try list.append(gpa, .{ .id = sv.id, .member = null, .host = try gpa.dupe(u8, sv.host), .port = sv.port });
+                continue;
+            }
+            for (sv.members, 0..) |*m, i| {
+                m.ping_ms = null;
+                try list.append(gpa, .{ .id = sv.id, .member = @intCast(i), .host = try gpa.dupe(u8, m.host), .port = m.port });
+            }
+        }
+        return list.toOwnedSlice(gpa);
+    }
+
+    /// A measurement came back: a group answers as its best member.
+    pub fn recordPing(s: *State, id: u32, member: ?u8, ms: ?u16) void {
+        const sv = s.serverById(id) orelse return;
+        const m = member orelse {
+            sv.ping_ms = ms;
+            sv.ping_state = if (ms != null) .ok else .failed;
+            return;
+        };
+        if (m >= sv.members.len) return;
+        sv.members[m].ping_ms = ms;
+        var best: ?u16 = null;
+        for (sv.members) |mb| if (mb.ping_ms) |p| {
+            if (best == null or p < best.?) best = p;
+        };
+        sv.ping_ms = best;
+        sv.ping_state = if (best != null) .ok else .failed;
     }
 
     pub fn addApp(s: *State, id: []const u8, name: []const u8, path: []const u8) !*App {
@@ -484,4 +705,83 @@ test "domain rules keep the bare host name" {
     try std.testing.expectEqual(1, s.domains.items.len);
     s.removeDomain(0);
     try std.testing.expectEqual(0, s.domains.items.len);
+}
+
+test "groups: matched by name when their servers change, pings by member" {
+    const gpa = std.testing.allocator;
+    var s: State = .init(gpa);
+    defer s.deinit();
+    const sub_id = (try s.addSubscription("free", "https://example.invalid/s/x")).id;
+    const m1: State.NewMember = .{ .link = "vless://a@1.example:443", .host = "1.example", .port = 443 };
+    const m2: State.NewMember = .{ .link = "vless://b@2.example:443", .host = "2.example", .port = 443 };
+    const m3: State.NewMember = .{ .link = "vless://c@3.example:443", .host = "3.example", .port = 443 };
+    try s.applySubscription(sub_id, &.{
+        .{ .name = "Auto 1", .host = "1.example", .port = 443, .protocol = .vless, .link = m1.link, .members = &.{ m1, m2 } },
+        .{ .name = "Germany 2", .host = "9.example", .port = 443, .protocol = .vless, .link = "vless://z@9.example:443" },
+    });
+    const auto_id = s.servers.items[0].id;
+    s.settings.selected_server = auto_id;
+    s.servers.items[0].favorite = true;
+
+    // pings: the group answers as its best member
+    const targets = try s.probeTargets(gpa);
+    defer {
+        for (targets) |t| gpa.free(t.host);
+        gpa.free(targets);
+    }
+    try std.testing.expectEqual(3, targets.len);
+    s.recordPing(auto_id, 0, null);
+    try std.testing.expectEqual(.failed, s.servers.items[0].ping_state);
+    s.recordPing(auto_id, 1, 80);
+    try std.testing.expectEqual(80, s.servers.items[0].ping_ms.?);
+
+    // an hour later the group is made of other servers, the single one left
+    try s.applySubscription(sub_id, &.{
+        .{ .name = "Auto 1", .host = "2.example", .port = 443, .protocol = .vless, .link = m2.link, .members = &.{ m2, m3 } },
+    });
+    const g = s.serverById(auto_id).?;
+    try std.testing.expect(g.available and g.favorite);
+    try std.testing.expectEqual(2, g.members.len);
+    try std.testing.expectEqualStrings("3.example", g.members[1].host);
+    // its measured member keeps its time until measured again
+    try std.testing.expectEqual(80, g.members[0].ping_ms.?);
+    try std.testing.expectEqualStrings("2.example", g.host);
+    try std.testing.expectEqual(1, s.servers.items.len);
+}
+
+test "a chosen server that left the subscription stays until Disconnect" {
+    const gpa = std.testing.allocator;
+    var s: State = .init(gpa);
+    defer s.deinit();
+    const sub_id = (try s.addSubscription("p", "https://example.invalid/sub")).id;
+    try s.applySubscription(sub_id, &.{
+        .{ .name = "A", .host = "a.example", .port = 443, .protocol = .vless, .link = "vless://a@a.example:443" },
+        .{ .name = "B", .host = "b.example", .port = 443, .protocol = .vless, .link = "vless://b@b.example:443" },
+    });
+    const a = s.servers.items[0].id;
+    s.settings.selected_server = a;
+    try s.applySubscription(sub_id, &.{
+        .{ .name = "B", .host = "b.example", .port = 443, .protocol = .vless, .link = "vless://b@b.example:443" },
+    });
+    // still the server in use
+    try std.testing.expectEqual(a, s.currentServer().?.id);
+    try std.testing.expect(s.dropVanishedChoice());
+    try std.testing.expectEqual(null, s.settings.selected_server);
+    try std.testing.expectEqual(1, s.servers.items.len);
+    try std.testing.expect(!s.dropVanishedChoice());
+}
+
+test "the provider's refresh period" {
+    var s: State = .init(std.testing.allocator);
+    defer s.deinit();
+    const sub = try s.addSubscription("p", "https://example.invalid/sub");
+    const id = sub.id;
+    try s.applyMeta(id, .{ .title = "Free", .update_hours = 1, .announce = "72 servers", .support_url = "https://t.me/x" });
+    try std.testing.expectEqualStrings("Free", s.subById(id).?.name);
+    s.subById(id).?.updated_unix = 1000;
+    try std.testing.expectEqual(null, s.dueForRefresh(1000 + 3599));
+    try std.testing.expectEqual(id, s.dueForRefresh(1000 + 3600).?.id);
+    // tried just now: not again before a quarter of the period
+    try std.testing.expectEqual(null, s.dueForRefresh(1000 + 3601));
+    try std.testing.expectEqual(id, s.dueForRefresh(1000 + 3600 + 900).?.id);
 }

@@ -279,7 +279,15 @@ public class Main extends Activity implements Core.Listener {
         // the server in use (a reserve one after a switch), else the one chosen
         JSONObject sv = core.server(look == PowerButton.ON ? st.optInt("server") : 0);
         if (sv == null) sv = core.server(s.optInt("current"));
-        serverCc.setText(country(sv));
+        if (sv != null && sv.optInt("group") > 0) {
+            serverCc.setText("");
+            serverCc.setCompoundDrawablesWithIntrinsicBounds(glyph(Glyph.BOLT, TEXT, 16), null, null, null);
+            serverCc.setPadding(dp(10), 0, 0, 0);
+        } else {
+            serverCc.setCompoundDrawables(null, null, null, null);
+            serverCc.setPadding(0, 0, 0, 0);
+            serverCc.setText(country(sv));
+        }
         serverName.setText(sv == null ? "" : sv.optString("name"));
         serverPing.setText(sv == null || sv.isNull("ping") ? "" : sv.optInt("ping") + " ms");
         down.setText(rate(look == PowerButton.ON ? core.rateDown : 0));
@@ -512,13 +520,21 @@ public class Main extends Activity implements Core.Listener {
                 return old;
             }
             final int id = o.optInt("id");
-            h.cc.setCompoundDrawables(null, null, null, null);
-            h.cc.setPadding(0, 0, 0, 0);
-            h.cc.setText(country(o));
+            // a provider's "Auto": a bolt, and how many servers it chooses among
+            int group = o.optInt("group");
+            if (group > 0) {
+                h.cc.setText("");
+                h.cc.setCompoundDrawablesWithIntrinsicBounds(glyph(Glyph.BOLT, TEXT, 16), null, null, null);
+                h.cc.setPadding(dp(10), 0, 0, 0);
+            } else {
+                h.cc.setCompoundDrawables(null, null, null, null);
+                h.cc.setPadding(0, 0, 0, 0);
+                h.cc.setText(country(o));
+            }
             h.name.setText(o.optString("name"));
             h.name.setAlpha(o.optBoolean("ok") ? 1f : 0.4f);
             h.proto.setVisibility(View.VISIBLE);
-            h.proto.setText(o.optString("proto"));
+            h.proto.setText(group > 0 ? "×" + group : o.optString("proto"));
             if (o.isNull("ping")) {
                 h.ping.setText(o.optBoolean("pinging") ? "···" : "—");
                 h.ping.setTextColor(DIM);
@@ -806,6 +822,26 @@ public class Main extends Activity implements Core.Listener {
         });
         col.addView(always);
 
+        // what the providers say about their subscriptions: here only
+        JSONArray subs = core.state.optJSONArray("subs");
+        for (int i = 0; subs != null && i < subs.length(); i++) {
+            JSONObject sub = subs.optJSONObject(i);
+            if (sub == null) continue;
+            final String note = sub.optString("announce"), support = sub.optString("support");
+            if (note.isEmpty() && support.isEmpty()) continue;
+            ImageView more = new ImageView(this);
+            if (!support.isEmpty()) more.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));
+            View row = setting(sub.optString("name"), note, more);
+            if (!support.isEmpty()) row.setOnClickListener(v -> {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(support)));
+                } catch (Exception e) {
+                    // no browser
+                }
+            });
+            col.addView(row);
+        }
+
         ImageView send = new ImageView(this);
         send.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));
         View report = setting(R.string.s_report, R.string.s_report_d, send);
@@ -860,15 +896,21 @@ public class Main extends Activity implements Core.Listener {
     }
 
     private View setting(int title, int text, View control) {
+        return setting(getString(title), getString(text), control);
+    }
+
+    private View setting(String title, String text, View control) {
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(0, dp(14), 0, dp(14));
         LinearLayout words = new LinearLayout(this);
         words.setOrientation(LinearLayout.VERTICAL);
-        words.addView(label(getString(title), 16, TEXT));
-        TextView more = label(getString(text), 13, DIM);
-        more.setPadding(0, dp(4), 0, 0);
-        words.addView(more);
+        words.addView(label(title, 16, TEXT));
+        if (!text.isEmpty()) {
+            TextView more = label(text, 13, DIM);
+            more.setPadding(0, dp(4), 0, 0);
+            words.addView(more);
+        }
         row.addView(words, margins(0, WRAP, 0, 0, 16, 0, 1));
         row.addView(control);
         return row;

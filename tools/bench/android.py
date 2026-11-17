@@ -91,7 +91,7 @@ def stand() -> None:
     subprocess.run(["zig", "build-exe", str(ROOT / "tools" / "bench" / "probe.zig"), "-target", "aarch64-linux-musl",
                     "-O", "ReleaseFast", "-fstrip", f"-femit-bin={STATE / 'probe'}"], check=True)
     pids = [
-        subprocess.Popen([str(STATE / "target"), str(PORT_SITE), str(STATE), str(PORT_PLAIN)], stderr=subprocess.DEVNULL).pid,
+        subprocess.Popen([str(STATE / "target"), str(PORT_SITE), str(STATE), str(PORT_PLAIN)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid,
         subprocess.Popen(["xray", "run", "-c", str(STATE / "xray.json")], stdout=subprocess.DEVNULL).pid,
         subprocess.Popen([sys.executable, "-m", "http.server", str(PORT_SUB), "--bind", "127.0.0.1", "--directory", str(www)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid,

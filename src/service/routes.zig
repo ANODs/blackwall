@@ -26,49 +26,66 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
     const a = arena.allocator();
 
     var obs: std.ArrayList(proxy.Outbound) = .empty;
+    // per outbound: its server's id, and its last measured connection time
     var ids: std.ArrayList(u32) = .empty;
+    var pings: std.ArrayList(?u16) = .empty;
     var skipped: usize = 0;
     // standby: the VPN is off, so no server is used at all
     const standby = state.settings.standby;
     for (state.servers.items) |sv| {
         if (standby) break;
-        if (!sv.available or sv.link.len == 0) continue;
-        const ob = proxy.outboundFromLink(try a.dupe(u8, sv.link), try a.dupe(u8, sv.host), sv.port) catch {
-            skipped += 1;
+        // a server in use that left its subscription stays until Disconnect
+        const in_use = sv.id == state.settings.selected_server or sv.id == state.settings.auto_server;
+        if (!(sv.available or in_use) or sv.link.len == 0) continue;
+        if (sv.members.len == 0) {
+            const ob = proxy.outboundFromLink(try a.dupe(u8, sv.link), try a.dupe(u8, sv.host), sv.port) catch {
+                skipped += 1;
+                continue;
+            };
+            try obs.append(a, ob);
+            try ids.append(a, sv.id);
+            try pings.append(a, sv.ping_ms);
             continue;
-        };
-        try obs.append(a, ob);
-        try ids.append(a, sv.id);
+        }
+        // a group: each of its servers is an outbound of the group's id
+        var any = false;
+        for (sv.members) |m| {
+            const ob = proxy.outboundFromLink(try a.dupe(u8, m.link), try a.dupe(u8, m.host), m.port) catch continue;
+            try obs.append(a, ob);
+            try ids.append(a, sv.id);
+            try pings.append(a, m.ping_ms);
+            any = true;
+        }
+        if (!any) skipped += 1;
     }
 
-    // the main server, then its reserve: the starred servers in list order
+    // The main server, then its reserve. A group is its own reserve: its
+    // servers, fastest first. Then the starred servers in list order (a
+    // starred group with all its servers), when the reserve is on.
     var main: std.ArrayList(u16) = .empty;
-    if (currentIndex(state, ids.items)) |cur| {
-        try main.append(a, cur);
+    if (currentId(state, ids.items)) |cur| {
+        try appendServer(a, &main, ids.items, pings.items, cur);
         if (state.settings.failover) for (state.servers.items) |sv| {
-            if (!sv.favorite or main.items.len == core.failover.max_members) continue;
-            for (ids.items, 0..) |id, i| {
-                if (id == sv.id and i != cur) try main.append(a, @intCast(i));
-            }
+            if (sv.favorite and sv.id != cur) try appendServer(a, &main, ids.items, pings.items, sv.id);
         };
     }
     const has_main = main.items.len > 0;
     var rules: std.ArrayList(tunnel.Rule) = .empty;
     for (state.apps.items) |app| {
         if (app.route == .default) continue;
-        try rules.append(a, .{ .app = try a.dupe(u8, app.id), .choice = choiceOf(app.route, ids.items, has_main) });
+        try rules.append(a, .{ .app = try a.dupe(u8, app.id), .choice = choiceOf(app.route, ids.items, pings.items, has_main) });
     }
     var domains: std.ArrayList(tunnel.DomainRule) = .empty;
     for (state.domains.items) |d| {
         if (d.route == .default) continue;
-        try domains.append(a, .{ .suffix = try a.dupe(u8, d.name), .choice = choiceOf(d.route, ids.items, has_main) });
+        try domains.append(a, .{ .suffix = try a.dupe(u8, d.name), .choice = choiceOf(d.route, ids.items, pings.items, has_main) });
     }
     const default: tunnel.Choice = if (standby)
         // only the applications with a rule are held back
         .direct
     else switch (state.settings.default_route) {
         .default => if (has_main) .main else .block,
-        else => |r| choiceOf(r, ids.items, has_main),
+        else => |r| choiceOf(r, ids.items, pings.items, has_main),
     };
     var cfg: tunnel.Config = .{ .default = default, .rules = rules.items, .domains = domains.items, .outbounds = obs.items, .main = main.items };
     // in standby everything without a rule goes direct, so a flow that
@@ -99,24 +116,52 @@ pub fn uses(cfg: tunnel.Config, i: u16) bool {
 
 /// The server the default route uses: the selected one, else the one the
 /// window found fastest, if usable; otherwise the first usable one.
-fn currentIndex(state: *const model.State, ids: []const u32) ?u16 {
+fn currentId(state: *const model.State, ids: []const u32) ?u32 {
     if (state.settings.selected_server orelse state.settings.auto_server) |want| {
-        for (ids, 0..) |id, i| if (id == want) return @intCast(i);
+        if (std.mem.indexOfScalar(u32, ids, want) != null) return want;
     }
-    return if (ids.len > 0) 0 else null;
+    return if (ids.len > 0) ids[0] else null;
+}
+
+/// The outbounds of server `id` added to the group, measured ones fastest
+/// first, as many as the group holds.
+fn appendServer(a: std.mem.Allocator, main: *std.ArrayList(u16), ids: []const u32, pings: []const ?u16, id: u32) !void {
+    const start = main.items.len;
+    for (ids, 0..) |sid, i| {
+        if (sid != id or main.items.len == core.failover.max_members) continue;
+        if (std.mem.indexOfScalar(u16, main.items, @intCast(i)) != null) continue;
+        try main.append(a, @intCast(i));
+    }
+    const Ctx = struct {
+        pings: []const ?u16,
+        fn less(ctx: @This(), x: u16, y: u16) bool {
+            const px = ctx.pings[x] orelse return false;
+            const py = ctx.pings[y] orelse return true;
+            return px < py;
+        }
+    };
+    std.sort.insertion(u16, main.items[start..], Ctx{ .pings = pings }, Ctx.less);
 }
 
 /// A route that names a server we cannot reach blocks instead of leaking.
-/// In standby no server is reachable, so every VPN route blocks.
-fn choiceOf(route: model.Route, ids: []const u32, has_main: bool) tunnel.Choice {
+/// In standby no server is reachable, so every VPN route blocks. A group
+/// named by a rule is its fastest server.
+fn choiceOf(route: model.Route, ids: []const u32, pings: []const ?u16, has_main: bool) tunnel.Choice {
     return switch (route) {
         .direct => .direct,
         .dpi => .dpi,
         .block => .block,
         .default, .auto => if (has_main) .main else .block,
-        .server => |id| for (ids, 0..) |sid, i| {
-            if (sid == id) break .{ .outbound = @intCast(i) };
-        } else .block,
+        .server => |id| blk: {
+            var best: ?usize = null;
+            for (ids, 0..) |sid, i| {
+                if (sid != id) continue;
+                if (best == null) best = i;
+                const p = pings[i] orelse continue;
+                if (pings[best.?] == null or p < pings[best.?].?) best = i;
+            }
+            break :blk if (best) |i| .{ .outbound = @intCast(i) } else .block;
+        },
     };
 }
 
@@ -234,4 +279,32 @@ test "routes: in standby the applications with a rule are held, the rest goes di
     try std.testing.expectEqual(2, b.cfg.domains.len);
     try std.testing.expectEqual(tunnel.Choice.block, b.cfg.domains[0].choice);
     try std.testing.expectEqual(tunnel.Choice.direct, b.cfg.domains[1].choice);
+}
+
+test "routes: a group is its servers, fastest first, before the starred ones" {
+    const gpa = std.testing.allocator;
+    var s: model.State = .init(gpa);
+    defer s.deinit();
+    try testServers(&s, &.{"single.example"});
+    const tpl = "vless://11111111-2222-3333-4444-555555555555@{s}:443?type=tcp&security=reality&flow=xtls-rprx-vision&sni=www.microsoft.com&pbk=jFuNsxsFdIt0Xig5jM1PAOIpJPKvJg9nU2PAMD5dPm8&sid=ab12#X";
+    var bufs: [3][256]u8 = undefined;
+    const hosts = [_][]const u8{ "g1.example", "g2.example", "g3.example" };
+    var members: [3]model.State.NewMember = undefined;
+    for (hosts, &members, &bufs) |h, *m, *buf| m.* = .{ .link = try std.fmt.bufPrint(buf, tpl, .{h}), .host = h, .port = 443 };
+    const g = try s.addServer(s.subs.items[0].id, .{ .name = "Auto 1", .host = "g1.example", .port = 443, .protocol = .vless, .link = members[0].link, .members = &members });
+    const gid = g.id;
+    // measured: g3 fastest, g1 slower, g2 not answering
+    g.members[0].ping_ms = 90;
+    g.members[2].ping_ms = 40;
+    s.servers.items[0].favorite = true;
+    s.settings.selected_server = gid;
+    (try s.addApp("/Applications/Pinned.app", "Pinned", "")).route = .{ .server = gid };
+    var b = try build(gpa, &s);
+    defer b.deinit();
+    // outbounds: 0 single, 1 g1, 2 g2, 3 g3
+    try std.testing.expectEqual(4, b.cfg.outbounds.len);
+    try std.testing.expectEqualSlices(u16, &.{ 3, 1, 2, 0 }, b.cfg.main);
+    try std.testing.expectEqualSlices(u32, &.{ s.servers.items[0].id, gid, gid, gid }, b.ids);
+    // an application pinned to the group gets its fastest server
+    try std.testing.expectEqual(tunnel.Choice{ .outbound = 3 }, b.cfg.rules[0].choice);
 }

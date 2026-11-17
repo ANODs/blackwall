@@ -293,7 +293,7 @@ pub fn routeLabel(route: model.Route, dim_default: bool) void {
         return;
     }
     if (app.state.serverById(route.server)) |sv| {
-        w.countryTag(@src(), sv.country, .{ .min_size_content = .{ .w = 26, .h = 18 } });
+        w.serverTag(@src(), sv, .{ .min_size_content = .{ .w = 26, .h = 18 } });
         w.gap(@src(), 9, 0);
         w.text(@src(), sv.name, th.body(13), if (sv.available) th.text else th.text3, .{});
     } else {

@@ -83,6 +83,11 @@ const Cmd = struct {
     mtu: u16 = 1500,
     dns: []const []const u8 = &.{},
     q: u32 = 0,
+    // a subscription's headers, as the shell got them (see sublink.metaFromHeaders)
+    title: ?[]const u8 = null,
+    interval: ?[]const u8 = null,
+    announce: ?[]const u8 = null,
+    support: ?[]const u8 = null,
 };
 
 /// Questions to the shell about who owns a flow, and what it answered.
@@ -270,7 +275,10 @@ pub const Session = struct {
         } else if (is(m.cmd, "add")) {
             s.add(m.text orelse "");
         } else if (is(m.cmd, "body")) {
-            s.applyFetched(m.id, m.text);
+            var arena: std.heap.ArenaAllocator = .init(s.gpa);
+            defer arena.deinit();
+            const headers = core.sublink.metaFromHeaders(arena.allocator(), m.title, m.interval, m.announce, m.support) catch null;
+            s.applyFetched(m.id, m.text, headers);
         } else if (is(m.cmd, "refresh")) {
             for (s.state.subs.items) |sub| {
                 if (sub.url.len > 0) s.emit(.{ .ev = "fetch", .id = sub.id, .url = sub.url });
@@ -310,6 +318,8 @@ pub const Session = struct {
             _ = s.sendPlan(true);
             s.sendState();
         } else if (is(m.cmd, "disconnect")) {
+            // a chosen server that left its subscription while in use goes now
+            _ = s.state.dropVanishedChoice();
             // applications that may only use the VPN stay held after it
             const hold = s.state.settings.protect_when_off and s.state.hasProtectedApps();
             s.active = hold;
@@ -353,9 +363,7 @@ pub const Session = struct {
     }
 
     fn refreshCarried(s: *Session) void {
-        for (s.state.servers.items) |*sv| {
-            sv.carried = if (proxy.outboundFromLink(sv.link, sv.host, sv.port)) |_| true else |_| false;
-        }
+        for (s.state.servers.items) |*sv| sv.carried = proxy.carries(sv);
     }
 
     fn setUpstream(s: *Session, list: []const []const u8) void {
@@ -397,7 +405,9 @@ pub const Session = struct {
         s.changed();
     }
 
-    fn applyFetched(s: *Session, sub_id: u32, body: ?[]const u8) void {
+    /// A downloaded subscription: its servers, and what the provider says
+    /// about it (in the body's comment lines, overridden by its headers).
+    fn applyFetched(s: *Session, sub_id: u32, body: ?[]const u8, headers: ?model.SubMeta) void {
         const sub = s.state.subById(sub_id) orelse return;
         const bytes = body orelse {
             sub.last_error = true;
@@ -411,6 +421,8 @@ pub const Session = struct {
         };
         defer parsed.deinit();
         s.state.applySubscription(sub_id, parsed.servers) catch return;
+        s.state.applyMeta(sub_id, parsed.meta) catch {};
+        if (headers) |h| s.state.applyMeta(sub_id, h) catch {};
         s.refreshCarried();
         if (s.state.subById(sub_id)) |s2| {
             s2.last_error = false;
@@ -474,8 +486,9 @@ pub const Session = struct {
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const Sv = struct { id: u32, sub: u32, name: []const u8, proto: []const u8, cc: []const u8, ping: ?u16, pinging: bool, star: bool, ok: bool };
-        const Sub = struct { id: u32, name: []const u8, link: bool, failed: bool, updated: i64 };
+        // group: how many servers a provider's "Auto" chooses among, 0 for a server
+        const Sv = struct { id: u32, sub: u32, name: []const u8, proto: []const u8, cc: []const u8, ping: ?u16, pinging: bool, star: bool, ok: bool, group: usize };
+        const Sub = struct { id: u32, name: []const u8, link: bool, failed: bool, updated: i64, announce: []const u8, support: []const u8 };
         const Rule = struct { app: []const u8, route: []const u8, id: u32 };
         const Site = struct { name: []const u8, route: []const u8, id: u32 };
         var servers: std.ArrayList(Sv) = .empty;
@@ -497,6 +510,7 @@ pub const Session = struct {
             .pinging = sv.ping_state == .testing,
             .star = sv.favorite,
             .ok = sv.available and sv.carried,
+            .group = sv.members.len,
         }) catch return;
         for (s.state.subs.items) |sub| subs.append(a, .{
             .id = sub.id,
@@ -504,6 +518,8 @@ pub const Session = struct {
             .link = sub.url.len > 0,
             .failed = sub.last_error,
             .updated = sub.updated_unix,
+            .announce = sub.announce,
+            .support = sub.support_url,
         }) catch return;
         for (s.state.apps.items) |app| {
             if (app.route == .default) continue;
@@ -693,6 +709,8 @@ pub const Session = struct {
             s.io.sleep(.fromMilliseconds(1000), .awake) catch {};
             s.mutex.lockUncancelable(s.io);
             defer s.mutex.unlock(s.io);
+            // the provider's refresh period (profile-update-interval)
+            if (s.state.dueForRefresh(Io.Clock.real.now(s.io).toSeconds())) |sub| s.emit(.{ .ev = "fetch", .id = sub.id, .url = sub.url });
             const t = s.t orelse continue;
             const b = s.built orelse continue;
             const i = t.mainInUse();
@@ -794,11 +812,9 @@ pub const Session = struct {
 
     // ------------------------------------------------------------ latency
 
-    const Target = struct { id: u32, host: []u8, port: u16 };
-
     const ProbeJob = struct {
         s: *Session,
-        targets: []Target,
+        targets: []model.State.ProbeTarget,
         next: std.atomic.Value(usize) = .init(0),
         left: std.atomic.Value(usize),
         servers: [4]packet.Endpoint,
@@ -812,19 +828,13 @@ pub const Session = struct {
     /// never enter the VPN, so this measures the servers themselves.
     fn probeAll(s: *Session) void {
         if (s.probing) return;
-        var list: std.ArrayList(Target) = .empty;
-        for (s.state.servers.items) |*sv| {
-            if (!sv.available or sv.host.len == 0) continue;
-            const host = s.gpa.dupe(u8, sv.host) catch continue;
-            list.append(s.gpa, .{ .id = sv.id, .host = host, .port = sv.port }) catch {
-                s.gpa.free(host);
-                continue;
-            };
-            sv.ping_state = .testing;
-        }
-        const targets = list.toOwnedSlice(s.gpa) catch return;
+        // a group's servers each, so that its time is its best one's
+        const targets = s.state.probeTargets(s.gpa) catch return;
         if (targets.len == 0) return s.gpa.free(targets);
-        const job = s.gpa.create(ProbeJob) catch return;
+        const job = s.gpa.create(ProbeJob) catch {
+            for (targets) |t| s.gpa.free(t.host);
+            return s.gpa.free(targets);
+        };
         const n = @min(probe_workers, targets.len);
         job.* = .{ .s = s, .targets = targets, .left = .init(n), .servers = s.upstream, .servers_len = s.upstream_len };
         s.probing = true;
@@ -847,10 +857,7 @@ pub const Session = struct {
             const tg = job.targets[i];
             const ms = probe(s.io, &resolver, tg.host, tg.port);
             s.mutex.lockUncancelable(s.io);
-            if (s.state.serverById(tg.id)) |sv| {
-                sv.ping_ms = ms;
-                sv.ping_state = if (ms != null) .ok else .failed;
-            }
+            s.state.recordPing(tg.id, tg.member, ms);
             s.mutex.unlock(s.io);
         }
         finishWorker(job);

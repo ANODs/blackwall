@@ -233,6 +233,16 @@ pub const LinkError = error{
 /// What of a share link this build can actually carry: vless://, trojan://,
 /// ss:// or vmess://. `host` and `port` are the server's, already taken from
 /// the link (sublink.zig); slices in the result point into `link` and `host`.
+/// Whether this build can carry a server (model.Server): a group when it
+/// can carry any of its servers.
+pub fn carries(sv: anytype) bool {
+    if (sv.members.len == 0) return if (outboundFromLink(sv.link, sv.host, sv.port)) |_| true else |_| false;
+    for (sv.members) |m| {
+        if (outboundFromLink(m.link, m.host, m.port)) |_| return true else |_| {}
+    }
+    return false;
+}
+
 pub fn outboundFromLink(link: []const u8, host: []const u8, port: u16) LinkError!Outbound {
     const scheme = link[0 .. std.mem.indexOf(u8, link, "://") orelse return error.UnsupportedProtocol];
     const is = std.ascii.eqlIgnoreCase;

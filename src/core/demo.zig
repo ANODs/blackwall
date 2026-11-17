@@ -26,6 +26,11 @@ pub fn load(s: *model.State, sub_name: []const u8) !void {
     const sub_id = sub.id;
     s.subs.items[s.subs.items.len - 1].used_bytes = 48 << 30;
     s.subs.items[s.subs.items.len - 1].total_bytes = 200 << 30;
+    // a provider's "Auto": several servers, chosen among by speed
+    const m: model.State.NewMember = .{ .link = "", .host = "", .port = 443 };
+    const auto = try s.addServer(sub_id, .{ .name = "Auto", .host = "", .port = 443, .protocol = .vless, .security = .reality, .members = &.{ m, m, m, m, m } });
+    auto.ping_ms = 31;
+    auto.ping_state = .ok;
     var ids: [servers.len]u32 = undefined;
     for (servers, 0..) |d, i| {
         const sv = try s.addServer(sub_id, .{ .name = d[0], .host = "", .port = 443, .protocol = d[2], .security = d[3], .country = d[1].* });
@@ -33,8 +38,8 @@ pub fn load(s: *model.State, sub_name: []const u8) !void {
         sv.ping_state = .ok;
         ids[i] = sv.id;
     }
-    s.servers.items[0].favorite = true;
-    s.servers.items[2].favorite = true;
+    s.serverById(ids[0]).?.favorite = true;
+    s.serverById(ids[2]).?.favorite = true;
 
     // Example rules on whatever is installed, mirroring the product brief.
     const rules = [_]struct { []const u8, model.Route }{

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const dvui = @import("dvui");
+const core = @import("core");
 const th = @import("theme.zig");
 const draw = @import("draw.zig");
 const app = @import("../app.zig");
@@ -202,6 +203,22 @@ pub fn countryTag(src: Src, code: [2]u8, opts: Options) void {
     defer b.deinit();
     const known = code[0] != '?';
     text(@src(), if (known) &code else "··", th.mono(11), if (known) th.text else th.text3, .{ .gravity_x = 0.5 });
+}
+
+/// A server's tile: its country, or a bolt for a group (the provider's
+/// "Auto", several servers chosen among by speed).
+pub fn serverTag(src: Src, sv: *const core.model.Server, opts: Options) void {
+    if (!sv.isGroup()) return countryTag(src, sv.country, opts);
+    const base: Options = .{
+        .min_size_content = .{ .w = 30, .h = 22 },
+        .background = true,
+        .color_fill = col(th.raised),
+        .corners = .all(6),
+        .gravity_y = 0.5,
+    };
+    var b = dvui.box(src, .{}, base.override(opts));
+    defer b.deinit();
+    icon(@src(), .bolt, 13, th.text, .{ .gravity_x = 0.5 });
 }
 
 /// Rounded tile with the app's initial; stands in for the app icon.

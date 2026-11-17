@@ -16,6 +16,9 @@ pub const Parsed = struct {
     unsupported: usize,
     /// lines that are neither links nor blank / comments
     malformed: usize,
+    /// what a plain list says about itself in comment lines
+    /// ("#profile-title: ...", as Happ reads them); headers win over it
+    meta: model.SubMeta = .{},
 
     pub fn deinit(p: *Parsed) void {
         p.arena.deinit();
@@ -36,10 +39,26 @@ pub fn parseBody(gpa: std.mem.Allocator, body: []const u8) Error!Parsed {
     var unsupported: usize = 0;
     var malformed: usize = 0;
 
+    var title: ?[]const u8 = null;
+    var interval: ?[]const u8 = null;
+    var announce: ?[]const u8 = null;
+    var support: ?[]const u8 = null;
     var it = std.mem.tokenizeAny(u8, text, "\r\n");
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t");
-        if (line.len == 0 or line[0] == '#' or std.mem.startsWith(u8, line, "//")) continue;
+        if (line.len > 0 and line[0] == '#') {
+            const fields = [_]struct { []const u8, *?[]const u8 }{
+                .{ "#profile-title:", &title },
+                .{ "#profile-update-interval:", &interval },
+                .{ "#announce:", &announce },
+                .{ "#support-url:", &support },
+            };
+            for (fields) |f| if (std.ascii.startsWithIgnoreCase(line, f[0])) {
+                f[1].* = line[f[0].len..];
+            };
+            continue;
+        }
+        if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
         if (parseLink(a, line)) |sv| {
             try list.append(a, sv);
         } else |err| switch (err) {
@@ -55,6 +74,7 @@ pub fn parseBody(gpa: std.mem.Allocator, body: []const u8) Error!Parsed {
         .servers = try list.toOwnedSlice(a),
         .unsupported = unsupported,
         .malformed = malformed,
+        .meta = try metaFromHeaders(a, title, interval, announce, support),
     };
 }
 
@@ -159,122 +179,271 @@ fn port16(v: ?std.json.Value) ?u16 {
     };
 }
 
+/// The servers of an Xray config: the first proxy outbound, or, when the
+/// config balances between several (`routing.balancers`: the "Auto" of
+/// Remnawave, Marzban, 3x-ui and the like, whatever the strategy), every
+/// outbound its selector names and its fallback, as one group.
 fn xrayServer(a: std.mem.Allocator, cfg: std.json.Value) LinkError!model.State.NewServer {
     const outbounds = field(cfg, "outbounds") orelse return error.Malformed;
     if (outbounds != .array) return error.Malformed;
+    const remarks = str(field(cfg, "remarks"));
+
+    if (mainBalancer(cfg)) |bal| {
+        var members: std.ArrayList(model.State.NewMember) = .empty;
+        var first_ob: ?Converted = null;
+        for (outbounds.array.items) |ob| {
+            if (!selected(str(field(ob, "tag")), bal.selector)) continue;
+            const conv = (outboundLink(a, ob) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // a member this build cannot read: the others still work
+                else => continue,
+            }) orelse continue;
+            if (members.items.len == max_members) break;
+            if (first_ob == null) first_ob = conv;
+            try members.append(a, .{ .link = conv.link, .host = conv.host, .port = conv.port });
+        }
+        // the fallback is a member too, after the others, when the selector
+        // did not name it already
+        if (bal.fallback.len > 0 and members.items.len < max_members) for (outbounds.array.items) |ob| {
+            if (!std.mem.eql(u8, str(field(ob, "tag")), bal.fallback)) continue;
+            const conv = (outboundLink(a, ob) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => break,
+            }) orelse break;
+            for (members.items) |m| {
+                if (std.mem.eql(u8, m.link, conv.link)) break;
+            } else {
+                if (first_ob == null) first_ob = conv;
+                try members.append(a, .{ .link = conv.link, .host = conv.host, .port = conv.port });
+            }
+            break;
+        };
+        if (first_ob) |f| {
+            var name = try cleanName(a, remarks);
+            if (name.len == 0) name = try a.dupe(u8, f.host);
+            return .{
+                .name = name,
+                .host = f.host,
+                .port = f.port,
+                .protocol = f.protocol,
+                .security = f.security,
+                .country = detectCountry(remarks),
+                .link = f.link,
+                // one balanced server is a plain server
+                .members = if (members.items.len > 1) members.items else &.{},
+            };
+        }
+    }
 
     var saw_proxy_like = false;
     for (outbounds.array.items) |ob| {
-        const proto = str(field(ob, "protocol"));
-        const protocol: model.Protocol = if (std.mem.eql(u8, proto, "vless"))
-            .vless
-        else if (std.mem.eql(u8, proto, "trojan"))
-            .trojan
-        else if (std.mem.eql(u8, proto, "shadowsocks"))
-            .shadowsocks
-        else if (std.mem.eql(u8, proto, "vmess"))
-            .vmess
-        else {
-            // freedom / blackhole / dns are plumbing, anything else is a
-            // proxy protocol this client does not know
-            const plumbing = [_][]const u8{ "freedom", "blackhole", "dns", "loopback", "" };
-            var is_plumbing = false;
-            for (plumbing) |name| if (std.mem.eql(u8, proto, name)) {
-                is_plumbing = true;
-            };
-            if (!is_plumbing) saw_proxy_like = true;
-            continue;
-        };
-
-        const settings = field(ob, "settings");
-        // classic layout nests the endpoint, newer Xray allows it flat
-        const endpoint = first(field(settings, "vnext")) orelse first(field(settings, "servers")) orelse settings;
-        const user = first(field(endpoint, "users")) orelse endpoint;
-        const host = str(field(endpoint, "address"));
-        const port = port16(field(endpoint, "port")) orelse return error.Malformed;
-        if (host.len == 0) return error.Malformed;
-
-        const stream = field(ob, "streamSettings");
-        const network = blk: {
-            const n = str(field(stream, "network"));
-            break :blk if (n.len == 0) "tcp" else n;
-        };
-        const sec = str(field(stream, "security"));
-        const security: model.Security = if (std.mem.eql(u8, sec, "reality")) .reality else if (std.mem.eql(u8, sec, "tls")) .tls else .none;
-
-        var link: std.Io.Writer.Allocating = .init(a);
-        const w = &link.writer;
-        const secret = switch (protocol) {
-            .vless, .vmess => str(field(user, "id")),
-            else => str(field(user, "password")),
-        };
-        if (secret.len == 0) return error.Malformed;
-        const scheme = switch (protocol) {
-            .vless => "vless",
-            .vmess => "vmess",
-            .trojan => "trojan",
-            else => "ss",
-        };
-        (blk: {
-            w.print("{s}://", .{scheme}) catch break :blk error.OutOfMemory;
-            if (protocol == .shadowsocks) w.print("{s}:", .{str(field(user, "method"))}) catch break :blk error.OutOfMemory;
-            // a password may hold what a link gives a meaning to ('@', '/', '#')
-            std.Uri.Component.percentEncode(w, secret, isUnreserved) catch break :blk error.OutOfMemory;
-            w.writeByte('@') catch break :blk error.OutOfMemory;
-            if (std.mem.indexOfScalar(u8, host, ':') != null) {
-                w.print("[{s}]:{d}", .{ host, port }) catch break :blk error.OutOfMemory;
-            } else {
-                w.print("{s}:{d}", .{ host, port }) catch break :blk error.OutOfMemory;
-            }
-            w.print("?type={s}&security={s}", .{ network, if (sec.len == 0) "none" else sec }) catch break :blk error.OutOfMemory;
-            param(w, "flow", str(field(user, "flow"))) catch break :blk error.OutOfMemory;
-            // VMess names its cipher where VLESS names its encryption;
-            // "none" is what a link without the parameter means
-            const enc = str(field(user, if (protocol == .vmess) "security" else "encryption"));
-            if (!std.mem.eql(u8, enc, "none")) param(w, "encryption", enc) catch break :blk error.OutOfMemory;
-            const reality = field(stream, "realitySettings");
-            const tls = field(stream, "tlsSettings");
-            const sni = if (str(field(reality, "serverName")).len > 0) str(field(reality, "serverName")) else str(field(tls, "serverName"));
-            param(w, "sni", sni) catch break :blk error.OutOfMemory;
-            const fp = if (str(field(reality, "fingerprint")).len > 0) str(field(reality, "fingerprint")) else str(field(tls, "fingerprint"));
-            param(w, "fp", fp) catch break :blk error.OutOfMemory;
-            param(w, "pbk", str(field(reality, "publicKey"))) catch break :blk error.OutOfMemory;
-            param(w, "sid", str(field(reality, "shortId"))) catch break :blk error.OutOfMemory;
-            param(w, "spx", str(field(reality, "spiderX"))) catch break :blk error.OutOfMemory;
-            // transport details live under "<network>Settings"
-            var key_buf: [32]u8 = undefined;
-            const key = std.fmt.bufPrint(&key_buf, "{s}Settings", .{network}) catch "";
-            const transport = field(stream, key);
-            param(w, "path", str(field(transport, "path"))) catch break :blk error.OutOfMemory;
-            const th_host = if (str(field(transport, "host")).len > 0) str(field(transport, "host")) else str(field(field(transport, "headers"), "Host"));
-            param(w, "host", th_host) catch break :blk error.OutOfMemory;
-            const multi = if (field(transport, "multiMode")) |m| m == .bool and m.bool else false;
-            param(w, "mode", if (multi) "multi" else str(field(transport, "mode"))) catch break :blk error.OutOfMemory;
-            param(w, "serviceName", str(field(transport, "serviceName"))) catch break :blk error.OutOfMemory;
-            param(w, "authority", str(field(transport, "authority"))) catch break :blk error.OutOfMemory;
-            // XHTTP's further settings travel as JSON, as in Xray's own links
-            if (field(transport, "extra")) |extra| if (extra == .object) {
-                const text = std.json.Stringify.valueAlloc(a, extra, .{}) catch break :blk error.OutOfMemory;
-                param(w, "extra", text) catch break :blk error.OutOfMemory;
-            };
-            break :blk {};
-        }) catch return error.OutOfMemory;
-
-        const remarks = str(field(cfg, "remarks"));
+        const conv = (outboundLink(a, ob) catch |err| switch (err) {
+            error.UnsupportedScheme => {
+                saw_proxy_like = true;
+                continue;
+            },
+            else => |e| return e,
+        }) orelse continue;
         const country = detectCountry(remarks);
         var name = try cleanName(a, remarks);
-        if (name.len == 0) name = try a.dupe(u8, host);
+        if (name.len == 0) name = try a.dupe(u8, conv.host);
         return .{
             .name = name,
-            .host = try a.dupe(u8, host),
-            .port = port,
-            .protocol = protocol,
-            .security = security,
+            .host = conv.host,
+            .port = conv.port,
+            .protocol = conv.protocol,
+            .security = conv.security,
             .country = country,
-            .link = link.written(),
+            .link = conv.link,
         };
     }
     return if (saw_proxy_like) error.UnsupportedScheme else error.Malformed;
+}
+
+/// A group has at most this many servers: the reserve logic's size.
+pub const max_members = 11;
+
+const Balancer = struct { selector: []const std.json.Value, fallback: []const u8 };
+
+/// The balancer the config sends its traffic to: the one a rule without
+/// conditions names (the catch-all), else the one the last rule naming any
+/// balancer uses, else the first. Null when the config has none.
+fn mainBalancer(cfg: std.json.Value) ?Balancer {
+    const routing = field(cfg, "routing");
+    const list = field(routing, "balancers") orelse return null;
+    if (list != .array or list.array.items.len == 0) return null;
+    var want: []const u8 = "";
+    if (field(routing, "rules")) |rules| if (rules == .array) for (rules.array.items) |r| {
+        const tag = str(field(r, "balancerTag"));
+        if (tag.len == 0) continue;
+        if (want.len == 0 or catchAll(r)) want = tag;
+        if (catchAll(r)) break;
+    };
+    var chosen = list.array.items[0];
+    if (want.len > 0) for (list.array.items) |b| {
+        if (std.mem.eql(u8, str(field(b, "tag")), want)) chosen = b;
+    };
+    const sel = field(chosen, "selector") orelse return null;
+    if (sel != .array or sel.array.items.len == 0) return null;
+    return .{ .selector = sel.array.items, .fallback = str(field(chosen, "fallbackTag")) };
+}
+
+/// A routing rule that matches every connection (or every one of a network).
+fn catchAll(rule: std.json.Value) bool {
+    if (rule != .object) return false;
+    const conditions = [_][]const u8{ "domain", "ip", "port", "sourcePort", "source", "user", "inboundTag", "protocol", "attrs", "process" };
+    for (conditions) |k| if (rule.object.get(k) != null) return false;
+    return true;
+}
+
+/// Xray's own rule: a selector entry picks every tag that starts with it.
+fn selected(tag: []const u8, selector: []const std.json.Value) bool {
+    if (tag.len == 0) return false;
+    for (selector) |v| {
+        if (v == .string and v.string.len > 0 and std.mem.startsWith(u8, tag, v.string)) return true;
+    }
+    return false;
+}
+
+const Converted = struct {
+    host: []const u8,
+    port: u16,
+    protocol: model.Protocol,
+    security: model.Security,
+    link: []const u8,
+};
+
+/// One outbound as a share link; null for plumbing (freedom, blackhole,
+/// dns), UnsupportedScheme for a proxy protocol this client does not know.
+fn outboundLink(a: std.mem.Allocator, ob: std.json.Value) LinkError!?Converted {
+    const proto = str(field(ob, "protocol"));
+    const protocol: model.Protocol = if (std.mem.eql(u8, proto, "vless"))
+        .vless
+    else if (std.mem.eql(u8, proto, "trojan"))
+        .trojan
+    else if (std.mem.eql(u8, proto, "shadowsocks"))
+        .shadowsocks
+    else if (std.mem.eql(u8, proto, "vmess"))
+        .vmess
+    else {
+        const plumbing = [_][]const u8{ "freedom", "blackhole", "dns", "loopback", "" };
+        for (plumbing) |name| if (std.mem.eql(u8, proto, name)) return null;
+        return error.UnsupportedScheme;
+    };
+
+    const settings = field(ob, "settings");
+    // classic layout nests the endpoint, newer Xray allows it flat
+    const endpoint = first(field(settings, "vnext")) orelse first(field(settings, "servers")) orelse settings;
+    const user = first(field(endpoint, "users")) orelse endpoint;
+    const host = str(field(endpoint, "address"));
+    const port = port16(field(endpoint, "port")) orelse return error.Malformed;
+    if (host.len == 0) return error.Malformed;
+
+    const stream = field(ob, "streamSettings");
+    const network = blk: {
+        const n = str(field(stream, "network"));
+        break :blk if (n.len == 0) "tcp" else n;
+    };
+    const sec = str(field(stream, "security"));
+    const security: model.Security = if (std.mem.eql(u8, sec, "reality")) .reality else if (std.mem.eql(u8, sec, "tls")) .tls else .none;
+
+    var link: std.Io.Writer.Allocating = .init(a);
+    const w = &link.writer;
+    const secret = switch (protocol) {
+        .vless, .vmess => str(field(user, "id")),
+        else => str(field(user, "password")),
+    };
+    if (secret.len == 0) return error.Malformed;
+    const scheme = switch (protocol) {
+        .vless => "vless",
+        .vmess => "vmess",
+        .trojan => "trojan",
+        else => "ss",
+    };
+    (blk: {
+        w.print("{s}://", .{scheme}) catch break :blk error.OutOfMemory;
+        if (protocol == .shadowsocks) w.print("{s}:", .{str(field(user, "method"))}) catch break :blk error.OutOfMemory;
+        // a password may hold what a link gives a meaning to ('@', '/', '#')
+        std.Uri.Component.percentEncode(w, secret, isUnreserved) catch break :blk error.OutOfMemory;
+        w.writeByte('@') catch break :blk error.OutOfMemory;
+        if (std.mem.indexOfScalar(u8, host, ':') != null) {
+            w.print("[{s}]:{d}", .{ host, port }) catch break :blk error.OutOfMemory;
+        } else {
+            w.print("{s}:{d}", .{ host, port }) catch break :blk error.OutOfMemory;
+        }
+        w.print("?type={s}&security={s}", .{ network, if (sec.len == 0) "none" else sec }) catch break :blk error.OutOfMemory;
+        param(w, "flow", str(field(user, "flow"))) catch break :blk error.OutOfMemory;
+        // VMess names its cipher where VLESS names its encryption;
+        // "none" is what a link without the parameter means
+        const enc = str(field(user, if (protocol == .vmess) "security" else "encryption"));
+        if (!std.mem.eql(u8, enc, "none")) param(w, "encryption", enc) catch break :blk error.OutOfMemory;
+        const reality = field(stream, "realitySettings");
+        const tls = field(stream, "tlsSettings");
+        const sni = if (str(field(reality, "serverName")).len > 0) str(field(reality, "serverName")) else str(field(tls, "serverName"));
+        param(w, "sni", sni) catch break :blk error.OutOfMemory;
+        const fp = if (str(field(reality, "fingerprint")).len > 0) str(field(reality, "fingerprint")) else str(field(tls, "fingerprint"));
+        param(w, "fp", fp) catch break :blk error.OutOfMemory;
+        param(w, "pbk", str(field(reality, "publicKey"))) catch break :blk error.OutOfMemory;
+        param(w, "sid", str(field(reality, "shortId"))) catch break :blk error.OutOfMemory;
+        param(w, "spx", str(field(reality, "spiderX"))) catch break :blk error.OutOfMemory;
+        // transport details live under "<network>Settings"
+        var key_buf: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}Settings", .{network}) catch "";
+        const transport = field(stream, key);
+        param(w, "path", str(field(transport, "path"))) catch break :blk error.OutOfMemory;
+        const th_host = if (str(field(transport, "host")).len > 0) str(field(transport, "host")) else str(field(field(transport, "headers"), "Host"));
+        param(w, "host", th_host) catch break :blk error.OutOfMemory;
+        const multi = if (field(transport, "multiMode")) |m| m == .bool and m.bool else false;
+        param(w, "mode", if (multi) "multi" else str(field(transport, "mode"))) catch break :blk error.OutOfMemory;
+        param(w, "serviceName", str(field(transport, "serviceName"))) catch break :blk error.OutOfMemory;
+        param(w, "authority", str(field(transport, "authority"))) catch break :blk error.OutOfMemory;
+        // XHTTP's further settings travel as JSON, as in Xray's own links
+        if (field(transport, "extra")) |extra| if (extra == .object) {
+            const text = std.json.Stringify.valueAlloc(a, extra, .{}) catch break :blk error.OutOfMemory;
+            param(w, "extra", text) catch break :blk error.OutOfMemory;
+        };
+        break :blk {};
+    }) catch return error.OutOfMemory;
+
+    return .{
+        .host = try a.dupe(u8, host),
+        .port = port,
+        .protocol = protocol,
+        .security = security,
+        .link = link.written(),
+    };
+}
+
+// ---------------------------------------------------------------- headers
+
+/// What a provider says in its answer's headers (the ones Happ and v2rayN
+/// read): `profile-title`, `profile-update-interval` (hours),
+/// `announce`, `support-url`. Values may be plain or "base64:<text>".
+pub fn metaFromHeaders(a: std.mem.Allocator, title: ?[]const u8, interval: ?[]const u8, announce: ?[]const u8, support: ?[]const u8) !model.SubMeta {
+    var meta: model.SubMeta = .{};
+    if (title) |t| meta.title = try headerText(a, t);
+    if (announce) |t| meta.announce = try headerText(a, t);
+    if (interval) |t| if (std.fmt.parseInt(u16, std.mem.trim(u8, t, " "), 10)) |h| {
+        // hourly at most, weekly at least
+        meta.update_hours = if (h == 0) 0 else std.math.clamp(h, 1, 168);
+    } else |_| {};
+    if (support) |t| {
+        const url = std.mem.trim(u8, t, " ");
+        if (std.ascii.startsWithIgnoreCase(url, "https://") or std.ascii.startsWithIgnoreCase(url, "http://"))
+            meta.support_url = try a.dupe(u8, url);
+    }
+    return meta;
+}
+
+fn headerText(a: std.mem.Allocator, value: []const u8) ![]const u8 {
+    const v = std.mem.trim(u8, value, " ");
+    if (std.ascii.startsWithIgnoreCase(v, "base64:")) {
+        if (try decodeBase64(a, v["base64:".len..])) |text| {
+            if (std.unicode.utf8ValidateSlice(text)) return std.mem.trim(u8, text, " \r\n");
+        }
+        return "";
+    }
+    return a.dupe(u8, v);
 }
 
 fn param(w: *std.Io.Writer, key: []const u8, value: []const u8) !void {
@@ -736,4 +905,88 @@ test "xray json subscription: reality tcp, xhttp, ws+tls, unknown protocol" {
     try std.testing.expectEqualStrings("NL", &nl.country);
     try std.testing.expectEqual(model.Security.tls, nl.security);
     try std.testing.expect(std.mem.indexOf(u8, nl.link, "type=ws&security=tls&sni=cdn.example&path=%2Fws&host=cdn.example") != null);
+}
+
+test "xray json: a balancer is one group, its servers in order" {
+    const body =
+        \\[{"remarks":"⚡ Авто 3","outbounds":[
+        \\  {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"1.example","port":443,"users":[{"id":"u1","encryption":"none"}]}]},
+        \\   "streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"a.example","publicKey":"k","shortId":"ab"}}},
+        \\  {"tag":"proxy-2","protocol":"trojan","settings":{"servers":[{"address":"2.example","port":8443,"password":"p"}]},"streamSettings":{"network":"ws","security":"tls"}},
+        \\  {"tag":"proxy-3","protocol":"hysteria2","settings":{}},
+        \\  {"tag":"proxy-4","protocol":"shadowsocks","settings":{"servers":[{"address":"4.example","port":8388,"method":"2022-blake3-aes-128-gcm","password":"x"}]}},
+        \\  {"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+        \\ "routing":{"balancers":[{"tag":"balancer","selector":["proxy"],"fallbackTag":"proxy","strategy":{"type":"leastLoad"}}],
+        \\   "rules":[{"type":"field","network":"tcp,udp","balancerTag":"balancer"}]},
+        \\ "burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://www.gstatic.com/generate_204","interval":"180s"}}},
+        \\ {"remarks":"🇩🇪 Германия 2","outbounds":[
+        \\  {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"9.example","port":443,"users":[{"id":"u9","encryption":"none"}]}]}},
+        \\  {"tag":"direct","protocol":"freedom"}]}]
+    ;
+    var parsed = try parseBody(std.testing.allocator, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(2, parsed.servers.len);
+    const g = parsed.servers[0];
+    try std.testing.expectEqualStrings("Авто 3", g.name);
+    // the hysteria2 member is left out, the rest kept in the config's order
+    try std.testing.expectEqual(3, g.members.len);
+    try std.testing.expectEqualStrings("1.example", g.members[0].host);
+    try std.testing.expectEqualStrings("2.example", g.members[1].host);
+    try std.testing.expectEqual(8388, g.members[2].port);
+    try std.testing.expectEqualStrings(g.members[0].link, g.link);
+    try std.testing.expect(std.mem.startsWith(u8, g.members[1].link, "trojan://p@2.example:8443?type=ws&security=tls"));
+    const single = parsed.servers[1];
+    try std.testing.expectEqual(0, single.members.len);
+    try std.testing.expectEqualStrings("DE", &single.country);
+}
+
+test "subscription headers, plain and base64" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // "BLACKWALL free" and "72 серверов, проверено 18.11, 02:07 МСК"
+    const m = try metaFromHeaders(a, "base64:QkxBQ0tXQUxMIGZyZWU=", " 1 ", "base64:NzIg0YHQtdGA0LLQtdGA0L7Qsiwg0L/RgNC+0LLQtdGA0LXQvdC+IDE4LjExLCAwMjowNyDQnNCh0Jo=", "https://t.me/BLACKWALLapp");
+    try std.testing.expectEqualStrings("BLACKWALL free", m.title.?);
+    try std.testing.expectEqual(1, m.update_hours.?);
+    try std.testing.expectEqualStrings("72 серверов, проверено 18.11, 02:07 МСК", m.announce.?);
+    try std.testing.expectEqualStrings("https://t.me/BLACKWALLapp", m.support_url.?);
+    const plain = try metaFromHeaders(a, "My VPN", "999", null, "javascript:alert(1)");
+    try std.testing.expectEqualStrings("My VPN", plain.title.?);
+    try std.testing.expectEqual(168, plain.update_hours.?);
+    try std.testing.expectEqual(null, plain.support_url);
+}
+
+test "xray json: the balancer the traffic goes to, and its fallback" {
+    const body =
+        \\{"remarks":"Auto","outbounds":[
+        \\  {"tag":"ru-1","protocol":"vless","settings":{"vnext":[{"address":"r.example","port":443,"users":[{"id":"r"}]}]}},
+        \\  {"tag":"eu-1","protocol":"vless","settings":{"vnext":[{"address":"e1.example","port":443,"users":[{"id":"a"}]}]}},
+        \\  {"tag":"eu-2","protocol":"vless","settings":{"vnext":[{"address":"e2.example","port":443,"users":[{"id":"b"}]}]}},
+        \\  {"tag":"spare","protocol":"trojan","settings":{"servers":[{"address":"s.example","port":443,"password":"p"}]}}],
+        \\ "routing":{"balancers":[{"tag":"ru","selector":["ru-"]},{"tag":"eu","selector":["eu-"],"fallbackTag":"spare","strategy":{"type":"leastPing"}}],
+        \\   "rules":[{"type":"field","domain":["geosite:category-ru"],"balancerTag":"ru"},{"type":"field","network":"tcp,udp","balancerTag":"eu"}]}}
+    ;
+    var parsed = try parseBody(std.testing.allocator, body);
+    defer parsed.deinit();
+    const g = parsed.servers[0];
+    try std.testing.expectEqual(3, g.members.len);
+    try std.testing.expectEqualStrings("e1.example", g.members[0].host);
+    try std.testing.expectEqualStrings("e2.example", g.members[1].host);
+    try std.testing.expectEqualStrings("s.example", g.members[2].host);
+}
+
+test "a plain list's own header lines" {
+    const body =
+        \\#profile-title: BLACKWALL
+        \\#profile-update-interval: 3
+        \\#announce: 72 серверов
+        \\vless://11111111-2222-3333-4444-555555555555@a.example:443?security=tls#A
+    ;
+    var parsed = try parseBody(std.testing.allocator, body);
+    defer parsed.deinit();
+    try std.testing.expectEqual(1, parsed.servers.len);
+    try std.testing.expectEqualStrings("BLACKWALL", parsed.meta.title.?);
+    try std.testing.expectEqual(3, parsed.meta.update_hours.?);
+    try std.testing.expectEqualStrings("72 серверов", parsed.meta.announce.?);
+    try std.testing.expectEqual(null, parsed.meta.support_url);
 }

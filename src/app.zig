@@ -70,9 +70,9 @@ var dirty: bool = false;
 pub var persist: bool = true;
 
 const Result = union(enum) {
-    ping: struct { id: u32, ms: ?u16 },
+    ping: struct { id: u32, member: ?u8, ms: ?u16 },
     ping_done,
-    sub: struct { sub_id: u32, body: ?[]u8 },
+    sub: struct { sub_id: u32, body: ?[]u8, meta: ?Meta = null },
     update_staged: std.SemanticVersion,
     update_failed: std.SemanticVersion,
     link: link_mod.Event,
@@ -222,9 +222,7 @@ pub fn save() void {
 /// change with the server list and with latency results.
 fn refreshCarried() void {
     if (state.demo) return;
-    for (state.servers.items) |*sv| {
-        sv.carried = if (core.proxy.outboundFromLink(sv.link, sv.host, sv.port)) |_| true else |_| false;
-    }
+    for (state.servers.items) |*sv| sv.carried = core.proxy.carries(sv);
     updateAutoServer();
 }
 
@@ -253,6 +251,8 @@ pub fn frame() void {
     if (last_tick_ns == 0) last_tick_ns = now;
     if (now - last_tick_ns >= std.time.ns_per_s) {
         last_tick_ns = now;
+        // the provider's refresh period (profile-update-interval)
+        if (!state.demo and persist) if (state.dueForRefresh(Io.Clock.real.now(io).toSeconds())) |sub| fetch(sub.id);
         // while the service runs, its status reports drive the counters
         if (!service_on) {
             reportFault(now);
@@ -292,10 +292,7 @@ fn drainResults() void {
     defer batch.deinit(gpa);
 
     for (batch.items) |r| switch (r) {
-        .ping => |p| if (state.serverById(p.id)) |sv| {
-            sv.ping_ms = p.ms;
-            sv.ping_state = if (p.ms != null) .ok else .failed;
-        },
+        .ping => |p| state.recordPing(p.id, p.member, p.ms),
         .ping_done => {
             probing = false;
             updateAutoServer();
@@ -303,7 +300,9 @@ fn drainResults() void {
         .sub => |s| {
             fetching -|= 1;
             defer if (s.body) |b| gpa.free(b);
-            applyFetched(s.sub_id, s.body);
+            var meta = s.meta;
+            defer if (meta) |*m| m.deinit();
+            applyFetched(s.sub_id, s.body, if (meta) |m| m.value else null);
         },
         .update_staged => |v| update_staged = v,
         .update_failed => |v| updateFailed(v),
@@ -313,7 +312,9 @@ fn drainResults() void {
     };
 }
 
-fn applyFetched(sub_id: u32, body: ?[]u8) void {
+/// A downloaded subscription: its servers, and what the provider says about
+/// it (in the body's comment lines, overridden by its headers).
+fn applyFetched(sub_id: u32, body: ?[]u8, headers: ?model.SubMeta) void {
     const sub = state.subById(sub_id) orelse return;
     const bytes = body orelse {
         sub.last_error = true;
@@ -327,6 +328,8 @@ fn applyFetched(sub_id: u32, body: ?[]u8) void {
     };
     defer parsed.deinit();
     state.applySubscription(sub_id, parsed.servers) catch return;
+    state.applyMeta(sub_id, parsed.meta) catch {};
+    if (headers) |h| state.applyMeta(sub_id, h) catch {};
     refreshCarried();
     if (state.subById(sub_id)) |s2| {
         s2.last_error = false;
@@ -421,30 +424,74 @@ pub fn fetchAll() void {
 
 fn fetchThread(sub_id: u32, url: []u8) void {
     defer gpa.free(url);
-    pushResult(.{ .sub = .{ .sub_id = sub_id, .body = download(url) catch null } });
+    var meta: ?Meta = null;
+    const body = download(url, &meta) catch null;
+    pushResult(.{ .sub = .{ .sub_id = sub_id, .body = body, .meta = meta } });
 }
 
-fn download(url: []const u8) ![]u8 {
+/// What the provider's headers said, decoded (its own arena).
+const Meta = struct {
+    arena: std.heap.ArenaAllocator,
+    value: model.SubMeta,
+
+    fn deinit(m: *Meta) void {
+        m.arena.deinit();
+    }
+};
+
+/// The subscription's body; its headers into `meta` (title, refresh
+/// period, announcement, support link). Providers pick the format by the
+/// User-Agent: Xray JSON (with groups) for the clients they know.
+fn download(url: []const u8, meta: *?Meta) ![]u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
+    const uri = try std.Uri.parse(url);
+    var req = try client.request(.GET, uri, .{
+        .redirect_behavior = .init(3),
+        .headers = .{ .user_agent = .{ .override = "BLACKWALL/" ++ @import("build_options").version } },
+    });
+    defer req.deinit();
+    try req.sendBodiless();
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var res = try req.receiveHead(&redirect_buf);
+    if (res.head.status != .ok) return error.BadStatus;
+
+    // the header bytes are the connection's: decoded before the body is read
+    var m: Meta = .{ .arena = .init(gpa), .value = .{} };
+    errdefer m.deinit();
+    var title: ?[]const u8 = null;
+    var interval: ?[]const u8 = null;
+    var announce: ?[]const u8 = null;
+    var support: ?[]const u8 = null;
+    var it = res.head.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "profile-title")) title = h.value;
+        if (std.ascii.eqlIgnoreCase(h.name, "profile-update-interval")) interval = h.value;
+        if (std.ascii.eqlIgnoreCase(h.name, "announce")) announce = h.value;
+        if (std.ascii.eqlIgnoreCase(h.name, "support-url")) support = h.value;
+    }
+    m.value = try core.sublink.metaFromHeaders(m.arena.allocator(), title, interval, announce, support);
+
     var out: Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    const res = try client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &out.writer,
-        .headers = .{ .user_agent = .{ .override = "blackwall/" ++ @import("build_options").version } },
-    });
-    if (res.status != .ok) return error.BadStatus;
-    if (out.written().len > 4 << 20) return error.TooLarge;
+    const decompress_buf = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(decompress_buf);
+    var transfer_buf: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = res.readerDecompressing(&transfer_buf, &decompress, decompress_buf);
+    _ = reader.stream(&out.writer, .limited(4 << 20)) catch |err| switch (err) {
+        error.ReadFailed => return res.bodyErr().?,
+        else => |e| return e,
+    };
+    if (out.written().len >= 4 << 20) return error.TooLarge;
+    meta.* = m;
     return out.toOwnedSlice();
 }
 
 // ---------------------------------------------------------------- latency
 
-const Target = struct { id: u32, host: []u8, port: u16 };
-
 const ProbeJob = struct {
-    targets: []Target,
+    targets: []model.State.ProbeTarget,
     /// measured by the service: its sockets bypass the TUN, ours do not
     via_service: bool,
     next: std.atomic.Value(usize) = .init(0),
@@ -456,22 +503,13 @@ const probe_workers = 4;
 /// TCP connect time to every server, a few at a time.
 pub fn probeAll() void {
     if (probing or state.demo) return;
-    var list: std.ArrayList(Target) = .empty;
-    for (state.servers.items) |*sv| {
-        if (!sv.available or sv.host.len == 0) continue;
-        const host = gpa.dupe(u8, sv.host) catch continue;
-        list.append(gpa, .{ .id = sv.id, .host = host, .port = sv.port }) catch {
-            gpa.free(host);
-            continue;
-        };
-        sv.ping_state = .testing;
-    }
-    if (list.items.len == 0) {
-        list.deinit(gpa);
-        return;
-    }
-    const job = gpa.create(ProbeJob) catch return;
-    const targets = list.toOwnedSlice(gpa) catch return;
+    // a group's servers each, so that its time is its best one's
+    const targets = state.probeTargets(gpa) catch return;
+    if (targets.len == 0) return gpa.free(targets);
+    const job = gpa.create(ProbeJob) catch {
+        for (targets) |t| gpa.free(t.host);
+        return gpa.free(targets);
+    };
     const n = @min(probe_workers, targets.len);
     job.* = .{ .targets = targets, .via_service = service_on, .workers_left = .init(n) };
     probing = true;
@@ -490,7 +528,7 @@ fn probeThread(job: *ProbeJob) void {
         if (i >= job.targets.len) break;
         const t = job.targets[i];
         const ms = if (job.via_service) servicePing(t.host, t.port) orelse probe(t.host, t.port) else probe(t.host, t.port);
-        pushResult(.{ .ping = .{ .id = t.id, .ms = ms } });
+        pushResult(.{ .ping = .{ .id = t.id, .member = t.member, .ms = ms } });
     }
     finishWorker(job);
 }
@@ -662,6 +700,8 @@ fn showFault(fault: core.proxy.Fault, now: i128) void {
 /// VPN (or blocks them) stay without network when the guard is enabled:
 /// the service keeps running for them alone, everything else goes direct.
 pub fn disconnect() void {
+    // a chosen server that left its subscription while in use goes now
+    if (state.dropVanishedChoice()) markDirty();
     proxy.stop();
     retry_at_ns = 0;
     retry_n = 0;

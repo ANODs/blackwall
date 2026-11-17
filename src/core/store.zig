@@ -19,6 +19,13 @@ const ServerDto = struct {
     favorite: bool = false,
     available: bool = true,
     link: []const u8 = "",
+    members: []const MemberDto = &.{},
+};
+
+const MemberDto = struct {
+    link: []const u8,
+    host: []const u8,
+    port: u16,
 };
 
 const SubDto = struct {
@@ -26,6 +33,9 @@ const SubDto = struct {
     name: []const u8,
     url: []const u8,
     updated_unix: i64 = 0,
+    update_hours: u16 = 0,
+    announce: []const u8 = "",
+    support_url: []const u8 = "",
 };
 
 const RuleDto = struct {
@@ -61,7 +71,15 @@ pub fn serialize(gpa: std.mem.Allocator, s: *const model.State) ![]u8 {
     var domains: std.ArrayList(DomainDto) = .empty;
     if (!s.demo) {
         for (s.domains.items) |d| try domains.append(a, .{ .name = d.name, .route = d.route });
-        for (s.subs.items) |sub| try subs.append(a, .{ .id = sub.id, .name = sub.name, .url = sub.url, .updated_unix = sub.updated_unix });
+        for (s.subs.items) |sub| try subs.append(a, .{
+            .id = sub.id,
+            .name = sub.name,
+            .url = sub.url,
+            .updated_unix = sub.updated_unix,
+            .update_hours = sub.update_hours,
+            .announce = sub.announce,
+            .support_url = sub.support_url,
+        });
         for (s.servers.items) |*sv| try servers.append(a, .{
             .id = sv.id,
             .sub_id = sv.sub_id,
@@ -74,6 +92,11 @@ pub fn serialize(gpa: std.mem.Allocator, s: *const model.State) ![]u8 {
             .favorite = sv.favorite,
             .available = sv.available,
             .link = sv.link,
+            .members = blk: {
+                const ms = try a.alloc(MemberDto, sv.members.len);
+                for (sv.members, ms) |m, *d| d.* = .{ .link = m.link, .host = m.host, .port = m.port };
+                break :blk ms;
+            },
         });
         for (s.apps.items) |app| {
             if (app.route == .default) continue;
@@ -112,23 +135,29 @@ pub fn deserialize(gpa: std.mem.Allocator, s: *model.State, bytes: []const u8) !
             .name = try s.gpa.dupe(u8, d.name),
             .url = try s.gpa.dupe(u8, d.url),
             .updated_unix = d.updated_unix,
+            .update_hours = d.update_hours,
+            .announce = try s.gpa.dupe(u8, d.announce),
+            .support_url = try s.gpa.dupe(u8, d.support_url),
         });
         s.next_id = @max(s.next_id, d.id + 1);
     }
     for (f.servers) |d| {
-        try s.servers.append(s.gpa, .{
-            .id = d.id,
-            .sub_id = d.sub_id,
-            .name = try s.gpa.dupe(u8, d.name),
-            .host = try s.gpa.dupe(u8, d.host),
+        var members: std.ArrayList(model.State.NewMember) = .empty;
+        defer members.deinit(gpa);
+        for (d.members) |m| try members.append(gpa, .{ .link = m.link, .host = m.host, .port = m.port });
+        const sv = try s.addServer(d.sub_id, .{
+            .name = d.name,
+            .host = d.host,
             .port = d.port,
             .protocol = d.protocol,
             .security = d.security,
             .country = if (d.country.len == 2) d.country[0..2].* else "??".*,
-            .favorite = d.favorite,
-            .available = d.available,
-            .link = try s.gpa.dupe(u8, d.link),
+            .link = d.link,
+            .members = members.items,
         });
+        sv.id = d.id;
+        sv.favorite = d.favorite;
+        sv.available = d.available;
         s.next_id = @max(s.next_id, d.id + 1);
     }
     for (f.rules) |d| {
@@ -213,4 +242,37 @@ test "demo data is never written to disk" {
     const bytes = try serialize(gpa, &a);
     defer gpa.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "demo://") == null);
+}
+
+test "round trip keeps groups and what the provider said" {
+    const gpa = std.testing.allocator;
+    var s: model.State = .init(gpa);
+    defer s.deinit();
+    const sub_id = (try s.addSubscription("free", "https://example.invalid/s/x")).id;
+    try s.applyMeta(sub_id, .{ .update_hours = 1, .announce = "72 servers", .support_url = "https://t.me/x" });
+    const g = try s.addServer(sub_id, .{
+        .name = "Auto 1",
+        .host = "1.example",
+        .port = 443,
+        .protocol = .vless,
+        .link = "vless://a@1.example:443",
+        .members = &.{ .{ .link = "vless://a@1.example:443", .host = "1.example", .port = 443 }, .{ .link = "vless://b@2.example:8443", .host = "2.example", .port = 8443 } },
+    });
+    g.favorite = true;
+    const id = g.id;
+    const bytes = try serialize(gpa, &s);
+    defer gpa.free(bytes);
+
+    var back: model.State = .init(gpa);
+    defer back.deinit();
+    try deserialize(gpa, &back, bytes);
+    const b = back.serverById(id).?;
+    try std.testing.expect(b.favorite);
+    try std.testing.expectEqual(2, b.members.len);
+    try std.testing.expectEqual(8443, b.members[1].port);
+    try std.testing.expectEqualStrings("vless://b@2.example:8443", b.members[1].link);
+    const sub = back.subById(sub_id).?;
+    try std.testing.expectEqual(1, sub.update_hours);
+    try std.testing.expectEqualStrings("72 servers", sub.announce);
+    try std.testing.expectEqualStrings("https://t.me/x", sub.support_url);
 }
