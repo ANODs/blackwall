@@ -2253,6 +2253,16 @@ const TestPeer = struct {
     }
 };
 
+/// A relay counts a chunk after passing it on, so the client can have the
+/// bytes a moment before the counter does.
+fn expectCount(want: u64, counter: *const std.atomic.Value(u64)) !void {
+    for (0..300) |_| {
+        if (counter.load(.monotonic) == want) return;
+        std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(want, counter.load(.monotonic));
+}
+
 fn socksRoundTrip(io: Io, proxy_port: u16, dest: [4]u8, dest_port: u16, payload: []const u8) !void {
     const address: net.IpAddress = .{ .ip4 = .loopback(proxy_port) };
     const s = try address.connect(io, .{ .mode = .stream });
@@ -2286,8 +2296,8 @@ test "socks5 -> direct carries bytes and counts them" {
     defer p.stop();
     try socksRoundTrip(io, p.port, .{ 127, 0, 0, 1 }, peer.port, "hello through direct");
     peer.thread.join();
-    try std.testing.expectEqual(20, p.meter.up.load(.monotonic));
-    try std.testing.expectEqual(20, p.meter.down.load(.monotonic));
+    try expectCount(20, &p.meter.up);
+    try expectCount(20, &p.meter.down);
 }
 
 test "socks5 -> vless sends a valid request and strips the response header" {
@@ -2306,7 +2316,7 @@ test "socks5 -> vless sends a valid request and strips the response header" {
     try socksRoundTrip(io, p.port, .{ 10, 9, 8, 7 }, 4242, "hello through vless");
     peer.thread.join();
     try std.testing.expect(peer.header_ok);
-    try std.testing.expectEqual(19, p.meter.down.load(.monotonic));
+    try expectCount(19, &p.meter.down);
 }
 
 test "socks5 -> vless inside HTTPUpgrade: the transport's layer carries the flow" {
@@ -2327,7 +2337,7 @@ test "socks5 -> vless inside HTTPUpgrade: the transport's layer carries the flow
     try socksRoundTrip(io, p.port, .{ 10, 9, 8, 7 }, 4242, "hello through httpupgrade");
     peer.thread.join();
     try std.testing.expect(peer.upgrade_ok and peer.header_ok);
-    try std.testing.expectEqual(25, p.meter.down.load(.monotonic));
+    try expectCount(25, &p.meter.down);
     try std.testing.expectEqual(Fault.none, p.meter.fault.load(.monotonic));
 }
 
