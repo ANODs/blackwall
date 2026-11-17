@@ -149,20 +149,7 @@
     "clients": {
       "dev.blackwall": {
         "name": "BLACKWALL",
-        "version": "0.2.2",
-        "idle_pss_mb": 17.3,
-        "peak_rss_mb": 124.7,
-        "idle_cpu_ms_s": 0.83,
-        "mbps": 457,
-        "par_mbps": 749,
-        "cpu_ms_per_gb": 12803,
-        "handshake_ms": 1.7,
-        "apk_mb": 3.0,
-        "installed_mb": 3.1
-      },
-      "dev.blackwall.next": {
-        "name": "BLACKWALL (next)",
-        "version": "0.2.2 + quiet status, LAN outside the VPN",
+        "version": "0.2.3",
         "idle_pss_mb": 23.2,
         "peak_rss_mb": 125.8,
         "idle_cpu_ms_s": 0.17,
@@ -171,7 +158,8 @@
         "cpu_ms_per_gb": 13175,
         "handshake_ms": 1.8,
         "apk_mb": 3.0,
-        "installed_mb": 3.1
+        "installed_mb": 3.1,
+        "build": "main 356b4b9, the code of 0.2.3 (measured before its version number changed)"
       },
       "moe.nb4a": {
         "name": "NekoBox",
@@ -205,6 +193,39 @@
       "direct_par_mbps": 1415,
       "note": "the emulator's own network, no VPN"
     },
-    "note": "sing-box (NekoBox, Hiddify) sets MTU 9000 on its tun; BLACKWALL 1500"
+    "note": "sing-box (NekoBox, Hiddify) sets MTU 9000 on its tun; BLACKWALL 1500",
+    "battery": {
+      "assumptions": {
+        "battery_mah": 5000,
+        "volts": 3.85,
+        "awake_hours": 8,
+        "day_gb": [
+          2,
+          10
+        ],
+        "joules_per_cpu_s": 3.97,
+        "joules_from": "kernel energy counters of the desktop bench on the same Mac"
+      },
+      "clients": {
+        "dev.blackwall": {
+          "pct_2gb": 0.18,
+          "pct_10gb": 0.78,
+          "minutes_2gb": 2.6,
+          "minutes_10gb": 11.3
+        },
+        "moe.nb4a": {
+          "pct_2gb": 0.23,
+          "pct_10gb": 0.81,
+          "minutes_2gb": 3.3,
+          "minutes_10gb": 11.6
+        },
+        "app.hiddify.com": {
+          "pct_2gb": 1.83,
+          "pct_10gb": 3.1,
+          "minutes_2gb": 26.3,
+          "minutes_10gb": 44.6
+        }
+      }
+    }
   }
 }

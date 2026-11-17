@@ -26,6 +26,8 @@ Counters come from the emulator's kernel, summed over every process of the packa
     cpu_ms_per_gb  CPU time per GB carried
     handshake_ms   a small request on a new connection, median
     apk_mb, installed_mb
+
+    python3 tools/bench/android.py battery   the battery estimate again (see battery())
 """
 
 import base64
@@ -186,12 +188,56 @@ def measure(package: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------- battery, estimated
+
+BATTERY_J = 5000e-3 * 3.85 * 3600  # a 5000 mAh phone battery at 3.85 V
+AWAKE_S = 8 * 3600  # hours a day the phone is not asleep, VPN on all day
+DAY_GB = (2, 10)  # a usual day's traffic, a heavy one
+
+
+def joules_per_cpu_s(data: dict) -> float:
+    """Energy per second of CPU on this Mac, from the kernel's own counters in the desktop
+    bench (run.py, Shadowsocks 2022, every client): the emulator ran on the same cores."""
+    rows = [r for r in data.get("local", {}).get("protocols", {}).get("ss2022", {}).values()
+            if r and r.get("cpu_ms_per_gb") and r.get("energy_j_per_gb")]
+    if not rows:
+        return 4.0
+    return statistics.median(r["energy_j_per_gb"] / (r["cpu_ms_per_gb"] / 1000) for r in rows)
+
+
+def battery(data: dict) -> None:
+    """Share of a phone battery a client's own CPU takes in a day: idle while the phone is
+    awake, plus its CPU per GB carried. Not measured on a phone: the radio, the same for
+    every client, is left out, and so is deep sleep with the screen off."""
+    part = data["android"]
+    j = joules_per_cpu_s(data)
+    out = {"assumptions": {"battery_mah": 5000, "volts": 3.85, "awake_hours": AWAKE_S // 3600,
+                           "day_gb": list(DAY_GB), "joules_per_cpu_s": round(j, 2),
+                           "joules_from": "kernel energy counters of the desktop bench on the same Mac"},
+           "clients": {}}
+    for pkg, c in part["clients"].items():
+        cpu_s = {gb: c["idle_cpu_ms_s"] * AWAKE_S / 1000 + c["cpu_ms_per_gb"] / 1000 * gb for gb in DAY_GB}
+        out["clients"][pkg] = {
+            f"pct_{gb}gb": round(cpu_s[gb] * j / BATTERY_J * 100, 2) for gb in DAY_GB
+        } | {
+            # what that share is in minutes, for a phone that lasts a day on a charge
+            f"minutes_{gb}gb": round(cpu_s[gb] * j / BATTERY_J * 24 * 60, 1) for gb in DAY_GB
+        }
+    part["battery"] = out
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "stand":
         return stand()
     if cmd == "stop":
         return stop()
+    if cmd == "battery":  # the estimate again, from the stored measurements
+        data = json.loads(OUT.read_text())
+        battery(data)
+        OUT.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        print(json.dumps(data["android"]["battery"], indent=2))
+        return
     if cmd == "baseline":  # the emulator's own network, no VPN: the ceiling
         got, secs = [float(x) for x in adb(PROBE, "get", "10.0.2.2", str(PORT_PLAIN), str(SINGLE)).split()]
         print(json.dumps({"direct_mbps": round(got * 8 / secs / 1e6)}))
@@ -208,6 +254,7 @@ def main() -> None:
     part["protocol"] = "Shadowsocks 2022"
     version = re.search(r"versionName=(\S+)", adb("dumpsys", "package", package)).group(1)
     part.setdefault("clients", {})[package] = {"name": CLIENTS[package], "version": version, **result}
+    battery(data)
     OUT.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
