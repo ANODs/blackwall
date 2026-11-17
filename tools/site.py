@@ -184,9 +184,44 @@ def bench_data() -> dict | None:
     return json.loads(p.read_text()) if p.exists() else None
 
 
+MONTHS = {
+    "en": ["January", "February", "March", "April", "May", "June", "July", "August", "September",
+           "October", "November", "December"],
+    "ru": ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
+           "октября", "ноября", "декабря"],
+}
+
+
+def fmt_date(iso: str, lang: str) -> str:
+    """2026-11-17 as the page's language writes it (the same as Intl.DateTimeFormat, long month)."""
+    y, m, d = (int(x) for x in iso.split("-"))
+    if lang == "zh":
+        return f"{y}年{m}月{d}日"
+    if lang == "ru":
+        return f"{d} {MONTHS['ru'][m - 1]} {y} г."
+    return f"{MONTHS['en'][m - 1]} {d}, {y}"
+
+
+def fmt_num(v: float, digits: int, lang: str) -> str:
+    """A number as the page's language writes it: 1 088,5 in Russian, 1,088.5 otherwise."""
+    s = f"{v:,.{digits}f}"
+    return s.replace(",", " ").replace(".", ",") if lang == "ru" else s
+
+
+def hero_tiles(items: list, strings: dict, lang: str) -> str:
+    """Headline ratios, written into the page so that they are read without scripts. Each one
+    is ours against the best of the others; one under 1.2 is not a headline."""
+    out = []
+    for key, r in items:
+        if not r or r < 1.2:
+            continue
+        num = (f"{r:.0f}" if r >= 10 else fmt_num(r, 1, lang)) + "×"
+        out.append(f'<div><b>{num}</b><span>{html.escape(strings["bench_x_" + key])}</span></div>')
+    return "\n".join(out)
+
+
 def bench_hero(bench: dict | None, strings: dict, lang: str) -> str:
-    """The headline ratios, written into the page so that they are read without scripts.
-    Each is against the best of the other clients, and the smallest over both protocols."""
+    """macOS: each ratio against the best of the other cores, the smallest over both protocols."""
     if not bench or "local" not in bench:
         return ""
     protos = [p for p in bench["local"]["protocols"].values()]
@@ -202,21 +237,141 @@ def bench_hero(bench: dict | None, strings: dict, lang: str) -> str:
 
     apps = (bench.get("sizes") or {}).get("app_mb") or {}
     others = [v for k, v in apps.items() if k != "blackwall" and v]
-    items = [
+    return hero_tiles([
         ("memory", ratio("idle_mb")),
         ("peak", ratio("peak_mb")),
         ("start", ratio("start_ms")),
         ("size", min(others) / apps["blackwall"] if apps.get("blackwall") and others else None),
+    ], strings, lang)
+
+
+OURS_ANDROID = "dev.blackwall"
+
+
+def android_hero(bench: dict | None, strings: dict, lang: str) -> str:
+    """Android: memory and size only, where the lead holds against NekoBox as well. Speed and
+    CPU are close to NekoBox's and are left to the table, which shows them as they are."""
+    a = (bench or {}).get("android")
+    if not a or OURS_ANDROID not in a.get("clients", {}):
+        return ""
+    ours = a["clients"][OURS_ANDROID]
+    others = [c for k, c in a["clients"].items() if k != OURS_ANDROID]
+
+    def ratio(key: str) -> float | None:
+        theirs = [c[key] for c in others if c.get(key)]
+        return min(theirs) / ours[key] if ours.get(key) and theirs else None
+
+    return hero_tiles([
+        ("memory", ratio("idle_pss_mb")),
+        ("peak", ratio("peak_rss_mb")),
+        ("apk", ratio("apk_mb")),
+        ("installed", ratio("installed_mb")),
+    ], strings, lang)
+
+
+def android_table(bench: dict | None, strings: dict, lang: str) -> str:
+    """The Android comparison as a table in the page: a row per measure, a column per client.
+    In each row the best value is lit, whoever it belongs to; the caveats sit under the rows
+    they are about. Bars are scaled to the row's largest value, speeds to the speed without
+    a VPN on the same emulator."""
+    a = (bench or {}).get("android")
+    if not a or OURS_ANDROID not in a.get("clients", {}):
+        return ""
+    e = lambda s: html.escape(s, quote=True)  # noqa: E731
+    t = lambda k: e(strings[k])  # noqa: E731
+    pkgs = [OURS_ANDROID] + [k for k in a["clients"] if k != OURS_ANDROID]
+    clients = a["clients"]
+    battery = (a.get("battery") or {}).get("clients", {})
+    assume = (a.get("battery") or {}).get("assumptions", {})
+    base = a.get("baseline") or {}
+    core = {OURS_ANDROID: "Zig"}
+
+    def field(key, scale=1.0):
+        return lambda pkg: (clients[pkg].get(key) / scale) if clients[pkg].get(key) is not None else None
+
+    def batt(key):
+        return lambda pkg: (battery.get(pkg) or {}).get(key)
+
+    # group, lower is better, [(label, value, digits, ceiling, sub-label)]
+    groups = [
+        ("memory", True, [("idle_mem", field("idle_pss_mb"), 1, None, ""),
+                          ("peak_mem", field("peak_rss_mb"), 1, None, "")]),
+        ("cpu", True, [("idle_cpu", field("idle_cpu_ms_s"), 2, None, ""),
+                       ("cpu_gb", field("cpu_ms_per_gb", 1000), 1, None, "")]),
+        ("speed", False, [("single", field("mbps"), 0, base.get("direct_mbps"), "direct_mbps"),
+                          ("par", field("par_mbps"), 0, base.get("direct_par_mbps"), "direct_par_mbps")]),
+        ("latency", True, [("hs", field("handshake_ms"), 1, None, "")]),
+        ("size", True, [("apk", field("apk_mb"), 1, None, ""),
+                        ("installed", field("installed_mb"), 1, None, "")]),
+        ("battery", True, [("day2", batt("pct_2gb"), 2, None, ""),
+                           ("day10", batt("pct_10gb"), 2, None, "")]),
     ]
-    out = []
-    for key, r in items:
-        if not r or r < 1.2:
+    notes = {
+        "speed": strings["bench_a_mtu"] if a.get("note") and "9000" in a["note"] else "",
+        "battery": strings["bench_a_battery"].replace("{mah}", str(assume.get("battery_mah", "")))
+                                             .replace("{hours}", str(assume.get("awake_hours", ""))),
+    }
+
+    out = [f'<table class="at" role="table" aria-label="{t("bench_a_caption")}">',
+           '<thead role="rowgroup"><tr role="row">',
+           f'<th class="at-c" role="columnheader" scope="col">{e(a.get("protocol", ""))}</th>']
+    for pkg in pkgs:
+        c = clients[pkg]
+        sub = f'{c.get("version", "")} · {core.get(pkg, "sing-box")}'
+        me = ' class="me"' if pkg == OURS_ANDROID else ""
+        out.append(f'<th{me} role="columnheader" scope="col"><b>{e(c["name"])}</b><span>{e(sub)}</span></th>')
+    out.append("</tr></thead>")
+
+    row_i = 0
+    for g, lower, rows in groups:
+        if not any(get(p) is not None for _, get, *_ in rows for p in pkgs):
             continue
-        num = f"{r:.0f}×" if r >= 10 else f"{r:.1f}×"
-        if lang == "ru":
-            num = num.replace(".", ",")
-        out.append(f'<div><b>{num}</b><span>{html.escape(strings["bench_x_" + key])}</span></div>')
+        hint = strings["bench_lower" if lower else "bench_higher"]
+        if g == "battery":
+            hint = strings["bench_a_estimate"] + " · " + hint
+        out.append(f'<tbody role="rowgroup"><tr class="at-g" role="row">'
+                   f'<th role="rowheader" scope="rowgroup" colspan="4">{t("bench_ag_" + g)}<span>{e(hint)}</span></th></tr>')
+        for label, get, digits, ceiling, base_key in rows:
+            vals = {p: get(p) for p in pkgs}
+            shown = {p: (round(v, digits) if v is not None else None) for p, v in vals.items()}
+            known = [v for v in shown.values() if v is not None]
+            best = (min if lower else max)(known) if known else None
+            scale = ceiling or max((v for v in vals.values() if v is not None), default=1) or 1
+            sub = ""
+            if base_key and base.get(base_key):
+                sub = f'<span>{e(strings["bench_a_novpn"].replace("{n}", fmt_num(base[base_key], 0, lang)))}</span>'
+            out.append(f'<tr role="row"><th role="rowheader" scope="row">{t("bench_ar_" + label)}{sub}</th>')
+            for col, p in enumerate(pkgs):
+                cls = [c for c in ("me" if p == OURS_ANDROID else "", "best" if shown[p] == best else "") if c]
+                attr = f' class="{" ".join(cls)}"' if cls else ""
+                if vals[p] is None:
+                    out.append(f'<td{attr} role="cell"><b>·</b></td>')
+                    continue
+                w = min(vals[p] / scale * 100, 100)
+                mark = f'<span class="vh"> ({t("bench_best")})</span>' if "best" in cls else ""
+                out.append(f'<td{attr} role="cell"><b>{fmt_num(vals[p], digits, lang)}</b>{mark}'
+                           f'<span class="at-t"><i style="--w:{w:.2f}%;--d:{row_i * 40 + col * 70}ms"></i></span></td>')
+            out.append("</tr>")
+            row_i += 1
+        if notes.get(g):
+            out.append(f'<tr class="at-n" role="row"><td role="cell" colspan="4">{e(notes[g])}</td></tr>')
+        out.append("</tbody>")
+    out.append("</table>")
     return "\n".join(out)
+
+
+def android_foot(bench: dict | None, strings: dict, lang: str) -> str:
+    """Where and how: the emulator, the Mac under it, the date, why Shadowsocks 2022, the counters."""
+    a = (bench or {}).get("android")
+    if not a:
+        return ""
+    device = a.get("device", "")
+    android = re.search(r"Android (\S+)", device)
+    machine = re.search(r"\bon (.+)$", device)
+    return html.escape(strings["bench_a_foot"]
+                       .replace("{android}", android.group(1) if android else "")
+                       .replace("{machine}", machine.group(1) if machine else (bench or {}).get("machine", ""))
+                       .replace("{date}", fmt_date(a["date"], lang) if a.get("date") else ""))
 
 
 def write_sitemap(base: str) -> None:
@@ -287,6 +442,10 @@ def build(offline: bool = False, releases: dict | None = None) -> dict:
             }
             ctx = {
                 "bench_hero": bench_hero(bench, strings[lang], lang),
+                "bench_android_hero": android_hero(bench, strings[lang], lang),
+                "bench_android_table": android_table(bench, strings[lang], lang),
+                "bench_android_foot": android_foot(bench, strings[lang], lang),
+                "bench_android_on": "" if (bench or {}).get("android") else " hidden",
                 "lang": lang,
                 "root": root,
                 "url": base + path,

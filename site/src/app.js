@@ -115,7 +115,30 @@ if (BW.worker && !BW.fresh) {
 (() => {
   const sec = $('#bench'), B = BW.bench;
   if (!sec) return;
-  if (!B || !B.local) { sec.hidden = true; return; }
+  if (!B || (!B.local && !B.android)) { sec.hidden = true; return; }
+  const press = (box, attr, value) => $$('button', box).forEach(b => b.setAttribute('aria-pressed', String(b.dataset[attr] === value)));
+
+  // two views: macOS (the cores side by side on a Mac) and Android (whole apps on an emulator);
+  // a phone sees its own platform first
+  const platBox = $('#bx-plat'), views = $$('.bxp', sec);
+  const setPlat = p => { views.forEach(v => v.classList.toggle('on', v.dataset.p === p)); press(platBox, 'p', p); };
+  $$('button', platBox).forEach(b => b.addEventListener('click', () => setPlat(b.dataset.p)));
+  if (!B.local) { platBox.hidden = true; setPlat('android'); }
+  else if (!B.android) platBox.hidden = true;
+  else if (OS === 'android') setPlat('android');
+
+  // the headline numbers rise and the table's bars grow the first time each is seen
+  const once = [...$$('.bx-hero', sec), ...$$('.at', sec)];
+  if ('IntersectionObserver' in window && !reduce) {
+    const io = new IntersectionObserver(es => es.forEach(e => {
+      if (!e.isIntersecting) return;
+      io.unobserve(e.target);
+      e.target.classList.add('in');
+    }), { rootMargin: '0px 0px -12% 0px' });
+    once.forEach(x => io.observe(x));
+  } else once.forEach(x => x.classList.add('in'));
+
+  if (!B.local) return;  // the rest is the macOS panel
   const T = sec.dataset, bars = $('#bx-bars'), unit = $('#bx-unit'), hint = $('#bx-hint');
   const legend = $('#bx-legend'), note = $('#bx-note'), setBox = $('#bx-set');
   const el = (tag, cls, text) => { const e = d.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
@@ -187,7 +210,6 @@ if (BW.worker && !BW.fresh) {
     note.textContent = footnote();
   }
 
-  const press = (box, attr, value) => $$('button', box).forEach(b => b.setAttribute('aria-pressed', String(b.dataset[attr] === value)));
   $$('#bx-metric button').forEach(b => b.addEventListener('click', () => {
     metric = b.dataset.m;
     press($('#bx-metric'), 'm', metric);
@@ -200,20 +222,15 @@ if (BW.worker && !BW.fresh) {
     draw();
   }));
 
-  // the bars grow the first time they are seen, the headline numbers rise in turn
-  const hero = $('.bx-hero', sec);
+  // the bars grow the first time they are seen (also after a switch from Android)
   if ('IntersectionObserver' in window && !reduce) {
     const io = new IntersectionObserver(es => es.forEach(e => {
       if (!e.isIntersecting) return;
       io.unobserve(e.target);
-      if (e.target === hero) hero.classList.add('in'); else draw();
+      draw();
     }), { rootMargin: '0px 0px -12% 0px' });
-    io.observe(hero);
     io.observe(bars);
-  } else {
-    hero.classList.add('in');
-    draw();
-  }
+  } else draw();
 })();
 
 /* ---------- statistics: what the worker has counted, open to everyone ---------- */

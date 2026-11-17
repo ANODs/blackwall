@@ -138,7 +138,16 @@
   data-u-memory="{{bench_u_memory}}" data-u-start="{{bench_u_start}}" data-u-size="{{bench_u_size}}" data-u-cpu="{{bench_u_cpu}}"
   data-u-speed="{{bench_u_speed}}" data-u-speed-remote="{{bench_u_speed_remote}}" data-u-latency="{{bench_u_latency}}">
   <div class="wrap">
-    <h2 class="rv">{{bench_h}}</h2>
+    <div class="bx-head">
+      <h2 class="rv">{{bench_h}}</h2>
+      <div class="seg rv" id="bx-plat" role="group" aria-label="{{bench_plat}}" style="--i:1"{{@bench_android_on}}>
+        <button type="button" data-p="mac" aria-pressed="true">macOS</button>
+        <button type="button" data-p="android" aria-pressed="false">Android</button>
+      </div>
+    </div>
+
+    <div class="bxp on" data-p="mac">
+    <h3 class="vh">macOS</h3>
     <div class="bx-hero">
 {{@bench_hero}}
     </div>
@@ -162,6 +171,18 @@
       <div class="bx-legend" id="bx-legend" hidden><i class="sw sw-solid"></i>{{bench_idle}}<i class="sw sw-faint"></i>{{bench_peak}}</div>
       <div class="bx-bars" id="bx-bars"></div>
       <p class="bx-foot"><span id="bx-note"></span> <a href="{{@repo_url}}/tree/main/tools/bench" rel="noopener">{{bench_how}}</a></p>
+    </div>
+    </div>
+
+    <div class="bxp" data-p="android"{{@bench_android_on}}>
+    <h3 class="vh">Android</h3>
+    <div class="bx-hero">
+{{@bench_android_hero}}
+    </div>
+    <div class="bx bx-a rv" style="--i:2">
+{{@bench_android_table}}
+      <p class="bx-foot">{{@bench_android_foot}} <a href="{{@repo_url}}/blob/main/tools/bench/android.py" rel="noopener">{{bench_how}}</a></p>
+    </div>
     </div>
   </div>
 </section>
