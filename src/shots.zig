@@ -13,7 +13,7 @@ var step: usize = 0;
 var picture: ?dvui.Picture = null;
 
 const settle = 10;
-const Action = enum { none, off, click_route, rules, add_site, open_add, add_keys };
+const Action = enum { none, off, click_route, rules, add_site, settings_end, open_add, add_keys };
 const plan = [_]struct { app.Screen, Action, []const u8 }{
     .{ .connect, .off, "1-connect-off" },
     .{ .connect, .none, "2-connect-on" },
@@ -24,6 +24,7 @@ const plan = [_]struct { app.Screen, Action, []const u8 }{
     .{ .servers, .none, "5-servers" },
     .{ .stats, .none, "6-stats" },
     .{ .settings, .none, "7-settings" },
+    .{ .settings, .settings_end, "7b-settings-about" },
     .{ .servers, .open_add, "8-add-dialog" },
     .{ .servers, .add_keys, "9-own-keys" },
 };
@@ -49,7 +50,12 @@ pub fn init() void {
 pub fn before() bool {
     if (dir_path == null) return false;
     const idx = step / settle;
-    if (idx >= plan.len) return true;
+    if (idx >= plan.len) {
+        // and the report for GitHub, as it would be saved now
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (@import("report.zig").save(dir_path.?, &buf)) |path| std.log.info("report: {s}", .{path});
+        return true;
+    }
     const p = plan[idx];
     const phase = step % settle;
     app.screen = p[0];
@@ -62,6 +68,7 @@ pub fn before() bool {
         },
         .rules => @import("ui/screens/apps.zig").filter = 2,
         .add_site => @import("ui/screens/apps.zig").adding = true,
+        .settings_end => {},
         .open_add => {
             @import("ui/screens/apps.zig").filter = 0;
             @import("ui/screens/apps.zig").adding = false;
@@ -80,6 +87,10 @@ pub fn before() bool {
             if (phase == 4) _ = app.win.addEventMouseButton(.left, .press) catch {};
             if (phase == 5) _ = app.win.addEventMouseButton(.left, .release) catch {};
         }
+    } else if (p[1] == .settings_end) {
+        // the end of the list: About
+        if (phase == 1) _ = app.win.addEventMouseMotion(.{ .pt = dvui.windowRectPixels().center() }) catch {};
+        if (phase == 2) _ = app.win.addEventMouseWheel(-6000, .vertical, .mouse) catch {};
     } else if (phase == 0 and p[1] != .add_site) {
         _ = app.win.addEventMouseMotion(.{ .pt = .{ .x = 2, .y = 2 } }) catch {};
         _ = app.win.addEventKey(.{ .code = .escape, .action = .down, .mod = .none }) catch {};

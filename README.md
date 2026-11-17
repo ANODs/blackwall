@@ -92,6 +92,8 @@ release is a single file of 3 to 14 MB.
 - A menu bar / tray item with the state, the server, the current speed and the two or
   three actions you need.
 - Signed automatic updates. Settings, subscriptions and rules are kept.
+- A report for GitHub issues in Settings: the recent log as a file, with links, keys and
+  the addresses of servers and sites taken out.
 - English, Russian and Chinese.
 
 <p align="center">

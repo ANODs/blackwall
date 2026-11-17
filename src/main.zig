@@ -32,7 +32,7 @@ pub const dvui_app: dvui.App = .{
 };
 pub const main = dvui.App.main;
 pub const panic = dvui.App.panic;
-pub const std_options: std.Options = .{ .logFn = dvui.App.logFn };
+pub const std_options: std.Options = .{ .logFn = @import("report.zig").logFn };
 
 fn init(win: *dvui.Window) !void {
     dvui.ScrollBarWidget.defaults.min_size_content = .{ .w = 6, .h = 6 };

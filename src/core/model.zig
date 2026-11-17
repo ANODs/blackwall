@@ -146,7 +146,7 @@ pub const Settings = struct {
     notifications: bool = true,
     sounds: bool = false,
     reduce_motion: bool = false,
-    /// Install new releases by itself (only in builds made with an update repository).
+    /// Install new releases by itself (not in builds made with `-Dupdate-repo=`).
     auto_update: bool = true,
     mtu: u16 = 0, // 0 = auto
     /// Route for apps without a rule.

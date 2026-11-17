@@ -27,6 +27,15 @@ no advertising, no crash reporting and no tracking in it, on any platform.
 - **Updates** (desktop only): the app asks GitHub which release is the latest and
   downloads it from there. GitHub sees your IP address, as with any download.
 
+## A report for a bug
+
+**Settings → Report for GitHub** saves a text file with the app's recent log to your
+Downloads folder and opens a new issue on GitHub; the app itself sends nothing. Before the
+file is written, the app takes out subscription and server links, keys, user ids, e-mail
+addresses, your user name in folder paths, and the names and public addresses of servers
+and sites (each becomes a meaningless token such as `<host:3fa2c1>.com`). You see the file
+and decide whether to attach it.
+
 ## Android: why the app is a VPN
 
 On Android the app uses the system's `VpnService` to carry the traffic of your

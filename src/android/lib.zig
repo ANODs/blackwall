@@ -62,6 +62,27 @@ const GetDirectBufferCapacity = *const fn (JniEnv, ?*anyopaque) callconv(.c) i64
 
 /// The text of a QR code in `gray` (w×h bytes) into `out`: its length, or
 /// -1 when there is none.
+/// A report's text without secrets (core/diag.zig): `in` holds `n` bytes of
+/// UTF-8, the result goes to `out`. Its length, or -1 when it does not fit.
+export fn Java_dev_blackwall_Core_scrub(env: JniEnv, class: ?*anyopaque, in: ?*anyopaque, n: c_int, out: ?*anyopaque) callconv(.c) c_int {
+    _ = class;
+    const fns = env.*;
+    const address: GetDirectBufferAddress = @ptrCast(@alignCast(fns[230] orelse return -1));
+    const capacity: GetDirectBufferCapacity = @ptrCast(@alignCast(fns[231] orelse return -1));
+    if (n < 0) return -1;
+    const len: usize = @intCast(n);
+    const in_ptr = address(env, in) orelse return -1;
+    if (capacity(env, in) < len) return -1;
+    const out_ptr = address(env, out) orelse return -1;
+    const out_len: usize = @intCast(@max(0, capacity(env, out)));
+    var w: std.Io.Writer = .fixed(out_ptr[0..out_len]);
+    var key: [8]u8 = undefined;
+    std.c.arc4random_buf(&key, key.len);
+    const s: core.diag.Scrub = .{ .key = std.mem.readInt(u64, &key, .little) };
+    s.write(&w, in_ptr[0..len]) catch return -1;
+    return @intCast(w.buffered().len);
+}
+
 export fn Java_dev_blackwall_Core_qr(env: JniEnv, class: ?*anyopaque, gray: ?*anyopaque, w: c_int, h: c_int, out: ?*anyopaque) callconv(.c) c_int {
     _ = class;
     const fns = env.*;

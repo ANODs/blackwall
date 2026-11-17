@@ -803,6 +803,29 @@ public class Main extends Activity implements Core.Listener {
         });
         col.addView(always);
 
+        ImageView send = new ImageView(this);
+        send.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));
+        View report = setting(R.string.s_report, R.string.s_report_d, send);
+        report.setOnClickListener(v -> {
+            final JSONObject state = core.state;
+            new Thread(() -> {
+                final String name = Report.save(this, state);
+                runOnUiThread(() -> {
+                    if (name == null) {
+                        toast(getString(R.string.report_failed));
+                        return;
+                    }
+                    toast(getString(R.string.report_saved, name));
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, Report.issue(this, name)));
+                    } catch (Exception e) {
+                        // no browser
+                    }
+                });
+            }).start();
+        });
+        col.addView(report);
+
         // Google Play asks for the policy to be reachable from inside the app
         ImageView open = new ImageView(this);
         open.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));

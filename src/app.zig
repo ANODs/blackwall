@@ -50,6 +50,8 @@ pub fn back() void {
     screen = to;
 }
 pub var config_dir: []const u8 = "";
+/// the user's home folder (HOME, or USERPROFILE on Windows)
+pub var home_dir: ?[]const u8 = null;
 /// HOME and XDG_CONFIG_HOME, for the login item
 var env_paths: autostart.Env = .{};
 
@@ -90,23 +92,21 @@ pub fn init(w: *dvui.Window) !void {
     // first, so that a fresh version crashing anywhere below is rolled back
     resumeUpdate();
 
-    var home: ?[]const u8 = null;
     if (dvui.App.main_init) |mi| {
         const env = mi.environ_map;
-        home = env.get("HOME") orelse env.get("USERPROFILE");
-        config_dir = try configDir(env, home);
+        home_dir = env.get("HOME") orelse env.get("USERPROFILE");
+        config_dir = try configDir(env, home_dir);
         env_paths = .{ .home = env.get("HOME"), .xdg_config = env.get("XDG_CONFIG_HOME") };
         // screenshot mode (src/shots.zig) touches neither the config nor the service
         if (env.get("BLACKWALL_SHOTS") != null) persist = false;
     }
 
-    const had_config = core.store.load(gpa, io, config_dir, &state) catch |err| blk: {
+    // screenshot mode shows sample data only, never the user's servers
+    if (persist) _ = core.store.load(gpa, io, config_dir, &state) catch |err| {
         std.log.warn("config not loaded: {t}", .{err});
-        break :blk false;
     };
-    _ = had_config;
 
-    apps_platform.discover(io, &state, home);
+    apps_platform.discover(io, &state, home_dir);
     refreshCarried();
 
     if (state.subs.items.len == 0) {
@@ -1204,8 +1204,8 @@ pub fn summary() Summary {
 const update = @import("update");
 const build_options = @import("build_options");
 
-/// Only release builds made by CI know their repository and signing key
-/// (-Dupdate-repo, -Dupdate-pubkey); every other build never updates itself.
+/// Every build knows the project's releases and their signing key, unless
+/// it was made with `-Dupdate-repo=` (empty): that one never updates itself.
 pub const updater_built = build_options.update_repo.len > 0;
 
 const update_cfg: update.Config = .{
@@ -1262,6 +1262,14 @@ fn resumeUpdate() void {
         },
     }
     update_install = inst;
+}
+
+/// For the report: whether this copy updates itself, and if not, why.
+pub fn updaterState() []const u8 {
+    if (!updater_built) return "not in this build";
+    if (update_install == null) return "off: this copy was not installed as a release lays it out";
+    if (!state.settings.auto_update) return "off in the settings";
+    return "on";
 }
 
 /// Background checks, once the settings are loaded.

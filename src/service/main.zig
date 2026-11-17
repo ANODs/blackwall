@@ -61,18 +61,11 @@ var events_fd: if (on_windows) ?std.os.windows.HANDLE else c.fd_t = if (on_windo
 const events_name = "service.events";
 const events_max = 512 * 1024;
 
-/// struct tm (the same leading fields on macOS and Linux; the tail is padding here)
-const Tm = extern struct { sec: c_int, min: c_int, hour: c_int, mday: c_int, mon: c_int, year: c_int, wday: c_int, yday: c_int, isdst: c_int, rest: [32]u8 };
-extern "c" fn time(t: ?*i64) i64;
-extern "c" fn localtime_r(t: *const i64, out: *Tm) ?*Tm;
-
 /// Windows: the calls the events file needs (kernel32).
 const k32 = struct {
     const W: std.builtin.CallingConvention = .winapi;
-    const SYSTEMTIME = extern struct { year: u16, month: u16, wday: u16, day: u16, hour: u16, min: u16, sec: u16, ms: u16 };
     extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disp: u32, flags: u32, template: ?std.os.windows.HANDLE) callconv(W) std.os.windows.HANDLE;
     extern "kernel32" fn WriteFile(h: std.os.windows.HANDLE, buf: [*]const u8, n: u32, written: ?*u32, ov: ?*anyopaque) callconv(W) i32;
-    extern "kernel32" fn GetLocalTime(t: *SYSTEMTIME) callconv(W) void;
     extern "kernel32" fn GetCurrentProcessId() callconv(W) u32;
 };
 
@@ -103,30 +96,8 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
     if (if (on_windows) events_fd == null else events_fd < 0) return;
     var buf: [640]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    var mon: u32 = 0;
-    var day: u32 = 0;
-    var hour: u32 = 0;
-    var min: u32 = 0;
-    var sec: u32 = 0;
-    if (comptime on_windows) {
-        var st: k32.SYSTEMTIME = undefined;
-        k32.GetLocalTime(&st);
-        mon = st.month;
-        day = st.day;
-        hour = st.hour;
-        min = st.min;
-        sec = st.sec;
-    } else {
-        var now: i64 = time(null);
-        var tm: Tm = undefined;
-        _ = localtime_r(&now, &tm);
-        mon = @intCast(tm.mon + 1);
-        day = @intCast(tm.mday);
-        hour = @intCast(tm.hour);
-        min = @intCast(tm.min);
-        sec = @intCast(tm.sec);
-    }
-    w.print("{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}({s}): ", .{ mon, day, hour, min, sec, @tagName(level), @tagName(scope) }) catch {};
+    const t = core.diag.now();
+    w.print("{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}({s}): ", .{ t.mon, t.day, t.hour, t.min, t.sec, @tagName(level), @tagName(scope) }) catch {};
     w.print(format, args) catch {};
     // a line cut short still ends as a line
     if (w.end >= buf.len) w.end = buf.len - 1;

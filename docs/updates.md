@@ -44,17 +44,19 @@ the signature is `Contents/Resources/blackwall-helper.sig`). When a newer app fi
 helper running, it hands the helper its own copy and that signature; the helper checks the
 signature with the public key it was built with, refuses anything older than itself, writes
 the new file itself and restarts. So the password is asked once per installation, not once
-per helper change. Builds without the key (every local build) cannot do this and ask for the
-password instead.
+per helper change. A helper that was not signed (every local build: the seed is only in CI)
+cannot be handed over this way, so the password is asked for instead.
 
 ## How a release gets signed
 
 `release.yml`, on a `vX.Y.Z` tag:
 
 1. **Build**: each language × platform is packaged with
-   `-Dupdate-repo=<owner/name> -Dupdate-pubkey=<public key>`. These build options
-   (`build.zig`) compile the updater in; a build without `-Dupdate-repo` (every local
-   build) has no updater and no Settings row.
+   `-Dupdate-repo=<owner/name> -Dupdate-pubkey=<public key>`. Every other build takes the
+   same values by default (`release_repo`, `release_pubkey` in `build.zig`: the public key is
+   inside every release anyway), so a build from source also updates itself to newer
+   releases and has the Settings row. `-Dupdate-repo=` (empty) compiles the updater out;
+   a release made without the signing secrets (a fork) is built that way.
 2. **Publish**: per language, `blackwall-sign sign` writes `<file>.sig` next to every file
    (base64 of the Ed25519 signature over the file's bytes, seed from the secret), then
    `blackwall-sign verify` checks all of them against the public key variable, so a

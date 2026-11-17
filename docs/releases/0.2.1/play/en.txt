@@ -1,0 +1,1 @@
+A report for bug reports in Settings: the recent log saved to Downloads without links, keys or the addresses of servers and sites, and a new GitHub issue to attach it to.

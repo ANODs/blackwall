@@ -24,6 +24,7 @@ pub const udp_out = @import("udp_out.zig");
 pub const dpi = @import("dpi.zig");
 pub const sni = @import("sni.zig");
 pub const qr = @import("qr.zig");
+pub const diag = @import("diag.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const failover = @import("failover.zig");
 pub const ipc = @import("ipc.zig");
@@ -65,6 +66,7 @@ test {
     _ = sni;
     _ = dpi;
     _ = qr;
+    _ = diag;
     _ = @import("aes_gcm.zig");
 }
 

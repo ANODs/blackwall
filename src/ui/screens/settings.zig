@@ -8,6 +8,7 @@ const th = @import("../theme.zig");
 const w = @import("../widgets.zig");
 const tr = @import("../../i18n.zig").t;
 const build_options = @import("build_options");
+const report = @import("../../report.zig");
 
 const Src = std.builtin.SourceLocation;
 
@@ -91,8 +92,13 @@ pub fn show() void {
         defer r.deinit();
         w.text(@src(), build_options.version, th.mono(12), th.text2, .{});
     }
-    // only builds that know where releases come from can update themselves
+    // builds made without a release repository cannot update themselves
     if (app.updater_built) _ = switchRow(@src(), tr.auto_update, tr.auto_update_desc, &s.auto_update);
+    {
+        var r = row(@src(), tr.report, tr.report_desc);
+        defer r.deinit();
+        if (w.quietButton(@src(), tr.report_make, .{ .gravity_y = 0.5 })) report.make();
+    }
     {
         // the state only (the SOCKS address is worth seeing); no essay here
         var r = row(@src(), tr.engine, null);

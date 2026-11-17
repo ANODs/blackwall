@@ -64,6 +64,23 @@ final class Core {
     /** The QR code in a grayscale picture (w×h bytes): its length in `out`, or -1. */
     private static native int qr(java.nio.ByteBuffer gray, int w, int h, java.nio.ByteBuffer out);
 
+    /** `in` (n bytes of UTF-8) without secrets into `out`: its length, or -1 (src/core/diag.zig). */
+    private static native int scrub(java.nio.ByteBuffer in, int n, java.nio.ByteBuffer out);
+
+    /** The text without links, keys, or the names and addresses of servers and sites; null if it fails. */
+    static String scrubbed(String text) {
+        byte[] b = text.getBytes(StandardCharsets.UTF_8);
+        java.nio.ByteBuffer in = java.nio.ByteBuffer.allocateDirect(Math.max(1, b.length));
+        in.put(b);
+        // a short name can become a longer token
+        java.nio.ByteBuffer out = java.nio.ByteBuffer.allocateDirect(b.length * 2 + 4096);
+        int n = scrub(in, b.length, out);
+        if (n < 0) return null;
+        byte[] r = new byte[n];
+        out.get(r, 0, n);
+        return new String(r, StandardCharsets.UTF_8);
+    }
+
     /** The text of a QR code in `gray` (a direct buffer of w×h bytes), or null. */
     static String readQr(java.nio.ByteBuffer gray, int w, int h) {
         java.nio.ByteBuffer out = java.nio.ByteBuffer.allocateDirect(4096);

@@ -119,7 +119,9 @@ jobs:
           # helpers can replace themselves without the administrator (docs/updates.md)
           BLACKWALL_UPDATE_KEY: ${{ secrets.BLACKWALL_UPDATE_KEY }}
         run: |
-          update=()
+          # without the keys (a fork) the apps take no updates at all, not
+          # even the default ones from the upstream repository
+          update=("-Dupdate-repo=")
           if [ -n "$UPDATE_PUBKEY" ] && [ "$HAS_UPDATE_KEY" = true ]; then
             update=("-Dupdate-repo=$GITHUB_REPOSITORY" "-Dupdate-pubkey=$UPDATE_PUBKEY")
           else

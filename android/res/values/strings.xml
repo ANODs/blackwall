@@ -34,6 +34,12 @@
     <string name="ipv6_system">System</string>
     <string name="s_always">Always-on and kill switch</string>
     <string name="s_always_d">Android itself keeps the VPN on from boot and blocks everything outside it: turn on “Always-on VPN” and “Block connections without VPN” for BLACKWALL in the system settings.</string>
+    <string name="s_report">Report for GitHub</string>
+    <string name="s_report_d">Saves the app\'s log to Downloads and opens a new issue on GitHub: attach the file there. Links, keys and the addresses of servers and sites stay out of the file.</string>
+    <string name="report_saved">Report saved to Downloads: %1$s</string>
+    <string name="report_failed">The report could not be saved</string>
+    <string name="issue_what">What happened:</string>
+    <string name="issue_attach">Report (attach it from Downloads):</string>
     <string name="s_privacy">Privacy policy</string>
     <string name="s_privacy_d">Nothing is sent to the developer: no analytics, no accounts. Your keys and rules stay on this device.</string>
     <string name="r_dpi">DPI bypass</string>

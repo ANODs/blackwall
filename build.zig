@@ -13,6 +13,11 @@ const zon_version = blk: {
     break :blk zon[start..end];
 };
 
+/// Where releases are published, and the public half of the key that signs
+/// them (it is inside every release anyway; the secret half is only in CI).
+const release_repo = "ANODs/blackwall";
+const release_pubkey = "+XrIcBscLUz2H+Ozb2Q0/KMmzJaJOh8MI66l5yjppnU=";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -22,10 +27,12 @@ pub fn build(b: *std.Build) void {
     // Release builds drop debug info: the shipped app stays small (spec: lightweight).
     const strip = b.option(bool, "strip", "Strip debug info (default: on in release builds)") orelse (optimize != .debug);
 
-    // Auto-update (src/core/update.zig, docs/updates.md). Release CI passes both;
-    // without a repository the updater is compiled out of the app.
-    const update_repo = b.option([]const u8, "update-repo", "GitHub owner/name to take updates from (default: none, updater off)") orelse "";
-    const update_pubkey = b.option([]const u8, "update-pubkey", "Base64 Ed25519 public key that signs releases (required with -Dupdate-repo)") orelse "";
+    // Auto-update (src/core/update.zig, docs/updates.md). Every build takes
+    // updates from the project's releases; `-Dupdate-repo=` (empty) compiles
+    // the updater out.
+    const update_repo = b.option([]const u8, "update-repo", "GitHub owner/name to take updates from (default: " ++ release_repo ++ "; empty: updater off)") orelse release_repo;
+    const update_pubkey = b.option([]const u8, "update-pubkey", "Base64 Ed25519 public key that signs releases (default: the project's own)") orelse
+        if (std.mem.eql(u8, update_repo, release_repo)) release_pubkey else "";
 
     const options = b.addOptions();
     options.addOption([]const u8, "lang", @tagName(lang));

@@ -34,6 +34,12 @@
     <string name="ipv6_system">系统</string>
     <string name="s_always">始终开启与断网保护</string>
     <string name="s_always_d">Android 自身可在开机后保持 VPN 开启并拦截 VPN 之外的所有连接：请在系统设置中为 BLACKWALL 打开“始终开启的 VPN”和“屏蔽未使用 VPN 的所有连接”。</string>
+    <string name="s_report">GitHub 问题报告</string>
+    <string name="s_report_d">将应用日志保存到“下载”，并在 GitHub 上新建问题：把文件附上即可。链接、密钥以及服务器和网站的地址不会写入文件。</string>
+    <string name="report_saved">报告已保存到“下载”：%1$s</string>
+    <string name="report_failed">报告无法保存</string>
+    <string name="issue_what">发生了什么：</string>
+    <string name="issue_attach">报告（从“下载”附上）：</string>
     <string name="s_privacy">隐私政策</string>
     <string name="s_privacy_d">不向开发者发送任何数据：没有统计，也没有账户。密钥和规则只保存在本设备上。</string>
     <string name="r_dpi">绕过 DPI</string>
