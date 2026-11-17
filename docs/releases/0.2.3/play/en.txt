@@ -1,0 +1,1 @@
+The local network (router, printers, casting) stays reachable while connected, and an idle VPN no longer wakes the app every second.
