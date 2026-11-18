@@ -472,20 +472,18 @@ fn download(url: []const u8, meta: *?Meta) ![]u8 {
     }
     m.value = try core.sublink.metaFromHeaders(m.arena.allocator(), title, interval, announce, support);
 
-    var out: Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
     const decompress_buf = try gpa.alloc(u8, std.compress.flate.max_window_len);
     defer gpa.free(decompress_buf);
     var transfer_buf: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = res.readerDecompressing(&transfer_buf, &decompress, decompress_buf);
-    _ = reader.stream(&out.writer, .limited(4 << 20)) catch |err| switch (err) {
+    // the whole body (one `stream` call is one chunk of it), 4 MiB at most
+    const body = reader.allocRemaining(gpa, .limited(4 << 20)) catch |err| switch (err) {
         error.ReadFailed => return res.bodyErr().?,
         else => |e| return e,
     };
-    if (out.written().len >= 4 << 20) return error.TooLarge;
     meta.* = m;
-    return out.toOwnedSlice();
+    return body;
 }
 
 // ---------------------------------------------------------------- latency
