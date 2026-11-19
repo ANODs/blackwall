@@ -280,9 +280,15 @@ pub const Session = struct {
             const headers = core.sublink.metaFromHeaders(arena.allocator(), m.title, m.interval, m.announce, m.support) catch null;
             s.applyFetched(m.id, m.text, headers);
         } else if (is(m.cmd, "refresh")) {
+            // one subscription, or all of them
             for (s.state.subs.items) |sub| {
-                if (sub.url.len > 0) s.emit(.{ .ev = "fetch", .id = sub.id, .url = sub.url });
+                if (sub.url.len > 0 and (m.id == 0 or m.id == sub.id)) s.emit(.{ .ev = "fetch", .id = sub.id, .url = sub.url });
             }
+        } else if (is(m.cmd, "clip")) {
+            s.clip(m.key, m.id);
+        } else if (is(m.cmd, "dropserver")) {
+            s.state.removeServer(m.id);
+            s.changed();
         } else if (is(m.cmd, "remove")) {
             s.state.removeSubscription(m.id);
             s.changed();
@@ -403,6 +409,27 @@ pub const Session = struct {
         s.note("added", parsed.servers.len, parsed.unsupported + parsed.malformed);
         s.probeAll();
         s.changed();
+    }
+
+    /// Text for the clipboard, asked for when the user copies it (links are
+    /// secrets: they are in no state message): a subscription's link, a
+    /// server's links (a group's, one a line) or its Xray JSON.
+    fn clip(s: *Session, what: []const u8, id: u32) void {
+        if (std.mem.eql(u8, what, "sub")) {
+            const sub = s.state.subById(id) orelse return;
+            return s.emit(.{ .ev = "clip", .text = sub.url });
+        }
+        const sv = s.state.serverById(id) orelse return;
+        const links = sv.linksOf(s.gpa) catch return;
+        defer s.gpa.free(links);
+        if (std.mem.eql(u8, what, "json")) {
+            const json = core.xrayjson.config(s.gpa, sv.name, links) catch return s.emit(.{ .ev = "clip", .failed = true });
+            defer s.gpa.free(json);
+            return s.emit(.{ .ev = "clip", .text = json });
+        }
+        const text = std.mem.join(s.gpa, "\n", links) catch return;
+        defer s.gpa.free(text);
+        s.emit(.{ .ev = "clip", .text = text });
     }
 
     /// A downloaded subscription: its servers, and what the provider says

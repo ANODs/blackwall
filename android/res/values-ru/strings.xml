@@ -34,6 +34,12 @@
     <string name="ipv6_system">Система</string>
     <string name="s_always">Постоянный VPN и блокировка</string>
     <string name="s_always_d">Android сам держит VPN включённым с загрузки и блокирует всё мимо него: включите «Постоянная VPN» и «Блокировать соединения без VPN» для BLACKWALL в настройках системы.</string>
+    <string name="refresh">Обновить</string>
+    <string name="copy_link">Скопировать ссылку</string>
+    <string name="copy_json">Скопировать JSON</string>
+    <string name="copied">Скопировано</string>
+    <string name="no_json">Для этого протокола JSON не получить</string>
+    <string name="support">Поддержка</string>
     <string name="s_report">Отчёт для GitHub</string>
     <string name="s_report_d">Сохраняет журнал приложения в Загрузки и открывает новое обращение на GitHub: приложите файл туда. Ссылки, ключи и адреса серверов и сайтов в файл не попадают.</string>
     <string name="report_saved">Отчёт сохранён в Загрузки: %1$s</string>

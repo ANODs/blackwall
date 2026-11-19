@@ -176,6 +176,20 @@ public class Main extends Activity implements Core.Listener {
             case "note":
                 note(o);
                 break;
+            case "clip":
+                if (o.optBoolean("failed")) {
+                    toast(getString(R.string.no_json));
+                } else {
+                    // links are secrets: the system's clipboard preview hides them
+                    ClipData data = ClipData.newPlainText("BLACKWALL", o.optString("text"));
+                    android.os.PersistableBundle extras = new android.os.PersistableBundle();
+                    extras.putBoolean("android.content.extra.IS_SENSITIVE", true);
+                    data.getDescription().setExtras(extras);
+                    getSystemService(ClipboardManager.class).setPrimaryClip(data);
+                    // Android 13 and later confirm the copy themselves
+                    if (android.os.Build.VERSION.SDK_INT < 33) toast(getString(R.string.copied));
+                }
+                break;
         }
     }
 
@@ -334,6 +348,16 @@ public class Main extends Activity implements Core.Listener {
         }
         Tunnel.prefs(this).edit().putBoolean("on", true).apply();
         core.send("connect");
+    }
+
+    /** The subscription with this id in the latest state, or null. */
+    private JSONObject subOf(int id) {
+        JSONArray subs = core.state.optJSONArray("subs");
+        for (int i = 0; subs != null && i < subs.length(); i++) {
+            JSONObject s = subs.optJSONObject(i);
+            if (s != null && s.optInt("id") == id) return s;
+        }
+        return null;
     }
 
     /** A server's country code; two dots when it is not known. */
@@ -549,34 +573,103 @@ public class Main extends Activity implements Core.Listener {
             h.star.setImageDrawable(glyph(star ? Glyph.STAR_ON : Glyph.STAR, star ? TEXT : LINE, 20));
             h.star.setOnClickListener(v -> core.send("star", "id", id));
             old.setOnClickListener(v -> core.send("select", "id", id));
+            // its link (a group's, one a line), its Xray JSON, and removal of
+            // a key added by hand
+            final JSONObject owner = subOf(o.optInt("sub"));
+            final boolean byHand = owner != null && !owner.optBoolean("link");
+            old.setOnLongClickListener(v -> {
+                PopupMenu m = new PopupMenu(Main.this, v);
+                m.getMenu().add(0, 1, 0, R.string.copy_link);
+                m.getMenu().add(0, 2, 0, R.string.copy_json);
+                if (byHand) m.getMenu().add(0, 3, 0, R.string.remove);
+                m.setOnMenuItemClickListener(item -> {
+                    switch (item.getItemId()) {
+                        case 1:
+                            core.send("clip", "key", "links", "id", id);
+                            break;
+                        case 2:
+                            core.send("clip", "key", "json", "id", id);
+                            break;
+                        case 3:
+                            core.send("dropserver", "id", id);
+                            break;
+                    }
+                    return true;
+                });
+                m.show();
+                return true;
+            });
             return old;
         }
 
+        /** A subscription: its name, what the provider says about it, and "⋯". */
         private View header(final JSONObject sub, View old) {
-            LinearLayout row;
+            LinearLayout box;
             if (old == null) {
-                row = new LinearLayout(Main.this);
+                box = new LinearLayout(Main.this);
+                box.setOrientation(LinearLayout.VERTICAL);
+                box.setPadding(dp(20), dp(14), dp(8), 0);
+                LinearLayout row = new LinearLayout(Main.this);
                 row.setGravity(Gravity.CENTER_VERTICAL);
-                row.setPadding(dp(20), dp(14), dp(8), 0);
-                TextView name = label("", 13, DIM);
-                row.addView(name, new LinearLayout.LayoutParams(0, WRAP, 1));
-                ImageView trash = new ImageView(Main.this);
-                trash.setImageDrawable(glyph(Glyph.TRASH, DIM, 18));
-                trash.setPadding(dp(12), dp(8), dp(12), dp(8));
-                row.addView(trash);
+                row.addView(label("", 13, DIM), new LinearLayout.LayoutParams(0, WRAP, 1));
+                ImageView more = new ImageView(Main.this);
+                more.setImageDrawable(glyph(Glyph.MORE, DIM, 18));
+                more.setPadding(dp(12), dp(8), dp(12), dp(8));
+                row.addView(more);
+                box.addView(row);
+                TextView note = label("", 12, DIM);
+                note.setAlpha(0.8f);
+                note.setPadding(0, 0, dp(48), dp(4));
+                box.addView(note);
             } else {
-                row = (LinearLayout) old;
+                box = (LinearLayout) old;
             }
+            LinearLayout row = (LinearLayout) box.getChildAt(0);
             final String name = sub.optString("name").isEmpty() ? getString(R.string.keys) : sub.optString("name");
             TextView text = (TextView) row.getChildAt(0);
             text.setText(name);
             text.setTextColor(sub.optBoolean("failed") ? RED : DIM);
-            row.getChildAt(1).setOnClickListener(v -> new AlertDialog.Builder(Main.this)
-                    .setMessage(getString(R.string.remove_q, name))
-                    .setPositiveButton(R.string.remove, (dlg, w) -> core.send("remove", "id", sub.optInt("id")))
-                    .setNegativeButton(R.string.cancel, null)
-                    .show());
-            return row;
+            TextView note = (TextView) box.getChildAt(1);
+            String announce = sub.optString("announce");
+            note.setText(announce);
+            note.setVisibility(announce.isEmpty() ? View.GONE : View.VISIBLE);
+            final int id = sub.optInt("id");
+            final boolean link = sub.optBoolean("link");
+            final String support = sub.optString("support");
+            row.getChildAt(1).setOnClickListener(v -> {
+                PopupMenu m = new PopupMenu(Main.this, v);
+                if (link) m.getMenu().add(0, 1, 0, R.string.refresh);
+                if (link) m.getMenu().add(0, 2, 0, R.string.copy_link);
+                if (!support.isEmpty()) m.getMenu().add(0, 3, 0, R.string.support);
+                m.getMenu().add(0, 4, 0, R.string.remove);
+                m.setOnMenuItemClickListener(item -> {
+                    switch (item.getItemId()) {
+                        case 1:
+                            core.send("refresh", "id", id);
+                            break;
+                        case 2:
+                            core.send("clip", "key", "sub", "id", id);
+                            break;
+                        case 3:
+                            try {
+                                startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(support)));
+                            } catch (Exception e) {
+                                // no browser
+                            }
+                            break;
+                        case 4:
+                            new AlertDialog.Builder(Main.this)
+                                    .setMessage(getString(R.string.remove_q, name))
+                                    .setPositiveButton(R.string.remove, (dlg, w) -> core.send("remove", "id", id))
+                                    .setNegativeButton(R.string.cancel, null)
+                                    .show();
+                            break;
+                    }
+                    return true;
+                });
+                m.show();
+            });
+            return box;
         }
     }
 
@@ -821,26 +914,6 @@ public class Main extends Activity implements Core.Listener {
             }
         });
         col.addView(always);
-
-        // what the providers say about their subscriptions: here only
-        JSONArray subs = core.state.optJSONArray("subs");
-        for (int i = 0; subs != null && i < subs.length(); i++) {
-            JSONObject sub = subs.optJSONObject(i);
-            if (sub == null) continue;
-            final String note = sub.optString("announce"), support = sub.optString("support");
-            if (note.isEmpty() && support.isEmpty()) continue;
-            ImageView more = new ImageView(this);
-            if (!support.isEmpty()) more.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));
-            View row = setting(sub.optString("name"), note, more);
-            if (!support.isEmpty()) row.setOnClickListener(v -> {
-                try {
-                    startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(support)));
-                } catch (Exception e) {
-                    // no browser
-                }
-            });
-            col.addView(row);
-        }
 
         ImageView send = new ImageView(this);
         send.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));

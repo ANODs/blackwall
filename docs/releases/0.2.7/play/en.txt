@@ -1,0 +1,1 @@
+Subscriptions moved to the servers screen with their provider's note. Menus to refresh, copy the link or the Xray JSON, and remove.
