@@ -40,6 +40,10 @@ pub fn load(s: *model.State, sub_name: []const u8) !void {
     }
     s.serverById(ids[0]).?.favorite = true;
     s.serverById(ids[2]).?.favorite = true;
+    // where a few of them were seen to exit: as named, and one that is not
+    s.serverById(ids[0]).?.exit = "NL".*;
+    s.serverById(ids[2]).?.exit = "FI".*;
+    s.serverById(ids[5]).?.exit = "DE".*;
 
     // Example rules on whatever is installed, mirroring the product brief.
     const rules = [_]struct { []const u8, model.Route }{

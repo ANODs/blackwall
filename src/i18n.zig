@@ -36,6 +36,8 @@ pub const Strings = struct {
     failover_desc: []const u8,
     protect_off: []const u8,
     protect_off_desc: []const u8,
+    check_exit: []const u8,
+    check_exit_desc: []const u8,
     st_mixed: []const u8,
     st_on: []const u8,
 
@@ -188,6 +190,8 @@ const en: Strings = .{
     .failover_desc = "When the server stops answering, it is reconnected once; if that does not help, the starred servers are tried in turn. Traffic never leaves directly meanwhile.",
     .protect_off = "Protection when off",
     .protect_off_desc = "After disconnecting, apps with their own VPN rule (or blocked ones) stay without network. Everything else uses the normal internet.",
+    .check_exit = "Real server country",
+    .check_exit_desc = "Once a server is in use, one request through it to cloudflare.com shows the country it really exits in. Such a country has a dot next to it, also where the provider named another one.",
     .st_mixed = "Mixed routes",
     .st_on = "VPN is on",
 
@@ -328,6 +332,8 @@ const ru: Strings = .{
     .failover_desc = "Если сервер перестал отвечать, сначала одно переподключение к нему; не помогло — по очереди пробуются серверы, отмеченные звёздочкой. В обычный интернет трафик при этом не уходит.",
     .protect_off = "Защита после отключения",
     .protect_off_desc = "После отключения приложения со своим VPN-правилом (и заблокированные) остаются без сети. Остальное идёт через обычный интернет.",
+    .check_exit = "Настоящая страна сервера",
+    .check_exit_desc = "Когда сервер в работе, один запрос через него к cloudflare.com показывает, в какой стране его выход в интернет. Такая страна отмечена точкой, даже если провайдер указал другую.",
     .st_mixed = "Смешанные маршруты",
     .st_on = "VPN работает",
 
@@ -468,6 +474,8 @@ const zh: Strings = .{
     .failover_desc = "服务器停止响应时先重新连接一次；仍然不行，则依次尝试带星标的服务器。期间流量不会直连。",
     .protect_off = "断开后的保护",
     .protect_off_desc = "断开后，拥有独立 VPN 规则（或被阻止）的应用保持无网络，其余应用使用普通网络。",
+    .check_exit = "服务器真实国家",
+    .check_exit_desc = "服务器投入使用后，通过它向 cloudflare.com 发送一次请求，查看它实际从哪个国家接入互联网。这样确认的国家旁有一个圆点，即使服务商标注的是别的国家。",
     .st_mixed = "混合路由",
     .st_on = "VPN 已开启",
 

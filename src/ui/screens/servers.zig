@@ -156,7 +156,7 @@ fn serverRow(sv: *model.Server, i: usize) void {
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer row.deinit();
-        w.serverTag(@src(), sv, .{});
+        w.serverTag(@src(), sv, null, .{});
         w.gap(@src(), 12, 0);
         w.text(@src(), sv.name, th.medium(13.5), if (sv.available) th.text else th.text3, .{});
         w.gap(@src(), 10, 0);

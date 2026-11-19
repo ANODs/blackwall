@@ -21,9 +21,16 @@ no advertising, no crash reporting and no tracking in it, on any platform.
   refresh the server list.
 - **Name lookups for the server's own address** go to your network's resolver and, when
   it does not answer, to public resolvers (8.8.8.8, 1.1.1.1, 9.9.9.9).
-- **A connectivity check**: through the VPN server, the app asks
-  `www.gstatic.com/generate_204` for an empty page to see whether the server carries
-  traffic. Nothing about you is in that request.
+- **Where the server really is**: once a server is in use, the app makes one plain HTTP
+  request through it to Cloudflare, `http://cloudflare.com/cdn-cgi/trace`. Cloudflare
+  sees the server's address, never yours, and answers with the country it places that
+  address in; the app shows that country next to the server and keeps it with the
+  server on the device. The request carries no cookies, no user agent and nothing about
+  you, and it never leaves without the VPN server. **Settings → Real server country**
+  turns it off.
+- **A connectivity check**: when the server stops answering, the same request through it
+  (and through the reserve servers, one at a time) shows whether it still carries
+  traffic.
 - **Updates** (desktop only): the app asks GitHub which release is the latest and
   downloads it from there. GitHub sees your IP address, as with any download.
 
