@@ -14,6 +14,8 @@ pub const Built = struct {
     skipped: usize,
     /// server id of each outbound
     ids: []const u32 = &.{},
+    /// which of its group's servers each outbound is (0 for a plain server)
+    members: []const u16 = &.{},
 
     pub fn deinit(b: *Built) void {
         b.arena.deinit();
@@ -28,6 +30,7 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
     var obs: std.ArrayList(proxy.Outbound) = .empty;
     // per outbound: its server's id, and its last measured connection time
     var ids: std.ArrayList(u32) = .empty;
+    var members_of: std.ArrayList(u16) = .empty;
     var pings: std.ArrayList(?u16) = .empty;
     var skipped: usize = 0;
     // standby: the VPN is off, so no server is used at all
@@ -44,15 +47,17 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
             };
             try obs.append(a, ob);
             try ids.append(a, sv.id);
+            try members_of.append(a, 0);
             try pings.append(a, sv.ping_ms);
             continue;
         }
         // a group: each of its servers is an outbound of the group's id
         var any = false;
-        for (sv.members) |m| {
+        for (sv.members, 0..) |m, k| {
             const ob = proxy.outboundFromLink(try a.dupe(u8, m.link), try a.dupe(u8, m.host), m.port) catch continue;
             try obs.append(a, ob);
             try ids.append(a, sv.id);
+            try members_of.append(a, @intCast(@min(k, std.math.maxInt(u16))));
             try pings.append(a, m.ping_ms);
             any = true;
         }
@@ -87,7 +92,7 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
         .default => if (has_main) .main else .block,
         else => |r| choiceOf(r, ids.items, pings.items, has_main),
     };
-    var cfg: tunnel.Config = .{ .default = default, .rules = rules.items, .domains = domains.items, .outbounds = obs.items, .main = main.items };
+    var cfg: tunnel.Config = .{ .default = default, .rules = rules.items, .domains = domains.items, .outbounds = obs.items, .main = main.items, .check_exit = state.settings.check_exit };
     // in standby everything without a rule goes direct, so a flow that
     // cannot be attributed might be one of the held applications': refuse it
     if (standby) cfg.unknown = .block;
@@ -95,7 +100,18 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
     if (@hasField(tunnel.Config, "block_ipv6")) cfg.block_ipv6 = state.settings.ipv6 == .block;
     // "DNS through the route" off: real answers instead of fake addresses
     if (@hasField(tunnel.Config, "fake_dns")) cfg.fake_dns = state.settings.dns_over_route;
-    return .{ .arena = arena, .cfg = cfg, .skipped = skipped, .ids = ids.items };
+    return .{ .arena = arena, .cfg = cfg, .skipped = skipped, .ids = ids.items, .members = members_of.items };
+}
+
+/// What the main route uses right now: the server (0 when there is none),
+/// which of a group's servers, and where it exits ("??" not known yet).
+pub const InUse = struct { server: u32 = 0, member: u16 = 0, exit: [2]u8 = "??".* };
+
+pub fn inUse(b: *const Built, t: *tunnel.Tunnel) InUse {
+    const u = t.mainExit();
+    if (u.index >= b.cfg.main.len) return .{};
+    const i = b.cfg.main[u.index];
+    return .{ .server = b.ids[i], .member = b.members[i], .exit = u.exit };
 }
 
 /// Whether the default route or any rule may send traffic to outbound `i`
@@ -305,6 +321,8 @@ test "routes: a group is its servers, fastest first, before the starred ones" {
     try std.testing.expectEqual(4, b.cfg.outbounds.len);
     try std.testing.expectEqualSlices(u16, &.{ 3, 1, 2, 0 }, b.cfg.main);
     try std.testing.expectEqualSlices(u32, &.{ s.servers.items[0].id, gid, gid, gid }, b.ids);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 0, 1, 2 }, b.members);
+    try std.testing.expect(b.cfg.check_exit);
     // an application pinned to the group gets its fastest server
     try std.testing.expectEqual(tunnel.Choice{ .outbound = 3 }, b.cfg.rules[0].choice);
 }

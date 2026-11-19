@@ -101,6 +101,7 @@ final class Report {
                 .append(sites == null ? 0 : sites.length()).append(" sites\n");
         sb.append("settings: active=").append(s.optBoolean("active"))
                 .append(" failover=").append(s.optBoolean("failover"))
+                .append(" exitcheck=").append(s.optBoolean("exitcheck"))
                 .append(" guard=").append(s.optBoolean("guard"))
                 .append(" ipv6=").append(s.optString("ipv6"))
                 .append(" direct=").append(s.optBoolean("direct"))

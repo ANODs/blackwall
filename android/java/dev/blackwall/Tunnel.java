@@ -267,7 +267,17 @@ public class Tunnel extends VpnService implements Core.Listener {
         JSONObject st = core.status;
         if (st.optBoolean("up") && st.optBoolean("standby")) return getString(R.string.st_guard);
         JSONObject sv = core.server(st.optInt("server"));
-        return sv != null ? sv.optString("name") : "BLACKWALL";
+        if (sv == null) return "BLACKWALL";
+        // and where it really exits, when that is not what the provider says
+        String exit = st.optString("exit");
+        if (exit.length() != 2 || exit.equals(sv.optString("said"))) return sv.optString("name");
+        String country;
+        try {
+            country = new Locale.Builder().setRegion(exit).build().getDisplayCountry();
+        } catch (RuntimeException e) {
+            country = exit;
+        }
+        return sv.optString("name") + " · " + (country.isEmpty() ? exit : country);
     }
 
     private String text() {

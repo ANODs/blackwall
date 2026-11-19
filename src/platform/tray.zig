@@ -2,7 +2,9 @@
 //! state of the connection at a glance and the two or three things one
 //! does without opening the window.
 //!
-//!   VPN is on · Netherlands          (what is going on, and through where)
+//!   VPN is on · Netherlands          (what is going on, and through where;
+//!                                     "· Germany" after it when the server
+//!                                     was seen to exit elsewhere)
 //!   ↓ 12.4 Mbit/s  ↑ 1.1 Mbit/s      (current speed)
 //!   ─────────
 //!   Disconnect / Connect
@@ -22,6 +24,7 @@ const dvui = @import("dvui");
 const core = @import("core");
 const app = @import("../app.zig");
 const tr = @import("../i18n.zig").t;
+const countries = @import("../countries.zig");
 
 const c = dvui.backend.c;
 
@@ -133,10 +136,14 @@ fn update() void {
         .disconnected => if (app.guarding()) tr.st_guard else tr.st_disconnected,
     };
     const server = if (e.status == .connected) app.shownServer() else null;
-    const status = if (server) |sv|
-        std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s} · {s}", .{ state_text, sv.name }) catch state_text
-    else
-        state_text;
+    const status = if (server) |sv| blk: {
+        // and where it really exits, when that is not what its name says
+        if (app.otherExit(sv)) |cc| {
+            const real = countries.name(cc) orelse &cc;
+            break :blk std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s} · {s} · {s}", .{ state_text, sv.name, real }) catch state_text;
+        }
+        break :blk std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s} · {s}", .{ state_text, sv.name }) catch state_text;
+    } else state_text;
     if (!std.mem.eql(u8, status, shown_status[0..shown_status_len])) {
         shown_status_len = @min(status.len, shown_status.len - 1);
         @memcpy(shown_status[0..shown_status_len], status[0..shown_status_len]);

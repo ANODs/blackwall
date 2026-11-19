@@ -70,6 +70,9 @@ pub const Config = struct {
     /// QUIC (UDP 443) of proxied applications is dropped so they fall back
     /// to TCP, which the outbound carries
     drop_quic: bool = true,
+    /// ask, through the server in use, where it exits to the internet
+    /// (failover.zig); `mainExit` tells
+    check_exit: bool = false,
 };
 
 /// Finds which application owns a flow; writes a stable identity (macOS:
@@ -202,6 +205,7 @@ pub const Tunnel = struct {
         t.cfg_mutex.lockUncancelable(t.io);
         defer t.cfg_mutex.unlock(t.io);
         // the group copies what it keeps, so the old arena can go
+        t.group.check_exit = copy.check_exit;
         t.group.set(members[0..n]);
         t.cfg_arena.deinit();
         t.cfg_arena = arena;
@@ -212,6 +216,12 @@ pub const Tunnel = struct {
     /// Index into the configuration's `main` list of the server in use.
     pub fn mainInUse(t: *Tunnel) usize {
         return t.group.activeIndex();
+    }
+
+    /// The server in use, as `mainInUse`, and the country a request through
+    /// it showed its exit in ("??" while not known).
+    pub fn mainExit(t: *Tunnel) failover.Group.InUse {
+        return t.group.inUse();
     }
 
     /// How often the group's server changed since the tunnel started.
@@ -263,7 +273,7 @@ pub const Tunnel = struct {
             for (suffix) |*ch| ch.* = std.ascii.toLower(ch.*);
             dst.* = .{ .suffix = suffix, .choice = src.choice };
         }
-        return .{ .default = cfg.default, .unknown = cfg.unknown, .rules = rules, .domains = doms, .outbounds = obs, .main = try a.dupe(u16, cfg.main), .dns_exclusions = ex, .drop_quic = cfg.drop_quic };
+        return .{ .default = cfg.default, .unknown = cfg.unknown, .rules = rules, .domains = doms, .outbounds = obs, .main = try a.dupe(u16, cfg.main), .dns_exclusions = ex, .drop_quic = cfg.drop_quic, .check_exit = cfg.check_exit };
     }
 
     const Decision = struct {
@@ -1262,8 +1272,8 @@ test "tunnel: flows through the main server are forgotten when they end, also wh
     const obs = [_]proxy.Outbound{.{ .vless = .{ .host = "127.0.0.1", .port = 1, .uuid = @splat(1) } }};
     try t.setConfig(.{ .default = .main, .outbounds = &obs, .main = &.{0} });
     const Quiet = struct {
-        fn probe(_: *failover.Group, _: *const proxy.Outbound) bool {
-            return false;
+        fn probe(_: *failover.Group, _: *const proxy.Outbound) failover.Probe {
+            return .{};
         }
         fn ping(_: *failover.Group, _: *const proxy.Outbound) ?u32 {
             return null;

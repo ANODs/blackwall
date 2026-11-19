@@ -158,13 +158,12 @@ const Service = struct {
         return if (s.settings.standby) .selective else s.settings.kill_switch;
     }
 
-    /// Server id of the group's server in use; 0 when there is none.
-    fn serverInUse(s: *Service) u32 {
-        const t = s.t orelse return 0;
-        const b = s.built orelse return 0;
-        const i = t.mainInUse();
-        if (i >= b.cfg.main.len) return 0;
-        return b.ids[b.cfg.main[i]];
+    /// The group's server in use and where it exits; server 0 when there
+    /// is none.
+    fn serverInUse(s: *Service) routes.InUse {
+        const t = s.t orelse return .{};
+        const b = s.built orelse return .{};
+        return routes.inUse(&b, t);
     }
 
     fn loadConfig(s: *Service) !void {
@@ -527,6 +526,7 @@ const Service = struct {
             const f = p.meter.fault.swap(.none, .monotonic);
             if (fault == .none) fault = f;
         }
+        const in_use = s.serverInUse();
         const st: ipc.Status = .{
             .pid = if (comptime on_windows) @intCast(k32.GetCurrentProcessId()) else c.getpid(),
             .build = build_options.version,
@@ -539,8 +539,10 @@ const Service = struct {
             .direct = total.direct_down.raw,
             .fault = @tagName(fault),
             .skipped = if (s.built) |b| b.skipped else 0,
-            .server = s.serverInUse(),
+            .server = in_use.server,
             .switches = if (s.t) |t| t.mainSwitches() else 0,
+            .member = in_use.member,
+            .exit = if (core.model.knownCountry(in_use.exit)) &in_use.exit else "",
             .standby = s.settings.standby,
             .apps = apps.items,
         };

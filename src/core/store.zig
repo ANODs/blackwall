@@ -16,6 +16,8 @@ const ServerDto = struct {
     protocol: model.Protocol,
     security: model.Security = .none,
     country: []const u8 = "??",
+    /// where it really exits, once seen
+    exit: []const u8 = "??",
     favorite: bool = false,
     available: bool = true,
     link: []const u8 = "",
@@ -26,6 +28,7 @@ const MemberDto = struct {
     link: []const u8,
     host: []const u8,
     port: u16,
+    exit: []const u8 = "??",
 };
 
 const SubDto = struct {
@@ -89,12 +92,13 @@ pub fn serialize(gpa: std.mem.Allocator, s: *const model.State) ![]u8 {
             .protocol = sv.protocol,
             .security = sv.security,
             .country = &sv.country,
+            .exit = &sv.exit,
             .favorite = sv.favorite,
             .available = sv.available,
             .link = sv.link,
             .members = blk: {
                 const ms = try a.alloc(MemberDto, sv.members.len);
-                for (sv.members, ms) |m, *d| d.* = .{ .link = m.link, .host = m.host, .port = m.port };
+                for (sv.members, ms) |*m, *d| d.* = .{ .link = m.link, .host = m.host, .port = m.port, .exit = &m.exit };
                 break :blk ms;
             },
         });
@@ -151,10 +155,12 @@ pub fn deserialize(gpa: std.mem.Allocator, s: *model.State, bytes: []const u8) !
             .port = d.port,
             .protocol = d.protocol,
             .security = d.security,
-            .country = if (d.country.len == 2) d.country[0..2].* else "??".*,
+            .country = code(d.country),
             .link = d.link,
             .members = members.items,
         });
+        sv.exit = code(d.exit);
+        for (sv.members, d.members) |*m, dm| m.exit = code(dm.exit);
         sv.id = d.id;
         sv.favorite = d.favorite;
         sv.available = d.available;
@@ -168,6 +174,11 @@ pub fn deserialize(gpa: std.mem.Allocator, s: *model.State, bytes: []const u8) !
         const dom = s.addDomain(d.name) catch continue;
         dom.route = d.route;
     }
+}
+
+/// A country code as kept, or "??".
+fn code(text: []const u8) [2]u8 {
+    return if (text.len == 2) text[0..2].* else "??".*;
 }
 
 pub fn save(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, s: *const model.State) !void {
@@ -204,8 +215,10 @@ test "round trip keeps rules, pinned server and settings" {
     const sub = try a.addSubscription("Home", "https://example.invalid/s/token");
     const sv = try a.addServer(sub.id, .{ .name = "Amsterdam", .host = "nl.example", .port = 443, .protocol = .vless, .security = .reality, .country = "NL".* });
     sv.favorite = true;
+    sv.exit = "DE".*;
     const sv_id = sv.id;
     a.settings.kill_switch = .strict;
+    a.settings.check_exit = false;
     a.settings.selected_server = sv_id;
     (try a.addApp("org.telegram.desktop", "Telegram", "/Applications/Telegram.app")).route = .{ .server = sv_id };
     (try a.addApp("com.example.game", "Game", "")).route = .direct;
@@ -224,6 +237,8 @@ test "round trip keeps rules, pinned server and settings" {
     try std.testing.expectEqual(1, b.servers.items.len);
     try std.testing.expect(b.servers.items[0].favorite);
     try std.testing.expectEqualStrings("NL", &b.servers.items[0].country);
+    try std.testing.expectEqualStrings("DE", &b.servers.items[0].exit);
+    try std.testing.expect(!b.settings.check_exit);
     try std.testing.expectEqual(2, b.apps.items.len);
     try std.testing.expect(b.appById("org.telegram.desktop").?.route.eql(.{ .server = sv_id }));
     try std.testing.expectEqual(2, b.domains.items.len);
@@ -259,6 +274,7 @@ test "round trip keeps groups and what the provider said" {
         .members = &.{ .{ .link = "vless://a@1.example:443", .host = "1.example", .port = 443 }, .{ .link = "vless://b@2.example:8443", .host = "2.example", .port = 8443 } },
     });
     g.favorite = true;
+    g.members[1].exit = "FI".*;
     const id = g.id;
     const bytes = try serialize(gpa, &s);
     defer gpa.free(bytes);
@@ -271,6 +287,8 @@ test "round trip keeps groups and what the provider said" {
     try std.testing.expectEqual(2, b.members.len);
     try std.testing.expectEqual(8443, b.members[1].port);
     try std.testing.expectEqualStrings("vless://b@2.example:8443", b.members[1].link);
+    try std.testing.expectEqualStrings("??", &b.members[0].exit);
+    try std.testing.expectEqualStrings("FI", &b.members[1].exit);
     const sub = back.subById(sub_id).?;
     try std.testing.expectEqual(1, sub.update_hours);
     try std.testing.expectEqualStrings("72 servers", sub.announce);
