@@ -1,0 +1,1 @@
+Encryption on the processor's own AES instructions: half the CPU per gigabyte, which is battery. Bigger tunnel packets: faster with many downloads at once.

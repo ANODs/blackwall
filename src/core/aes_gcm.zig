@@ -14,6 +14,12 @@
 //! last. On an M4 Pro: 12.5 GB/s for 8 KiB messages with AES-128, std's
 //! 3.2, Go's 10.2. Elsewhere std's AesGcm does the work.
 //!
+//! The ARMv8 path is built for every 64-bit ARM target and chosen when the
+//! processor has the instructions: known at build time for Apple chips,
+//! asked of the kernel (AT_HWCAP) on Android and Linux, whose builds target
+//! the baseline ARMv8 so that a phone without them still runs. Measured on
+//! Android: half the CPU per GB that std's software AES takes.
+//!
 //! The field arithmetic is std's (crypto/ghash_polyval.zig): blocks as
 //! big-endian 128-bit numbers, H shifted left by one bit and reduced, the
 //! product reduced with 0xc2 << 56.
@@ -24,9 +30,47 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// The aese/pmull path. (The C backend cannot pass vectors to inline asm.)
-pub const accelerated = builtin.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c and
-    builtin.cpu.has(.aarch64, .aes);
+/// The aese/pmull path is built. (The C backend cannot pass vectors to
+/// inline asm.)
+pub const compiled = builtin.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c;
+
+/// Tests set this to exercise std's path on a machine that has the
+/// instructions.
+pub var force_software = false;
+
+var hw_state: std.atomic.Value(u8) = .init(0);
+
+/// Whether this processor runs the aese/pmull path: the build says so, or
+/// the kernel does (once, then remembered).
+pub fn hardware() bool {
+    if (comptime !compiled) return false;
+    if (force_software) return false;
+    if (comptime builtin.cpu.has(.aarch64, .aes)) return true;
+    switch (hw_state.load(.monotonic)) {
+        1 => return false,
+        2 => return true,
+        else => {},
+    }
+    const yes = detect();
+    hw_state.store(if (yes) 2 else 1, .monotonic);
+    return yes;
+}
+
+extern "c" fn getauxval(kind: c_ulong) c_ulong;
+
+fn detect() bool {
+    return switch (builtin.os.tag) {
+        // HWCAP_AES and HWCAP_PMULL; libc's auxv, as std's start code does not
+        // run in a library that Java loads
+        .linux => blk: {
+            const caps = getauxval(16); // AT_HWCAP
+            break :blk caps & (1 << 3) != 0 and caps & (1 << 4) != 0;
+        },
+        // every 64-bit Apple chip
+        .macos, .ios => true,
+        else => false,
+    };
+}
 
 pub const tag_length = 16;
 pub const nonce_length = 12;
@@ -46,19 +90,24 @@ fn AesGcm(comptime key_len: comptime_int) type {
         const Self = @This();
         pub const key_length = key_len;
 
-        state: if (accelerated) struct {
+        /// for std's path
+        key: [key_len]u8,
+        /// the aese/pmull path runs (see `hardware`)
+        fast: bool,
+        state: if (compiled) struct {
             /// round keys, as `aese` takes them
             rk: [rounds + 1]V,
             /// H^1 .. H^8, shifted and reduced as std's GHASH keeps H
             h: [8]W,
             /// the same with their halves swapped (see `Wide.addRev64`)
             hs: [8]W,
-        } else [key_len]u8,
+        } else void,
 
         pub fn init(key: [key_len]u8) Self {
-            if (!accelerated) return .{ .state = key };
+            if (comptime !compiled) return .{ .key = key, .fast = false, .state = {} };
+            if (!hardware()) return .{ .key = key, .fast = false, .state = undefined };
             const ctx = StdAes.initEnc(key);
-            var s: Self = .{ .state = undefined };
+            var s: Self = .{ .key = key, .fast = true, .state = undefined };
             for (&s.state.rk, ctx.key_schedule.round_keys) |*d, k| d.* = k.toBytes();
             var hb: [16]u8 = @bitCast(s.encryptBlock(@splat(0)));
             var h = std.mem.readInt(u128, &hb, .big);
@@ -74,19 +123,31 @@ fn AesGcm(comptime key_len: comptime_int) type {
 
         /// Seal `m` into `c` (which may be `m` itself).
         pub fn encrypt(s: *const Self, c: []u8, tag: *[tag_length]u8, m: []const u8, nonce: [nonce_length]u8) void {
-            std.debug.assert(c.len == m.len);
-            std.debug.assert(@intFromPtr(c.ptr) <= @intFromPtr(m.ptr) or @intFromPtr(c.ptr) >= @intFromPtr(m.ptr) + m.len);
-            if (!accelerated) return Std.encrypt(c, tag, m, "", nonce, s.state);
-            tag.* = s.crypt(.seal, c, m, nonce);
+            s.encryptAd(c, tag, m, "", nonce);
         }
 
         /// Open `c` into `m`, which may be `c` itself or start before it
         /// in the same buffer. `m` is undefined if the tag does not match.
         pub fn decrypt(s: *const Self, m: []u8, c: []const u8, tag: [tag_length]u8, nonce: [nonce_length]u8) error{AuthenticationFailed}!void {
+            return s.decryptAd(m, c, tag, "", nonce);
+        }
+
+        /// `encrypt` with associated data (a TLS record's header).
+        pub fn encryptAd(s: *const Self, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, nonce: [nonce_length]u8) void {
+            std.debug.assert(c.len == m.len);
+            std.debug.assert(@intFromPtr(c.ptr) <= @intFromPtr(m.ptr) or @intFromPtr(c.ptr) >= @intFromPtr(m.ptr) + m.len);
+            if (comptime !compiled) return Std.encrypt(c, tag, m, ad, nonce, s.key);
+            if (!s.fast) return Std.encrypt(c, tag, m, ad, nonce, s.key);
+            tag.* = s.crypt(.seal, c, m, ad, nonce);
+        }
+
+        /// `decrypt` with associated data.
+        pub fn decryptAd(s: *const Self, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, nonce: [nonce_length]u8) error{AuthenticationFailed}!void {
             std.debug.assert(c.len == m.len);
             std.debug.assert(@intFromPtr(m.ptr) <= @intFromPtr(c.ptr) or @intFromPtr(m.ptr) >= @intFromPtr(c.ptr) + c.len);
-            if (!accelerated) return Std.decrypt(m, c, tag, "", nonce, s.state);
-            const want = s.crypt(.open, m, c, nonce);
+            if (comptime !compiled) return Std.decrypt(m, c, tag, ad, nonce, s.key);
+            if (!s.fast) return Std.decrypt(m, c, tag, ad, nonce, s.key);
+            const want = s.crypt(.open, m, c, ad, nonce);
             if (!std.crypto.timing_safe.eql([tag_length]u8, want, tag)) return error.AuthenticationFailed;
         }
 
@@ -100,13 +161,21 @@ fn AesGcm(comptime key_len: comptime_int) type {
         /// blocks at a time; returns the tag. Each group of eight is loaded
         /// before any of it is stored, so `dst` may start at `src` or
         /// before it.
-        fn crypt(s: *const Self, comptime dir: enum { seal, open }, dst: []u8, src: []const u8, nonce: [nonce_length]u8) [16]u8 {
+        fn crypt(s: *const Self, comptime dir: enum { seal, open }, dst: []u8, src: []const u8, ad: []const u8, nonce: [nonce_length]u8) [16]u8 {
             const rk = &s.state.rk;
             const h = &s.state.h;
             const hs = &s.state.hs;
             const base = counterBlock(nonce, 0);
             var n: u32 = 2;
+            // the associated data first, zero-padded to whole blocks
             var acc: W = @splat(0);
+            var at: usize = 0;
+            while (at < ad.len) : (at += 16) {
+                var blk: [16]u8 = @splat(0);
+                const len = @min(16, ad.len - at);
+                @memcpy(blk[0..len], ad[at..][0..len]);
+                acc = mulReduce(rev(blk) ^ acc, h[0]);
+            }
             var i: usize = 0;
             while (i + 128 <= src.len) : (i += 128) {
                 const in = src[i..][0..128];
@@ -140,7 +209,7 @@ fn AesGcm(comptime key_len: comptime_int) type {
             }
             // what is left, under eight blocks: hash the ciphertext, which
             // for `open` must be read before the plaintext lands on it
-            if (dir == .open) acc = s.ghashTail(acc, src[i..], src.len);
+            if (dir == .open) acc = s.ghashTail(acc, src[i..], src.len, ad.len);
             var k = i;
             while (k < src.len) : (k += 16) {
                 var cb = base;
@@ -150,7 +219,7 @@ fn AesGcm(comptime key_len: comptime_int) type {
                 const len = @min(16, src.len - k);
                 for (dst[k..][0..len], src[k..][0..len], ks[0..len]) |*d, a, y| d.* = a ^ y;
             }
-            if (dir == .seal) acc = s.ghashTail(acc, dst[i..src.len], src.len);
+            if (dir == .seal) acc = s.ghashTail(acc, dst[i..src.len], src.len, ad.len);
 
             var cb = base;
             cb[3] = @byteSwap(@as(u32, 1));
@@ -162,8 +231,9 @@ fn AesGcm(comptime key_len: comptime_int) type {
         }
 
         /// GHASH of the last `c` (under eight blocks), zero-padded, and the
-        /// lengths block for a message of `total` bytes.
-        fn ghashTail(s: *const Self, acc: W, c: []const u8, total: usize) W {
+        /// lengths block for a message of `total` bytes after `ad_len` of
+        /// associated data.
+        fn ghashTail(s: *const Self, acc: W, c: []const u8, total: usize, ad_len: usize) W {
             std.debug.assert(c.len < 128);
             const h = &s.state.h;
             // seven whole blocks, a partial one, the lengths: nine at most
@@ -180,7 +250,7 @@ fn AesGcm(comptime key_len: comptime_int) type {
                 tail[t] = rev(last);
                 t += 1;
             }
-            tail[t] = .{ @as(u64, total) * 8, 0 };
+            tail[t] = .{ @as(u64, total) * 8, @as(u64, ad_len) * 8 };
             t += 1;
             var a = acc;
             var k: usize = 0;
@@ -261,6 +331,7 @@ fn mulReduce(x: W, h: W) W {
 
 inline fn aesRound(b: V, k: V) V {
     return asm (
+        \\ .arch_extension aes
         \\ aese  %[b].16b, %[k].16b
         \\ aesmc %[b].16b, %[b].16b
         : [b] "=w" (-> V),
@@ -271,6 +342,7 @@ inline fn aesRound(b: V, k: V) V {
 
 inline fn aesLast(b: V, k: V) V {
     return asm (
+        \\ .arch_extension aes
         \\ aese  %[b].16b, %[k].16b
         : [b] "=w" (-> V),
         : [in] "0" (b),
@@ -280,6 +352,7 @@ inline fn aesLast(b: V, k: V) V {
 
 inline fn pmull(a: W, b: W) W {
     return asm (
+        \\ .arch_extension aes
         \\ pmull %[r].1q, %[a].1d, %[b].1d
         : [r] "=w" (-> W),
         : [a] "w" (a),
@@ -289,6 +362,7 @@ inline fn pmull(a: W, b: W) W {
 
 inline fn pmull2(a: W, b: W) W {
     return asm (
+        \\ .arch_extension aes
         \\ pmull2 %[r].1q, %[a].2d, %[b].2d
         : [r] "=w" (-> W),
         : [a] "w" (a),
@@ -340,6 +414,45 @@ test "matches std.crypto's AES-GCM, every length up to 300 and chunk sizes" {
                 try testing.expectError(error.AuthenticationFailed, a.decrypt(back[0..len], c[0..len], tag, nonce));
                 c[len / 2] ^= 1;
             }
+        }
+    }
+}
+
+test "std's path, and associated data on both paths, match std.crypto" {
+    var prng: std.Random.DefaultPrng = .init(0xad);
+    const rand = prng.random();
+    var m: [3000]u8 = undefined;
+    var c: [m.len]u8 = undefined;
+    var c2: [m.len]u8 = undefined;
+    var back: [m.len]u8 = undefined;
+    for ([_]bool{ false, true }) |soft| {
+        force_software = soft;
+        defer force_software = false;
+        inline for (.{ Aes128Gcm, Aes256Gcm }) |A| {
+            const S = if (A.key_length == 16) std.crypto.aead.aes_gcm.Aes128Gcm else std.crypto.aead.aes_gcm.Aes256Gcm;
+            var key: [A.key_length]u8 = undefined;
+            rand.bytes(&key);
+            const a: A = .init(key);
+            try testing.expectEqual(!soft and hardware(), a.fast);
+            for ([_]usize{ 0, 1, 5, 16, 17, 129, 1000, 2999 }) |len| for ([_]usize{ 0, 5, 13, 16, 33 }) |ad_len| {
+                var ad: [33]u8 = undefined;
+                rand.bytes(&ad);
+                var nonce: [nonce_length]u8 = undefined;
+                rand.bytes(&nonce);
+                rand.bytes(m[0..len]);
+                var tag: [16]u8 = undefined;
+                var want_tag: [16]u8 = undefined;
+                a.encryptAd(c[0..len], &tag, m[0..len], ad[0..ad_len], nonce);
+                S.encrypt(c2[0..len], &want_tag, m[0..len], ad[0..ad_len], nonce, key);
+                try testing.expectEqualSlices(u8, c2[0..len], c[0..len]);
+                try testing.expectEqualSlices(u8, &want_tag, &tag);
+                try a.decryptAd(back[0..len], c[0..len], tag, ad[0..ad_len], nonce);
+                try testing.expectEqualSlices(u8, m[0..len], back[0..len]);
+                if (ad_len > 0) {
+                    ad[0] ^= 1;
+                    try testing.expectError(error.AuthenticationFailed, a.decryptAd(back[0..len], c[0..len], tag, ad[0..ad_len], nonce));
+                }
+            };
         }
     }
 }

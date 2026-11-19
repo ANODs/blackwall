@@ -570,7 +570,9 @@ pub const Session = struct {
             .default => {},
         };
         const need = s.active and (!narrow or only.items.len > 0);
-        const mtu: u16 = if (st.mtu >= 1280) st.mtu else 1500;
+        // 9000 unless set: the tunnel ends inside this app, so the path to the
+        // server never sees these packets; six times fewer of them to carry
+        const mtu: u16 = if (st.mtu >= 1280) st.mtu else 9000;
 
         var h = std.hash.Wyhash.init(0);
         h.update(&.{ @intFromBool(need), @intFromBool(narrow), @intFromEnum(st.ipv6), @intFromBool(st.allow_lan) });

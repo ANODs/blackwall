@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const crypto = std.crypto;
+const aes_gcm = @import("aes_gcm.zig");
 const tls = crypto.tls;
 const Io = std.Io;
 
@@ -115,10 +116,24 @@ fn SpecT(comptime AeadT: type, comptime HashT: type) type {
 // ---------------------------------------------------------------- record protection
 
 fn Protect(comptime Aead: type) type {
+    // the AES suites go through aes_gcm.zig: its key schedule and powers of
+    // H are made once per direction, and it runs on ARMv8's instructions
+    const Fast = if (Aead == crypto.aead.aes_gcm.Aes128Gcm)
+        aes_gcm.Aes128Gcm
+    else if (Aead == crypto.aead.aes_gcm.Aes256Gcm)
+        aes_gcm.Aes256Gcm
+    else
+        void;
     return struct {
         key: [Aead.key_length]u8,
         iv: [Aead.nonce_length]u8,
         seq: u64 = 0,
+        fast: if (Fast == void) void else ?Fast = if (Fast == void) {} else null,
+
+        fn cipher(self: *Self) *const Fast {
+            if (self.fast == null) self.fast = Fast.init(self.key);
+            return &self.fast.?;
+        }
 
         const Self = @This();
 
@@ -138,7 +153,10 @@ fn Protect(comptime Aead: type) type {
             rec[0..3].* = .{ 0x17, 0x03, 0x03 };
             std.mem.writeInt(u16, rec[3..5], @intCast(total), .big);
             const body = rec[5..][0..inner_len];
-            Aead.encrypt(body, rec[5 + inner_len ..][0..Aead.tag_length], body, rec[0..5], self.nonce(), self.key);
+            const tag = rec[5 + inner_len ..][0..Aead.tag_length];
+            if (Fast != void) {
+                self.cipher().encryptAd(body, tag, body, rec[0..5], self.nonce());
+            } else Aead.encrypt(body, tag, body, rec[0..5], self.nonce(), self.key);
             return 5 + total;
         }
 
@@ -146,7 +164,10 @@ fn Protect(comptime Aead: type) type {
             if (payload.len < Aead.tag_length) return error.TlsBadRecordMac;
             const n = payload.len - Aead.tag_length;
             const body = payload[0..n];
-            Aead.decrypt(body, body, payload[n..][0..Aead.tag_length].*, hdr, self.nonce(), self.key) catch
+            const tag = payload[n..][0..Aead.tag_length].*;
+            if (Fast != void) {
+                self.cipher().decryptAd(body, body, tag, hdr, self.nonce()) catch return error.TlsBadRecordMac;
+            } else Aead.decrypt(body, body, tag, hdr, self.nonce(), self.key) catch
                 return error.TlsBadRecordMac;
             return body;
         }

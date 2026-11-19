@@ -75,7 +75,7 @@
   "bench_ar_day10": "10 GB 流量",
   "bench_a_novpn": "不用 VPN：{n}",
   "bench_a_estimate": "估算",
-  "bench_a_mtu": "sing-box 将隧道 MTU 设为 9000，BLACKWALL 为 1500，这是它们在并行下载中领先的部分原因。",
+  "bench_a_mtu": "两个隧道现在都使用 MTU 9000（BLACKWALL 自 0.2.6 起）。在并行下载中 NekoBox 仍然领先：它的网络栈把工作分配到多个核心，而我们的目前仍按顺序把数据包交给应用。",
   "bench_a_battery": "这是估算，并非在手机上实测：客户端的处理器时间，乘以同一台 Mac 上 macOS 内核能耗计数得出的处理器每秒能耗。手机电池 {mah} mAh，每天唤醒 {hours} 小时。未计入各客户端都相同的无线电模块，以及熄屏后的深度睡眠。",
   "bench_a_foot": "Android {android} 模拟器（arm64，已 root），运行于 {machine}，{date}。使用 Shadowsocks 2022，因为 NekoBox 和 Hiddify 的内核 sing-box 无法通过 Xray 26 的 REALITY 验证。数据来自 Linux 内核计数（/proc/<pid>/stat、smaps_rollup、VmHWM），按应用的全部进程求和。",
   "dl_title": "下载 BLACKWALL",

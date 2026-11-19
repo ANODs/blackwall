@@ -143,34 +143,34 @@
     }
   },
   "android": {
-    "date": "2026-11-17",
+    "date": "2026-11-19",
     "device": "Android 16 emulator (arm64), on Apple M4 Pro, macOS 26.6.2",
     "protocol": "Shadowsocks 2022",
     "clients": {
       "dev.blackwall": {
         "name": "BLACKWALL",
-        "version": "0.2.3",
-        "idle_pss_mb": 23.2,
-        "peak_rss_mb": 125.8,
+        "version": "0.2.6",
+        "idle_pss_mb": 7.3,
+        "peak_rss_mb": 81.7,
         "idle_cpu_ms_s": 0.17,
-        "mbps": 443,
-        "par_mbps": 734,
-        "cpu_ms_per_gb": 13175,
-        "handshake_ms": 1.8,
+        "mbps": 461,
+        "par_mbps": 882,
+        "cpu_ms_per_gb": 5625,
+        "handshake_ms": 1.7,
         "apk_mb": 3.0,
-        "installed_mb": 3.1,
-        "build": "main 356b4b9, the code of 0.2.3 (measured before its version number changed)"
+        "installed_mb": 3.2,
+        "build": "main before 0.2.6: MTU 9000, AES on the ARMv8 instructions when the processor has them"
       },
       "moe.nb4a": {
         "name": "NekoBox",
         "version": "1.4.2",
-        "idle_pss_mb": 96.2,
-        "peak_rss_mb": 374.6,
-        "idle_cpu_ms_s": 0.5,
-        "mbps": 399,
-        "par_mbps": 1088,
-        "cpu_ms_per_gb": 12629,
-        "handshake_ms": 1.8,
+        "idle_pss_mb": 79.8,
+        "peak_rss_mb": 378.0,
+        "idle_cpu_ms_s": 0.33,
+        "mbps": 412,
+        "par_mbps": 1162,
+        "cpu_ms_per_gb": 12194,
+        "handshake_ms": 1.7,
         "apk_mb": 14.5,
         "installed_mb": 44.1
       },
@@ -193,7 +193,7 @@
       "direct_par_mbps": 1415,
       "note": "the emulator's own network, no VPN"
     },
-    "note": "sing-box (NekoBox, Hiddify) sets MTU 9000 on its tun; BLACKWALL 1500",
+    "note": "Both tunnels use MTU 9000 now (BLACKWALL since 0.2.6). NekoBox stays ahead with many downloads at once: its network stack spreads the work over several cores, ours still hands packets to the applications one at a time.",
     "battery": {
       "assumptions": {
         "battery_mah": 5000,
@@ -208,16 +208,16 @@
       },
       "clients": {
         "dev.blackwall": {
-          "pct_2gb": 0.18,
-          "pct_10gb": 0.78,
-          "minutes_2gb": 2.6,
-          "minutes_10gb": 11.3
+          "pct_2gb": 0.09,
+          "pct_10gb": 0.35,
+          "minutes_2gb": 1.3,
+          "minutes_10gb": 5.0
         },
         "moe.nb4a": {
-          "pct_2gb": 0.23,
-          "pct_10gb": 0.81,
-          "minutes_2gb": 3.3,
-          "minutes_10gb": 11.6
+          "pct_2gb": 0.19,
+          "pct_10gb": 0.75,
+          "minutes_2gb": 2.8,
+          "minutes_10gb": 10.8
         },
         "app.hiddify.com": {
           "pct_2gb": 1.83,
