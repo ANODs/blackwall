@@ -3,7 +3,10 @@
 //! Every TCP connection an application opens through the TUN is terminated
 //! here: we play the server side, and a worker thread relays the bytes to an
 //! outbound. Packet input, timers and connection state sit behind one mutex;
-//! workers block on a per-connection condition.
+//! workers block on a per-connection condition. Packets are made under the
+//! mutex but written to the TUN after it is released (see `Batch`): that
+//! write is where the kernel delivers the packet to the application, the
+//! dearest step, and it runs on as many threads as there are writers.
 //!
 //! Deliberately small, because the peer is the local kernel a fraction of a
 //! millisecond away:
@@ -44,9 +47,10 @@ const KeyContext = struct {
 
 pub const Output = struct {
     ctx: *anyopaque,
-    /// Write one IP packet to the TUN. Must be safe to call from several
-    /// threads at once (a plain write(2) per packet is).
-    write: *const fn (ctx: *anyopaque, pkt: []const u8) void,
+    /// Write one IP packet to the TUN: the concatenation of `parts` (one to
+    /// three). Must be safe to call from several threads at once (a plain
+    /// writev(2) per packet is) and must not block.
+    write: *const fn (ctx: *anyopaque, parts: []const []const u8) void,
 };
 
 pub const Handler = struct {
@@ -89,7 +93,8 @@ const fin_wait_timeout_ms = 60_000;
 const idle_timeout_ms = 2 * 60 * 60 * 1000;
 /// Floor for the MSS a SYN announces (Linux uses 48). Zero would never
 /// advance trySend, and a few bytes would turn every window into a flood
-/// of tiny packets, all written under the stack lock.
+/// of tiny packets, more than a batch holds (the rest is written under the
+/// stack lock).
 const min_peer_mss = 64;
 /// The TUN carries IPv6, whose links are at least this large (the helper
 /// clamps the utun the same way); it keeps every segment size positive.
@@ -121,6 +126,16 @@ const Ring = struct {
         @memcpy(r.buf[0 .. n - first], data[first..n]);
         r.len += n;
         return n;
+    }
+
+    /// `len` bytes starting `offset` bytes after the head, in place: one
+    /// piece, or two where they wrap around the end of the buffer.
+    fn slices(r: *const Ring, offset: usize, len: usize) [2][]const u8 {
+        std.debug.assert(offset + len <= r.len);
+        const mask = r.buf.len - 1;
+        const start = (r.head + offset) & mask;
+        const first = @min(len, r.buf.len - start);
+        return .{ r.buf[start..][0..first], r.buf[0 .. len - first] };
     }
 
     /// Copy `out.len` bytes starting `offset` bytes after the head.
@@ -162,12 +177,21 @@ pub const Conn = struct {
     key: Key,
     state: State = .pending,
 
-    cond: Io.Condition = .init,
+    /// readers: data, end of stream, failure
+    rx_cond: Io.Condition = .init,
+    /// the sender (and `accept`): room in the send buffer, the handshake,
+    /// failure. Apart from readers: an ACK would wake the thread waiting
+    /// for the application's data, for nothing, thousands of times a second.
+    tx_cond: Io.Condition = .init,
     /// a worker still holds this connection
     attached: bool = true,
-    /// gone from the protocol's point of view; freed once detached
+    /// gone from the protocol's point of view; freed once detached and
+    /// its last packets are written
     dead: bool = false,
     in_ack_list: bool = false,
+    /// the batch of the lock's holder has packets of this connection
+    in_batch: bool = false,
+    turns: Turns = .{},
     failure: ?Error = null,
 
     // receive side: application -> us
@@ -212,13 +236,24 @@ pub const Conn = struct {
         return c.key.remote;
     }
 
+    fn wakeAll(c: *Conn) void {
+        c.rx_cond.broadcast(c.stack.io);
+        c.tx_cond.broadcast(c.stack.io);
+    }
+
+    /// No packet of it waits to be written. Under the lock.
+    fn quiet(c: *const Conn) bool {
+        return !c.in_batch and c.turns.idle();
+    }
+
     // ------------------------------------------------------------ worker API
 
     /// Complete the handshake (SYN-ACK). Blocks until the application
     /// acknowledges it, so the caller knows the flow is really open.
     pub fn accept(c: *Conn) Error!void {
         const s = c.stack;
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         if (c.state != .pending) return c.failure orelse error.Closed;
         c.rx.buf = s.gpa.alloc(u8, s.cfg.rx_buf) catch {
@@ -237,17 +272,18 @@ pub const Conn = struct {
         c.state = .syn_received;
         c.sendSynAck();
         c.rto_at = s.now() + @as(i96, c.rto_ms) * ns_per_ms;
-        while (c.state == .syn_received) c.cond.waitUncancelable(s.io, &s.mutex);
+        while (c.state == .syn_received) s.wait(&c.tx_cond, null);
         if (c.failure) |f| return f;
     }
 
     /// Refuse the flow (RST), as a closed port would.
     pub fn reject(c: *Conn) void {
         const s = c.stack;
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         if (c.state != .pending) return;
-        s.sendRst(c.key, 0, c.rcv_nxt, true);
+        s.sendRst(c, c.key, 0, c.rcv_nxt, true);
         c.failure = error.ConnectionRefused;
         c.state = .closed;
         c.dead = true;
@@ -257,12 +293,13 @@ pub const Conn = struct {
     /// is something to read. End of stream is error.EndOfStream.
     pub fn recv(c: *Conn, dest: []const []u8) (Error || error{EndOfStream})!usize {
         const s = c.stack;
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         while (c.rx.len == 0) {
             if (c.failure) |f| return f;
             if (c.rx_eof or c.rx_closed) return error.EndOfStream;
-            c.cond.waitUncancelable(s.io, &s.mutex);
+            s.wait(&c.rx_cond, null);
         }
         var n: usize = 0;
         for (dest) |d| {
@@ -279,24 +316,26 @@ pub const Conn = struct {
     /// Wait up to `ms` for data (or the end of the stream) to be readable.
     pub fn waitReadable(c: *Conn, ms: u32) bool {
         const s = c.stack;
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         const deadline = s.now() + @as(i96, ms) * ns_per_ms;
         while (c.rx.len == 0 and !c.rx_eof and c.failure == null and !c.rx_closed) {
             const left = deadline - s.now();
             if (left <= 0) return false;
-            c.cond.waitTimeout(s.io, &s.mutex, .{ .duration = .{
-                .raw = .fromNanoseconds(left),
-                .clock = .awake,
-            } }) catch {};
+            s.wait(&c.rx_cond, left);
         }
         return true;
     }
 
-    /// Queue `data` for the application; blocks while the send buffer is full.
+    /// Queue `data` for the application; blocks while the send buffer is
+    /// full. One thread at a time sends on a connection: the packets of a
+    /// batch read the send buffer after the lock is gone, and only this
+    /// thread writes there.
     pub fn send(c: *Conn, data: []const u8) Error!void {
         const s = c.stack;
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         var rest = data;
         while (rest.len > 0) {
@@ -305,14 +344,15 @@ pub const Conn = struct {
             const n = c.tx.write(rest);
             rest = rest[n..];
             if (n > 0) c.trySend();
-            if (rest.len > 0) c.cond.waitUncancelable(s.io, &s.mutex);
+            if (rest.len > 0) s.wait(&c.tx_cond, null);
         }
     }
 
     /// No more data from our side: FIN after everything queued.
     pub fn closeWrite(c: *Conn) void {
         const s = c.stack;
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         if (c.fin_queued or c.state == .closed or c.state == .pending) return;
         c.fin_queued = true;
@@ -322,20 +362,22 @@ pub const Conn = struct {
     /// Stop reading: buffered and future data is acknowledged and dropped.
     pub fn shutdownRead(c: *Conn) void {
         const s = c.stack;
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         c.rx_closed = true;
         if (c.rx.len > 0) {
             c.rx.consume(c.rx.len);
             c.maybeWindowUpdate();
         }
-        c.cond.broadcast(s.io);
+        c.rx_cond.broadcast(s.io);
     }
 
     /// Reset the connection (RST to the application).
     pub fn abort(c: *Conn) void {
         const s = c.stack;
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         if (c.state == .closed) return;
         c.abortLocked(error.ConnectionReset, true);
@@ -345,14 +387,15 @@ pub const Conn = struct {
     /// the protocol is finished (or right away if it already is).
     pub fn release(c: *Conn) void {
         const s = c.stack;
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         c.attached = false;
         c.rx_closed = true;
         if (c.rx.len > 0) c.rx.consume(c.rx.len);
         switch (c.state) {
             .pending => {
-                s.sendRst(c.key, 0, c.rcv_nxt, true);
+                s.sendRst(c, c.key, 0, c.rcv_nxt, true);
                 c.state = .closed;
                 c.dead = true;
             },
@@ -373,7 +416,7 @@ pub const Conn = struct {
     }
 
     /// Largest payload per segment. The header size comes from key.remote,
-    /// the source address of everything we send (packet.writeTcp).
+    /// the source address of everything we send (packet.tcpHeaders).
     fn mss(c: *const Conn) usize {
         const ip_len: usize = packet.ipHeaderLen(&c.key.remote.addr);
         const own: usize = c.stack.cfg.mtu - ip_len - 20;
@@ -385,29 +428,31 @@ pub const Conn = struct {
         return @intCast(@min(c.rx.free(), 65535));
     }
 
-    fn emit(c: *Conn, seq: u32, flags: packet.Flags, payload: []const u8, mss_opt: ?u16) void {
+    /// `payload` is in the send ring (`Ring.slices`), or empty.
+    fn emit(c: *Conn, seq: u32, flags: packet.Flags, payload: [2][]const u8, mss_opt: ?u16) void {
         var f = flags;
         f.ack = flags.ack or c.state != .pending;
         const wnd = c.window();
         c.adv_edge = c.rcv_nxt +% wnd;
         c.ack_due = false;
-        c.stack.writeTcp(c.key.remote, c.key.app, .{
+        c.stack.queue(c, c.key.remote, c.key.app, .{
             .seq = seq,
             .ack = c.rcv_nxt,
             .flags = f,
             .window = wnd,
             .mss = mss_opt,
-            .payload = payload,
-        });
+        }, payload);
     }
+
+    const no_payload: [2][]const u8 = .{ &.{}, &.{} };
 
     fn sendSynAck(c: *Conn) void {
         const own: u16 = @intCast(c.stack.cfg.mtu - packet.ipHeaderLen(&c.key.remote.addr) - 20);
-        c.emit(c.iss, .{ .syn = true, .ack = true }, &.{}, own);
+        c.emit(c.iss, .{ .syn = true, .ack = true }, no_payload, own);
     }
 
     fn sendAck(c: *Conn) void {
-        c.emit(c.snd_nxt, .{ .ack = true }, &.{}, null);
+        c.emit(c.snd_nxt, .{ .ack = true }, no_payload, null);
     }
 
     fn finInFlight(c: *const Conn) bool {
@@ -420,8 +465,6 @@ pub const Conn = struct {
             .established, .close_wait, .fin_wait_1, .last_ack, .closing => {},
             else => return,
         }
-        const s = c.stack;
-        const seg_buf = s.segbuf;
         while (true) {
             const in_flight: usize = c.snd_nxt -% c.snd_una;
             const fin_out = c.finInFlight();
@@ -435,16 +478,15 @@ pub const Conn = struct {
                     break;
                 }
                 const n = @min(unsent, room, c.mss());
-                c.tx.copyAt(data_in_flight, seg_buf[0..n]);
                 const last = n == unsent;
-                c.emit(c.snd_nxt, .{ .ack = true, .psh = last }, seg_buf[0..n], null);
+                c.emit(c.snd_nxt, .{ .ack = true, .psh = last }, c.tx.slices(data_in_flight, n), null);
                 c.snd_nxt +%= @intCast(n);
                 if (c.rto_at == 0) c.rto_at = c.now() + @as(i96, c.rto_ms) * ns_per_ms;
                 continue;
             }
             if (c.fin_queued and !fin_out) {
                 c.fin_seq = c.snd_nxt;
-                c.emit(c.snd_nxt, .{ .fin = true, .ack = true }, &.{}, null);
+                c.emit(c.snd_nxt, .{ .fin = true, .ack = true }, no_payload, null);
                 c.snd_nxt +%= 1;
                 switch (c.state) {
                     .established => c.state = .fin_wait_1,
@@ -469,15 +511,15 @@ pub const Conn = struct {
 
     fn abortLocked(c: *Conn, why: Error, send_rst: bool) void {
         if (send_rst and c.state != .pending and c.state != .closed)
-            c.stack.sendRst(c.key, c.snd_nxt, c.rcv_nxt, true);
+            c.stack.sendRst(c, c.key, c.snd_nxt, c.rcv_nxt, true);
         if (send_rst and c.state == .pending)
-            c.stack.sendRst(c.key, 0, c.rcv_nxt, true);
+            c.stack.sendRst(c, c.key, 0, c.rcv_nxt, true);
         c.failure = why;
         c.state = .closed;
         c.dead = true;
         c.rto_at = 0;
         c.persist_at = 0;
-        c.cond.broadcast(c.stack.io);
+        c.wakeAll();
     }
 
     fn enterTimeWait(c: *Conn) void {
@@ -510,7 +552,7 @@ pub const Conn = struct {
 
         if (c.state == .syn_received) {
             if (t.ack != c.iss +% 1) {
-                s.sendRst(c.key, t.ack, 0, false);
+                s.sendRst(c, c.key, t.ack, 0, false);
                 return;
             }
             c.state = .established;
@@ -521,7 +563,7 @@ pub const Conn = struct {
             c.rto_at = 0;
             c.retries = 0;
             c.rto_ms = rto_min_ms;
-            c.cond.broadcast(s.io);
+            c.tx_cond.broadcast(s.io);
         } else {
             if (seqLt(c.snd_nxt, t.ack)) {
                 // acknowledges data we never sent
@@ -539,7 +581,10 @@ pub const Conn = struct {
                 c.retries = 0;
                 c.rto_ms = rto_min_ms;
                 c.rto_at = if (c.snd_una != c.snd_nxt) c.now() + @as(i96, c.rto_ms) * ns_per_ms else 0;
-                c.cond.broadcast(s.io);
+                // the sender, once a good part of the buffer is free: every
+                // ACK would wake it for a few bytes at a time (all data
+                // acknowledged always is a good part)
+                if (c.tx.free() >= c.tx.buf.len / 4) c.tx_cond.broadcast(s.io);
             } else if (t.ack == c.snd_una and t.payload.len == 0 and !t.flags.fin and
                 t.window == c.snd_wnd and c.snd_una != c.snd_nxt)
             {
@@ -568,7 +613,7 @@ pub const Conn = struct {
                     c.state = .closed;
                     c.dead = true;
                     c.rto_at = 0;
-                    c.cond.broadcast(s.io);
+                    c.wakeAll();
                     return;
                 },
                 else => {},
@@ -635,7 +680,7 @@ pub const Conn = struct {
         if (data.len > 0) {
             taken = if (c.rx_closed) data.len else c.rx.write(data);
             c.rcv_nxt +%= @intCast(taken);
-            if (taken > 0) c.cond.broadcast(s.io);
+            if (taken > 0) c.rx_cond.broadcast(s.io);
             c.queueAck();
         }
         if (t.flags.fin and taken == data.len) {
@@ -648,7 +693,7 @@ pub const Conn = struct {
                 .fin_wait_2 => c.enterTimeWait(),
                 else => {},
             }
-            c.cond.broadcast(s.io);
+            c.rx_cond.broadcast(s.io);
         }
     }
 
@@ -659,7 +704,7 @@ pub const Conn = struct {
                 .time_wait => {
                     c.state = .closed;
                     c.dead = true;
-                    c.cond.broadcast(s.io);
+                    c.wakeAll();
                 },
                 else => c.abortLocked(error.ConnectionTimedOut, true),
             }
@@ -685,7 +730,7 @@ pub const Conn = struct {
         if (c.persist_at != 0 and now_ns >= c.persist_at) {
             // zero-window probe: an old sequence number makes the peer answer
             // with its current window
-            c.emit(c.snd_una -% 1, .{ .ack = true }, &.{}, null);
+            c.emit(c.snd_una -% 1, .{ .ack = true }, no_payload, null);
             c.persist_ms = @min(c.persist_ms * 2, persist_max_ms);
             c.persist_at = now_ns + @as(i96, c.persist_ms) * ns_per_ms;
         }
@@ -707,12 +752,10 @@ pub const Stack = struct {
     out: Output,
     handler: Handler,
     mutex: Io.Mutex = .init,
+    /// where the holder of `mutex` puts the packets it makes
+    batch: ?*Batch = null,
     conns: std.HashMapUnmanaged(Key, *Conn, KeyContext, 80) = .empty,
     ack_list: std.ArrayList(*Conn) = .empty,
-    /// packet scratch for TCP output, used under the mutex
-    scratch: []u8,
-    /// payload scratch for data segments, used under the mutex
-    segbuf: []u8,
     /// packet scratch for UDP output, used under `udp_mutex`. Not on the
     /// caller's stack: DNS forwarders and UDP readers run on small stacks.
     udp_buf: []u8,
@@ -727,18 +770,12 @@ pub const Stack = struct {
         cfg.mtu = @max(cfg.mtu, min_mtu);
         const s = try gpa.create(Stack);
         errdefer gpa.destroy(s);
-        const scratch = try gpa.alloc(u8, cfg.mtu);
-        errdefer gpa.free(scratch);
-        const segbuf = try gpa.alloc(u8, cfg.mtu);
-        errdefer gpa.free(segbuf);
         s.* = .{
             .gpa = gpa,
             .io = io,
             .cfg = cfg,
             .out = out,
             .handler = handler,
-            .scratch = scratch,
-            .segbuf = segbuf,
             .udp_buf = try gpa.alloc(u8, cfg.mtu),
         };
         return s;
@@ -746,7 +783,8 @@ pub const Stack = struct {
 
     /// Reset every connection; blocked workers wake up with ConnectionReset.
     pub fn abortAll(s: *Stack) void {
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         var it = s.conns.valueIterator();
         while (it.next()) |c| {
@@ -758,7 +796,8 @@ pub const Stack = struct {
     /// `Conn.abort` this needs no pointer that has to stay valid: whoever
     /// remembers flows to end them later remembers their keys.
     pub fn abortKey(s: *Stack, key: Key) void {
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         const c = s.conns.get(key) orelse return;
         if (c.state != .closed) c.abortLocked(error.ConnectionReset, true);
@@ -766,7 +805,7 @@ pub const Stack = struct {
 
     /// Connections still held by a worker.
     pub fn attachedCount(s: *Stack) usize {
-        s.lock();
+        s.lock(null);
         defer s.unlock();
         var n: usize = 0;
         var it = s.conns.valueIterator();
@@ -777,7 +816,7 @@ pub const Stack = struct {
     /// Free the stack. Call `abortAll` first and wait until no worker holds
     /// a connection (`attachedCount() == 0`).
     pub fn destroy(s: *Stack) void {
-        s.lock();
+        s.lock(null);
         var it = s.conns.valueIterator();
         while (it.next()) |cp| {
             const c = cp.*;
@@ -788,17 +827,56 @@ pub const Stack = struct {
         s.conns.deinit(s.gpa);
         s.ack_list.deinit(s.gpa);
         s.unlock();
-        s.gpa.free(s.scratch);
-        s.gpa.free(s.segbuf);
         s.gpa.free(s.udp_buf);
         s.gpa.destroy(s);
     }
 
-    fn lock(s: *Stack) void {
+    /// Take the lock; packets made under it go to `b` (null: none are made).
+    fn lock(s: *Stack, b: ?*Batch) void {
+        s.acquire();
+        s.batch = b;
+    }
+
+    /// The lock is held for microseconds at a time (no system call runs
+    /// under it): wait that out on the processor before going to sleep. A
+    /// sleep and its wakeup cost far more, in a virtual machine an
+    /// interrupt between processors each.
+    fn acquire(s: *Stack) void {
+        if (s.mutex.tryLock()) return;
+        for (0..256) |_| {
+            std.atomic.spinLoopHint();
+            if (s.mutex.state.load(.monotonic) == .unlocked and s.mutex.tryLock()) return;
+        }
         s.mutex.lockUncancelable(s.io);
     }
+
+    /// Release the lock, then write the packets made under it.
     fn unlock(s: *Stack) void {
+        const b = s.batch;
+        s.batch = null;
+        if (b) |x| x.seal();
         s.mutex.unlock(s.io);
+        if (b) |x| x.write(s);
+    }
+
+    /// Wait on a connection's condition for at most `ns` (null: no limit).
+    /// With packets made under the lock, writes them instead and returns at
+    /// once: what the caller waits for may be their answer. Callers loop, as
+    /// on a spurious wakeup.
+    fn wait(s: *Stack, cond: *Io.Condition, ns: ?i96) void {
+        const b = s.batch.?;
+        if (b.n > 0) {
+            s.unlock();
+            s.lock(b);
+            return;
+        }
+        s.batch = null;
+        defer s.batch = b;
+        const left = ns orelse return cond.waitUncancelable(s.io, &s.mutex);
+        cond.waitTimeout(s.io, &s.mutex, .{ .duration = .{
+            .raw = .fromNanoseconds(left),
+            .clock = .awake,
+        } }) catch {};
     }
 
     pub fn now(s: *const Stack) i96 {
@@ -811,7 +889,8 @@ pub const Stack = struct {
         switch (ip.proto) {
             packet.proto_tcp => {
                 const t = packet.parseTcp(ip.l4) orelse return;
-                s.lock();
+                var b: Batch = .{};
+                s.lock(&b);
                 defer s.unlock();
                 s.stats.packets_in += 1;
                 s.tcpInput(ip, t);
@@ -825,20 +904,28 @@ pub const Stack = struct {
     }
 
     /// Send the acknowledgements collected while processing a batch of input.
+    /// Call it from the thread that calls `input`: nothing else touches the list.
     pub fn flush(s: *Stack) void {
-        s.lock();
-        defer s.unlock();
-        for (s.ack_list.items) |c| {
-            c.in_ack_list = false;
-            if (c.ack_due and !c.dead) c.sendAck();
+        var i: usize = 0;
+        while (true) {
+            var b: Batch = .{};
+            s.lock(&b);
+            defer s.unlock();
+            // a batch at a time, so none is written under the lock
+            while (i < s.ack_list.items.len and b.n < Batch.cap) : (i += 1) {
+                const c = s.ack_list.items[i];
+                c.in_ack_list = false;
+                if (c.ack_due and !c.dead) c.sendAck();
+            }
+            if (i == s.ack_list.items.len) return s.ack_list.clearRetainingCapacity();
         }
-        s.ack_list.clearRetainingCapacity();
     }
 
     /// Run timers and free finished connections. Returns how long the caller
     /// may sleep before calling again (milliseconds).
     pub fn tick(s: *Stack) u32 {
-        s.lock();
+        var b: Batch = .{};
+        s.lock(&b);
         defer s.unlock();
         const t = s.now();
         var next: i96 = t + 60 * std.time.ns_per_s;
@@ -851,18 +938,18 @@ pub const Stack = struct {
             if (c.dead) {
                 // no timers left: a stale deadline of a connection its
                 // worker still holds must not make us wake every millisecond
-                if (!c.attached) gone.append(s.gpa, c) catch {};
+                if (!c.attached and c.quiet()) gone.append(s.gpa, c) catch {};
                 continue;
             }
             next = @min(next, c.nextDeadline());
         }
         for (gone.items) |c| s.freeConn(c);
-        const wait = @max(next - t, 0);
-        return @intCast(@min(@divTrunc(wait, ns_per_ms) + 1, 60_000));
+        const sleep = @max(next - t, 0);
+        return @intCast(@min(@divTrunc(sleep, ns_per_ms) + 1, 60_000));
     }
 
     pub fn connectionCount(s: *Stack) usize {
-        s.lock();
+        s.lock(null);
         defer s.unlock();
         return s.conns.count();
     }
@@ -889,6 +976,8 @@ pub const Stack = struct {
             if (c.dead) {
                 // a new SYN may reuse the tuple of a connection in its last moments
                 if (t.flags.syn and !t.flags.ack and !c.attached) {
+                    // its last packets are still being written: the SYN comes again
+                    if (!c.quiet()) return;
                     s.freeConn(c);
                     s.newConn(key, t);
                 } else if (!t.flags.rst) s.sendRstFor(key, t);
@@ -903,8 +992,8 @@ pub const Stack = struct {
     }
 
     fn newConn(s: *Stack, key: Key, t: packet.Tcp) void {
-        if (s.conns.count() >= s.cfg.max_conns) return s.sendRst(key, 0, t.seq +% 1, true);
-        const c = s.gpa.create(Conn) catch return s.sendRst(key, 0, t.seq +% 1, true);
+        if (s.conns.count() >= s.cfg.max_conns) return s.sendRst(null, key, 0, t.seq +% 1, true);
+        const c = s.gpa.create(Conn) catch return s.sendRst(null, key, 0, t.seq +% 1, true);
         c.* = .{
             .stack = s,
             .key = key,
@@ -916,10 +1005,10 @@ pub const Stack = struct {
         };
         s.conns.put(s.gpa, key, c) catch {
             s.gpa.destroy(c);
-            return s.sendRst(key, 0, t.seq +% 1, true);
+            return s.sendRst(null, key, 0, t.seq +% 1, true);
         };
         if (!s.handler.tcp(s.handler.ctx, c)) {
-            s.sendRst(key, 0, c.rcv_nxt, true);
+            s.sendRst(c, key, 0, c.rcv_nxt, true);
             c.state = .closed;
             c.dead = true;
             c.attached = false;
@@ -929,29 +1018,43 @@ pub const Stack = struct {
     /// RST in answer to a segment that belongs to no connection (RFC 9293 3.10.7.1).
     fn sendRstFor(s: *Stack, key: Key, t: packet.Tcp) void {
         if (t.flags.ack) {
-            s.sendRst(key, t.ack, 0, false);
+            s.sendRst(null, key, t.ack, 0, false);
         } else {
             var len: u32 = @intCast(t.payload.len);
             if (t.flags.syn) len += 1;
             if (t.flags.fin) len += 1;
-            s.sendRst(key, 0, t.seq +% len, true);
+            s.sendRst(null, key, 0, t.seq +% len, true);
         }
     }
 
-    fn sendRst(s: *Stack, key: Key, seq: u32, ack: u32, with_ack: bool) void {
+    /// `conn`: the connection the reset belongs to, if it has one, so it
+    /// leaves after the connection's other packets.
+    fn sendRst(s: *Stack, conn: ?*Conn, key: Key, seq: u32, ack: u32, with_ack: bool) void {
         s.stats.resets_sent += 1;
-        s.writeTcp(key.remote, key.app, .{
+        s.queue(conn, key.remote, key.app, .{
             .seq = seq,
             .ack = if (with_ack) ack else 0,
             .flags = .{ .rst = true, .ack = with_ack },
             .window = 0,
-        });
+        }, Conn.no_payload);
     }
 
-    fn writeTcp(s: *Stack, src: Endpoint, dst: Endpoint, seg: packet.TcpOut) void {
-        const n = packet.writeTcp(s.scratch, src, dst, seg);
+    /// Add a TCP segment to the lock holder's batch. `conn` orders it
+    /// after that connection's packets in earlier batches.
+    fn queue(s: *Stack, conn: ?*Conn, src: Endpoint, dst: Endpoint, seg: packet.TcpOut, payload: [2][]const u8) void {
+        const b = s.batch.?;
+        if (b.n == Batch.cap) {
+            // more than a batch holds (thousands of resets, a tiny MSS):
+            // the rest the old way, under the lock
+            b.seal();
+            b.write(s);
+        }
+        const it = &b.items[b.n];
+        it.hdr_len = @intCast(packet.tcpHeaders(&it.hdr, src, dst, seg, payload[0].len + payload[1].len));
+        it.payload = payload;
+        it.turn = if (conn) |c| b.turnOf(c) else Batch.no_turn;
+        b.n += 1;
         s.stats.packets_out += 1;
-        s.out.write(s.out.ctx, s.scratch[0..n]);
     }
 
     /// Send a UDP datagram to the application. Thread-safe; takes only
@@ -962,7 +1065,138 @@ pub const Stack = struct {
         s.udp_mutex.lockUncancelable(s.io);
         defer s.udp_mutex.unlock(s.io);
         const n = packet.writeUdp(s.udp_buf, src, dst, payload);
-        s.out.write(s.out.ctx, s.udp_buf[0..n]);
+        s.out.write(s.out.ctx, &.{s.udp_buf[0..n]});
+    }
+};
+
+/// The packets one holder of the stack's lock makes, written to the TUN
+/// once the lock is released: the write is where the kernel takes the
+/// packet in for the application (on Linux, its whole TCP input and the
+/// wakeup of the reader), and under the lock it made every connection wait
+/// for every other one's. Lives on the holder's stack.
+///
+/// A segment's payload is read from its connection's send ring after the
+/// lock is gone. Those bytes stay put until then: only the connection's
+/// sending thread writes into the ring, and it writes its own batch before
+/// it can write there again; and they are freed (acknowledged) only by the
+/// thread that feeds `input`, which also writes its own batches first.
+const Batch = struct {
+    items: [cap]Item = undefined,
+    n: u8 = 0,
+    turns: [cap]Turn = undefined,
+    n_turns: u8 = 0,
+
+    const cap = 32;
+    const no_turn = 0xff;
+
+    const Item = struct {
+        /// IP and TCP headers, the TCP checksum still to fill in
+        hdr: [packet.tcp_headers_max]u8,
+        hdr_len: u8,
+        /// index into `turns`, or `no_turn`
+        turn: u8,
+        payload: [2][]const u8,
+    };
+
+    /// A connection with packets in this batch.
+    const Turn = struct {
+        conn: *Conn,
+        ticket: u31,
+        /// its first and last packet here
+        first: u8,
+        last: u8,
+    };
+
+    fn turnOf(b: *Batch, c: *Conn) u8 {
+        if (c.in_batch) {
+            for (b.turns[0..b.n_turns], 0..) |*t, i| if (t.conn == c) {
+                t.last = b.n;
+                return @intCast(i);
+            };
+            unreachable;
+        }
+        c.in_batch = true;
+        b.turns[b.n_turns] = .{ .conn = c, .ticket = c.turns.take(), .first = b.n, .last = b.n };
+        b.n_turns += 1;
+        return b.n_turns - 1;
+    }
+
+    /// Done adding: under the lock, before it is released.
+    fn seal(b: *Batch) void {
+        for (b.turns[0..b.n_turns]) |t| t.conn.in_batch = false;
+    }
+
+    /// Checksum and write every packet, each connection's in its turn; empty
+    /// the batch.
+    fn write(b: *Batch, s: *Stack) void {
+        for (b.items[0..b.n], 0..) |*it, i| {
+            const turn = if (it.turn == no_turn) null else &b.turns[it.turn];
+            if (turn) |t| if (t.first == i) t.conn.turns.wait(s.io, t.ticket);
+            packet.finishTcp(it.hdr[0..it.hdr_len], &it.payload);
+            var parts: [3][]const u8 = .{ it.hdr[0..it.hdr_len], it.payload[0], it.payload[1] };
+            const n: usize = if (it.payload[1].len > 0) 3 else if (it.payload[0].len > 0) 2 else 1;
+            s.out.write(s.out.ctx, parts[0..n]);
+            // the connection may be freed from here on
+            if (turn) |t| if (t.last == i) t.conn.turns.pass(s.io);
+        }
+        b.n = 0;
+        b.n_turns = 0;
+    }
+};
+
+/// Keeps a connection's packets in order on their way out: every batch
+/// with packets of the connection takes a ticket under the stack's lock and
+/// writes them once the batches before it have written theirs.
+const Turns = struct {
+    /// the next ticket, under the stack's lock
+    next: u31 = 0,
+    /// the ticket whose turn it is, shifted left by one; bit 0: somebody
+    /// sleeps waiting for a later one
+    state: std.atomic.Value(u32) = .init(0),
+
+    fn take(t: *Turns) u31 {
+        const k = t.next;
+        t.next +%= 1;
+        return k;
+    }
+
+    fn turn(state: u32) u31 {
+        return @truncate(state >> 1);
+    }
+
+    /// Every ticket taken has been written. Under the stack's lock.
+    fn idle(t: *const Turns) bool {
+        return turn(t.state.load(.acquire)) == t.next;
+    }
+
+    fn wait(t: *Turns, io: Io, ticket: u31) void {
+        var st = t.state.load(.acquire);
+        // the batch before is a few writes away: spin a little first
+        var spins: u32 = 0;
+        while (turn(st) != ticket and spins < 200) : (spins += 1) {
+            std.atomic.spinLoopHint();
+            st = t.state.load(.acquire);
+        }
+        while (turn(st) != ticket) {
+            if (st & 1 == 0) {
+                if (t.state.cmpxchgWeak(st, st | 1, .acquire, .acquire)) |now| {
+                    st = now;
+                    continue;
+                }
+                st |= 1;
+            }
+            io.futexWaitUncancelable(u32, &t.state.raw, st);
+            st = t.state.load(.acquire);
+        }
+    }
+
+    /// The next ticket's turn. The connection may be freed the moment the
+    /// state changes; the wakeup only names the address, which the kernel
+    /// takes as a key (std's own primitives do the same).
+    fn pass(t: *Turns, io: Io) void {
+        var st = t.state.load(.monotonic);
+        while (t.state.cmpxchgWeak(st, @as(u32, turn(st) +% 1) << 1, .release, .monotonic)) |now| st = now;
+        if (st & 1 != 0) io.futexWake(u32, &t.state.raw, std.math.maxInt(u32));
     }
 };
 
@@ -1057,6 +1291,10 @@ const Harness = struct {
     out: std.ArrayList([]u8) = .empty,
     conns: std.ArrayList(*Conn) = .empty,
     refuse: bool = false,
+    /// the next packet with data stops on its way out until `gate` opens
+    hold: std.atomic.Value(bool) = .init(false),
+    held: std.atomic.Value(bool) = .init(false),
+    gate: std.atomic.Value(bool) = .init(false),
     app: Endpoint = .{ .addr = packet.v4(.{ 198, 18, 0, 1 }), .port = 50000 },
     remote: Endpoint = .{ .addr = packet.v4(.{ 93, 184, 216, 34 }), .port = 443 },
 
@@ -1077,11 +1315,15 @@ const Harness = struct {
         h.conns.deinit(h.gpa);
     }
 
-    fn capture(ctx: *anyopaque, pkt: []const u8) void {
+    fn capture(ctx: *anyopaque, parts: []const []const u8) void {
         const h: *Harness = @ptrCast(@alignCast(ctx));
+        if (parts.len > 1 and h.hold.swap(false, .acq_rel)) {
+            h.held.store(true, .release);
+            while (!h.gate.load(.acquire)) std.Thread.yield() catch {};
+        }
         h.mutex.lockUncancelable(std.testing.io);
         defer h.mutex.unlock(std.testing.io);
-        h.out.append(h.gpa, h.gpa.dupe(u8, pkt) catch unreachable) catch unreachable;
+        h.out.append(h.gpa, std.mem.concat(h.gpa, u8, parts) catch unreachable) catch unreachable;
     }
 
     fn onTcp(ctx: *anyopaque, conn: *Conn) bool {
@@ -1150,8 +1392,9 @@ const Harness = struct {
 
     /// `open` with the MSS option the SYN carries.
     fn openMss(h: *Harness, isn: u32, mss: ?u16) !struct { *Conn, u32 } {
+        const before = h.conns.items.len;
         h.send(.{ .seq = isn, .ack = 0, .flags = .{ .syn = true }, .window = 65535, .mss = mss });
-        try std.testing.expectEqual(1, h.conns.items.len);
+        try std.testing.expectEqual(before + 1, h.conns.items.len);
         const c = h.conns.items[h.conns.items.len - 1];
         try std.testing.expectEqual(0, h.pending()); // nothing until the worker decides
         const T = struct {
@@ -1477,6 +1720,125 @@ test "an MSS of 0 and a tiny MTU still leave room for data" {
     try std.testing.expectEqual(min_peer_mss, h.next().?.payload.len);
 }
 
+test "more segments than a batch holds leave in order" {
+    const h = try testHarness(.{});
+    defer freeHarness(h);
+    const c, const iss = try h.openMss(77, 0);
+    var data: [8 * 1024]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 31);
+    try c.send(&data); // 128 segments of 64 bytes, four batches' worth
+    var got: usize = 0;
+    while (h.next()) |t| {
+        try std.testing.expectEqual(iss +% 1 +% @as(u32, @intCast(got)), t.seq);
+        try std.testing.expectEqualSlices(u8, data[got..][0..t.payload.len], t.payload);
+        got += t.payload.len;
+    }
+    try std.testing.expectEqual(data.len, got);
+}
+
+test "a packet made later waits for the connection's packets made before it" {
+    const h = try testHarness(.{});
+    defer freeHarness(h);
+    const c, const iss = try h.open(1000);
+    const T = struct {
+        fn send(conn: *Conn) void {
+            conn.send("abc") catch unreachable;
+        }
+        fn ack(hh: *Harness, seq: u32) void {
+            hh.send(.{ .seq = 1001, .ack = seq, .flags = .{ .ack = true }, .window = 65535, .payload = "xy" });
+        }
+    };
+    h.hold.store(true, .release);
+    const sender = try std.Thread.spawn(.{}, T.send, .{c});
+    while (!h.held.load(.acquire)) std.Thread.yield() catch {};
+    // the sender's segment is made and on its way out; the application's
+    // data now makes an ACK of the same connection, on another thread
+    const acker = try std.Thread.spawn(.{}, T.ack, .{ h, iss +% 1 });
+    try std.testing.io.sleep(.fromMilliseconds(30), .awake);
+    try std.testing.expectEqual(0, h.pending());
+    h.gate.store(true, .release);
+    sender.join();
+    acker.join();
+    const data = h.next().?;
+    try std.testing.expectEqualStrings("abc", data.payload);
+    const ack = h.next().?;
+    try std.testing.expectEqual(0, ack.payload.len);
+    try std.testing.expectEqual(iss +% 4, ack.seq);
+    try std.testing.expectEqual(1003, ack.ack);
+}
+
+test "each connection's packets leave in order while many threads send" {
+    const h = try testHarness(.{});
+    defer freeHarness(h);
+    const n_conns = 4;
+    const total = 512 * 1024;
+    const Flow = struct {
+        conn: *Conn,
+        iss: u32,
+        port: u16,
+        got: usize = 0,
+        err: ?Error = null,
+
+        fn byte(port: u16, i: usize) u8 {
+            return @truncate(i *% 7 +% port);
+        }
+        fn run(f: *@This()) void {
+            var buf: [5000]u8 = undefined;
+            var sent: usize = 0;
+            var k: usize = 0;
+            while (sent < total) : (k += 1) {
+                // chunks of every size, so segments split anywhere in the ring
+                const n = @min(total - sent, 1 + (k * 977) % buf.len);
+                for (buf[0..n], sent..) |*b, i| b.* = byte(f.port, i);
+                f.conn.send(buf[0..n]) catch |e| {
+                    f.err = e;
+                    return;
+                };
+                sent += n;
+            }
+        }
+    };
+    var flows: [n_conns]Flow = undefined;
+    for (&flows, 0..) |*f, i| {
+        h.app.port = @intCast(50000 + i);
+        const c, const iss = try h.open(1000);
+        f.* = .{ .conn = c, .iss = iss, .port = h.app.port };
+    }
+    var threads: [n_conns]std.Thread = undefined;
+    for (&threads, &flows) |*th, *f| th.* = try std.Thread.spawn(.{}, Flow.run, .{f});
+
+    // the application's kernel: every segment must be the next one of its
+    // connection (no timer runs and no ACK is repeated, so nothing is resent)
+    var done: usize = 0;
+    while (done < n_conns) {
+        const b = blk: {
+            h.mutex.lockUncancelable(std.testing.io);
+            defer h.mutex.unlock(std.testing.io);
+            if (h.out.items.len == 0) break :blk null;
+            break :blk h.out.orderedRemove(0);
+        } orelse {
+            std.Thread.yield() catch {};
+            continue;
+        };
+        defer h.gpa.free(b);
+        const ip = packet.parseIp(b).?;
+        try std.testing.expect(packet.transportChecksumOk(ip));
+        const t = packet.parseTcp(ip.l4).?;
+        if (t.payload.len == 0) continue;
+        const f = &flows[t.dst_port - 50000];
+        try std.testing.expectEqual(f.iss +% 1 +% @as(u32, @intCast(f.got)), t.seq);
+        for (t.payload, f.got..) |x, i| try std.testing.expectEqual(Flow.byte(f.port, i), x);
+        f.got += t.payload.len;
+        if (f.got == total) done += 1;
+        h.app.port = f.port;
+        h.send(.{ .seq = 1001, .ack = t.seq +% @as(u32, @intCast(t.payload.len)), .flags = .{ .ack = true }, .window = 65535 });
+    }
+    for (threads, flows) |th, f| {
+        th.join();
+        try std.testing.expect(f.err == null);
+    }
+}
+
 test "a SYN reusing the tuple of a connection that waits for its ACK" {
     const h = try testHarness(.{});
     defer freeHarness(h);
@@ -1569,8 +1931,8 @@ test "an IPv6 SYN from an IPv4-mapped address opens nothing" {
 test "sendUdp fits on the small stack of a DNS forwarding thread" {
     const T = struct {
         var bytes: std.atomic.Value(usize) = .init(0);
-        fn write(_: *anyopaque, pkt: []const u8) void {
-            _ = bytes.fetchAdd(pkt.len, .monotonic);
+        fn write(_: *anyopaque, parts: []const []const u8) void {
+            for (parts) |p| _ = bytes.fetchAdd(p.len, .monotonic);
         }
         fn onTcp(_: *anyopaque, _: *Conn) bool {
             return false;
