@@ -54,6 +54,16 @@ Check 'the service runs' (-not $p.HasExited)
 Check 'the adapter is there' ($null -ne (Get-NetAdapter -Name 'BLACKWALL' -ErrorAction SilentlyContinue))
 $code = Fetch
 Check "curl through the tunnel ($code)" ($code -eq '200')
+# what a video is: one long download, and several at once (a page, a player)
+$big = 32000000
+$r = & curl.exe -s -m 90 -o NUL -w "%{http_code} %{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=$big" 2>$null
+$f = "$r".Split(' ')
+Check "a long download through the tunnel ($r)" (($f[0] -eq '200') -and ([int64]$f[1] -eq $big))
+$urls = 1..6 | ForEach-Object { "https://speed.cloudflare.com/__down?bytes=8000000&n=$_" }
+$out = 1..6 | ForEach-Object { '-o'; 'NUL' }
+$r = & curl.exe -s -m 90 --parallel --parallel-max 6 -w "%{size_download}\n" $out $urls 2>$null
+$sizes = @($r | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int64]$_ })
+Check "six at once through the tunnel ($($sizes -join ', '))" (($sizes.Count -eq 6) -and (($sizes | Where-Object { $_ -ne 8000000 }).Count -eq 0))
 Get-Content (Join-Path $cfg 'direct.err') -Tail 30 | Write-Host
 Stop-Process -Id $p.Id -Force
 Start-Sleep -Seconds 3

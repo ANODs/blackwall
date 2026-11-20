@@ -525,14 +525,9 @@ const Fetch = struct {
 /// enough) within `wait_ms`.
 fn fetch(g: *Group, ob: *const proxy.Outbound, comptime host: []const u8, request: []const u8, want: u64, wait_ms: i64) Fetch {
     var res: Fetch = .{};
-    if (comptime !sys.supported) return res;
     if (ob.via() == null) return res;
-    var fds: [2]c.fd_t = undefined;
-    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return res;
-    if (builtin.os.tag.isDarwin()) {
-        const one: c_int = 1;
-        for (fds) |fd| _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.NOSIGPIPE, &one, @sizeOf(c_int));
-    }
+    // on Windows a loopback TCP pair (it has no socketpair)
+    const fds = sys.socketPair(g.io) orelse return res;
 
     // the flow's "application" is the other end of the socket pair
     const Runner = struct {
@@ -557,14 +552,21 @@ fn fetch(g: *Group, ob: *const proxy.Outbound, comptime host: []const u8, reques
     };
     var runner: Runner = .{ .io = g.io, .dialer = g.dialer, .ob = ob, .fd = fds[0] };
     runner.dialer.timeout_ms = 5000;
+    const mine: net.Stream = .{ .socket = .{ .handle = fds[1], .address = sys.toIpAddress(&packet.v4(.{ 127, 0, 0, 1 }), 0) } };
     const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(512 * 1024) }, Runner.run, .{&runner}) catch {
-        _ = c.close(fds[0]);
-        _ = c.close(fds[1]);
+        const theirs: net.Stream = .{ .socket = .{ .handle = fds[0], .address = mine.socket.address } };
+        theirs.close(g.io);
+        mine.close(g.io);
         return res;
     };
 
     const start = g.nowMs();
-    _ = c.write(fds[1], request.ptr, request.len);
+    {
+        var wb: [512]u8 = undefined;
+        var sw = mine.writer(g.io, &wb);
+        sw.interface.writeAll(request) catch {};
+        sw.interface.flush() catch {};
+    }
     // the answer's head is kept until its end is seen, the body only counted
     var head: [8 * 1024]u8 = undefined;
     var head_len: usize = 0;
@@ -578,9 +580,9 @@ fn fetch(g: *Group, ob: *const proxy.Outbound, comptime host: []const u8, reques
         const left = deadline - g.nowMs();
         if (left <= 0) break;
         if (!sys.waitFd(fds[1], false, @intCast(@min(left, 500)))) continue;
-        const n = c.read(fds[1], &buf, buf.len);
-        if (n <= 0) break;
-        const chunk = buf[0..@intCast(n)];
+        const n = sys.recvSome(fds[1], &buf) orelse break;
+        if (n == 0) break;
+        const chunk = buf[0..n];
         const now = g.nowMs();
         if (head_done) {
             res.body += chunk.len;
@@ -617,7 +619,7 @@ fn fetch(g: *Group, ob: *const proxy.Outbound, comptime host: []const u8, reques
     // just shut down, so that its writes fail and it stops reading the
     // server (with a shutdown, macOS takes them and the download goes on)
     runner.done.store(true, .release);
-    _ = c.close(fds[1]);
+    mine.close(g.io);
     th.join();
     return res;
 }
