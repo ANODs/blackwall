@@ -2520,11 +2520,11 @@ test "a TUN connection relayed direct to a loopback server" {
         mutex: Io.Mutex = .init,
         out: std.ArrayList([]u8) = .empty,
         conn: ?*tcp.Conn = null,
-        fn write(ctx: *anyopaque, pkt: []const u8) void {
+        fn write(ctx: *anyopaque, parts: []const []const u8) void {
             const a: *@This() = @ptrCast(@alignCast(ctx));
             a.mutex.lockUncancelable(std.testing.io);
             defer a.mutex.unlock(std.testing.io);
-            a.out.append(a.gpa, a.gpa.dupe(u8, pkt) catch unreachable) catch unreachable;
+            a.out.append(a.gpa, std.mem.concat(a.gpa, u8, parts) catch unreachable) catch unreachable;
         }
         fn onTcp(ctx: *anyopaque, c: *tcp.Conn) bool {
             const a: *@This() = @ptrCast(@alignCast(ctx));

@@ -75,7 +75,7 @@
   "bench_ar_day10": "10 GB of traffic",
   "bench_a_novpn": "no VPN: {n}",
   "bench_a_estimate": "an estimate",
-  "bench_a_mtu": "Both tunnels use MTU 9000 now (BLACKWALL since 0.2.6). NekoBox stays ahead with many downloads at once: its network stack spreads the work over several cores, ours still hands packets to the applications one at a time.",
+  "bench_a_mtu": "Both tunnels use MTU 9000. With eight downloads at once BLACKWALL and NekoBox are now about level: our network stack hands packets to the applications from several threads at once, and spends a third of NekoBox's processor time per gigabyte.",
   "bench_a_battery": "An estimate, not a measurement on a phone: the client's CPU time times the energy the CPU uses per second, from the macOS kernel's energy counters on the same Mac. A {mah} mAh phone, awake {hours} hours a day. The radio, the same for every client, and deep sleep with the screen off are not counted.",
   "bench_a_foot": "Android {android} emulator (arm64) with root, on {machine}, {date}. Shadowsocks 2022, because sing-box, the core of NekoBox and Hiddify, does not pass Xray 26's REALITY check. Linux kernel counters (/proc/<pid>/stat, smaps_rollup, VmHWM), summed over every process of the app.",
   "dl_title": "Get BLACKWALL",
