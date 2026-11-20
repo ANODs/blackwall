@@ -953,37 +953,57 @@ pub const Tunnel = struct {
         var woke: [3]u32 = @splat(0);
         var in_packets: u64 = 0;
         var full_batches: u32 = 0;
+        // where the loop's time goes (Windows, logged while busy): reading
+        // Wintun, the stack's input, its flush, its timers
+        var spent: [4]i64 = @splat(0);
         while (!t.stopping.load(.acquire)) {
+            var t0 = Io.Clock.awake.now(t.io).toNanoseconds();
             const wait = @min(t.stack.tick(), 10_000);
+            if (comptime windows) {
+                const t1 = Io.Clock.awake.now(t.io).toNanoseconds();
+                spent[3] += @intCast(t1 - t0);
+                t0 = t1;
+            }
             if (t.nowMs() - last_sweep > 10_000) {
                 last_sweep = t.nowMs();
                 t.sweepUdp();
                 t.group.tick();
                 if (comptime windows) {
-                    if (in_packets > 1000) std.log.scoped(.tun).info("woken by packets {d}, by time {d}; {d} packets in, {d} full batches, {d} dropped out", .{
-                        woke[0], woke[2], in_packets, full_batches, dev.dropped.load(.monotonic),
+                    if (in_packets > 1000) std.log.scoped(.tun).info("woken by packets {d}, by time {d}; {d} packets in, {d} full batches, {d} dropped out; ms in read {d}, input {d}, flush {d}, tick {d}", .{
+                        woke[0],                  woke[2],                  in_packets,               full_batches, dev.dropped.load(.monotonic),
+                        @divTrunc(spent[0], 1_000_000), @divTrunc(spent[1], 1_000_000), @divTrunc(spent[2], 1_000_000), @divTrunc(spent[3], 1_000_000),
                     });
                     woke = @splat(0);
                     in_packets = 0;
                     full_batches = 0;
+                    spent = @splat(0);
                 }
+                t0 = Io.Clock.awake.now(t.io).toNanoseconds();
             }
             if (comptime windows) {
                 // Wintun sets its event only after a read found the ring
                 // empty: after a batch that stopped at its limit, read on
                 // at once instead of waiting for an event that may not come
-                if (!more) woke[@intFromEnum(dev.wait(@intCast(wait)))] += 1;
+                if (!more) {
+                    woke[@intFromEnum(dev.wait(@intCast(wait)))] += 1;
+                    t0 = Io.Clock.awake.now(t.io).toNanoseconds();
+                }
                 more = false;
                 var batch: usize = 0;
                 while (batch < 256) : (batch += 1) {
                     const pkt = dev.read(&buf) orelse break;
+                    const t1 = Io.Clock.awake.now(t.io).toNanoseconds();
+                    spent[0] += @intCast(t1 - t0);
                     if (pkt.len > 0) t.stack.input(pkt);
+                    t0 = Io.Clock.awake.now(t.io).toNanoseconds();
+                    spent[1] += @intCast(t0 - t1);
                 } else {
                     more = true;
                     full_batches += 1;
                 }
                 in_packets += batch;
                 if (batch > 0) t.stack.flush();
+                spent[2] += @intCast(Io.Clock.awake.now(t.io).toNanoseconds() - t0);
                 continue;
             }
             var fds = [2]c.pollfd{
