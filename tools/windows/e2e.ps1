@@ -76,6 +76,22 @@ Check 'the adapter went with the service' ($null -eq (Get-NetAdapter -Name 'BLAC
 $code = Fetch
 Check "the network is back ($code)" ($code -eq '200')
 
+Write-Host "== the same downloads through SOCKS (no Wintun, no TCP stack)"
+# halves the path: if these are fast, the TUN side is what is slow
+Config 'direct'
+$p = Start-Process -FilePath (Join-Path $Bin 'blackwall-service.exe') `
+    -ArgumentList '--config', $cfg, '--socks', '1089' `
+    -RedirectStandardError (Join-Path $cfg "socks.err") -RedirectStandardOutput (Join-Path $cfg "socks.out") `
+    -PassThru -WindowStyle Hidden
+Start-Sleep -Seconds 4
+$r = & curl.exe -s -m 90 --socks5-hostname 127.0.0.1:1089 -o NUL -w "%{http_code} %{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=32000000" 2>$null
+Write-Host "   32 MB through SOCKS: $r"
+$t0 = Get-Date
+$r = & curl.exe -s -m 90 --socks5-hostname 127.0.0.1:1089 --parallel --parallel-max 6 -w "%{size_download}\n" $out $urls 2>$null
+Write-Host "   six at once through SOCKS took $([int]((Get-Date) - $t0).TotalMilliseconds) ms"
+Stop-Process -Id $p.Id -Force
+Start-Sleep -Seconds 2
+
 Write-Host "== blocked"
 Config 'block'
 $p = Start-Service 'block'
