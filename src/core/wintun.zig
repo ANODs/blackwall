@@ -112,16 +112,10 @@ pub const Device = struct {
         w.CloseHandle(d.wake_event);
     }
 
-    pub const Woke = enum { packets, woken, time };
-
-    /// Waits for packets, or `wake`, at most `ms`; says which came.
-    pub fn wait(d: *Device, ms: u32) Woke {
+    /// Waits for packets, or `wake`, at most `ms`.
+    pub fn wait(d: *Device, ms: u32) void {
         const hs = [2]w.HANDLE{ d.api.getReadWaitEvent(d.session), d.wake_event };
-        return switch (WaitForMultipleObjects(2, &hs, 0, ms)) {
-            0 => .packets,
-            1 => .woken,
-            else => .time,
-        };
+        _ = WaitForMultipleObjects(2, &hs, 0, ms);
     }
 
     pub fn wake(d: *Device) void {

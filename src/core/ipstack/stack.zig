@@ -75,16 +75,6 @@ pub const Stats = struct {
     dropped: u64 = 0,
     resets_sent: u64 = 0,
     retransmits: u64 = 0,
-    /// nanoseconds `input` waited for the lock, spent in tcpInput, and
-    /// spent letting the lock go (diagnostics)
-    input_lock_ns: u64 = 0,
-    input_tcp_ns: u64 = 0,
-    input_unlock_ns: u64 = 0,
-    /// UDP datagrams handed to the handler, the time it took, and the
-    /// destination ports of the last few (diagnostics, the loop's thread only)
-    udp_in: u64 = 0,
-    udp_ns: u64 = 0,
-    udp_ports: [4]u16 = @splat(0),
 };
 
 const ns_per_ms = std.time.ns_per_ms;
@@ -804,18 +794,6 @@ pub const Stack = struct {
         s.gpa.destroy(s);
     }
 
-    /// Diagnostics: how long `input` waited for the lock, ran tcpInput and
-    /// let the lock go since the last call.
-    pub fn takeInputNs(s: *Stack) [3]u64 {
-        s.lock();
-        defer s.unlock();
-        const v: [3]u64 = .{ s.stats.input_lock_ns, s.stats.input_tcp_ns, @atomicLoad(u64, &s.stats.input_unlock_ns, .monotonic) };
-        s.stats.input_lock_ns = 0;
-        s.stats.input_tcp_ns = 0;
-        @atomicStore(u64, &s.stats.input_unlock_ns, 0, .monotonic);
-        return v;
-    }
-
     fn lock(s: *Stack) void {
         s.mutex.lockUncancelable(s.io);
     }
@@ -833,26 +811,14 @@ pub const Stack = struct {
         switch (ip.proto) {
             packet.proto_tcp => {
                 const t = packet.parseTcp(ip.l4) orelse return;
-                const w0 = Io.Clock.awake.now(s.io).toNanoseconds();
                 s.lock();
-                const w1 = Io.Clock.awake.now(s.io).toNanoseconds();
-                s.stats.input_lock_ns += @intCast(w1 - w0);
+                defer s.unlock();
                 s.stats.packets_in += 1;
                 s.tcpInput(ip, t);
-                const w2 = Io.Clock.awake.now(s.io).toNanoseconds();
-                s.stats.input_tcp_ns += @intCast(w2 - w1);
-                s.unlock();
-                const w3 = Io.Clock.awake.now(s.io).toNanoseconds();
-                // read unlocked: diagnostics only, a lost add does not matter
-                @atomicStore(u64, &s.stats.input_unlock_ns, @atomicLoad(u64, &s.stats.input_unlock_ns, .monotonic) + @as(u64, @intCast(w3 - w2)), .monotonic);
             },
             packet.proto_udp => {
                 const u = packet.parseUdp(ip.l4) orelse return;
-                const udp_t0 = Io.Clock.awake.now(s.io).toNanoseconds();
                 s.handler.udp(s.handler.ctx, .{ .addr = ip.src, .port = u.src_port }, .{ .addr = ip.dst, .port = u.dst_port }, u.payload);
-                s.stats.udp_ns += @intCast(Io.Clock.awake.now(s.io).toNanoseconds() - udp_t0);
-                s.stats.udp_ports[s.stats.udp_in % 4] = u.dst_port;
-                s.stats.udp_in += 1;
             },
             else => {},
         }
