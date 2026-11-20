@@ -47,6 +47,7 @@ Write-Host "== before: $(Fetch)"
 # the same long download without the tunnel, to compare its speed with
 $r = & curl.exe -s -m 90 -o NUL -w "%{http_code} %{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=32000000" 2>$null
 Write-Host "   32 MB without the tunnel: $r"
+$direct_speed = [double]("$r".Split(' ')[2])
 
 Write-Host "== direct through the tunnel"
 Config 'direct'
@@ -62,6 +63,8 @@ $big = 32000000
 $r = & curl.exe -s -m 90 -o NUL -w "%{http_code} %{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=$big" 2>$null
 $f = "$r".Split(' ')
 Check "a long download through the tunnel ($r)" (($f[0] -eq '200') -and ([int64]$f[1] -eq $big))
+# the tunnel ran at 1-2 MB/s here once, beside 100 without it (issue #5)
+Check "at a quarter of the direct speed or more ($([int]([double]$f[2] / 1MB)) of $([int]($direct_speed / 1MB)) MB/s)" ([double]$f[2] -ge $direct_speed / 4)
 $urls = 1..6 | ForEach-Object { "https://speed.cloudflare.com/__down?bytes=8000000&n=$_" }
 $out = 1..6 | ForEach-Object { '-o'; 'NUL' }
 $t0 = Get-Date
