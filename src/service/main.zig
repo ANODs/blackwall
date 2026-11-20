@@ -135,6 +135,8 @@ const Service = struct {
     tun_fd: ?i32 = null,
     /// the Wintun adapter and its routes (Windows)
     lease: if (on_windows) ?win.Lease else void = if (on_windows) null else {},
+    /// where the window reaches the service, and the secret it sends (Windows)
+    endpoint: if (on_windows) ipc.Endpoint else void = if (on_windows) undefined else {},
     via_helper: bool = false,
     /// the device is ours to set up and take down (Linux, `--tun auto`)
     own_device: bool = false,
@@ -560,6 +562,7 @@ const Service = struct {
     /// so a window waiting for the service to go sees it go only then.
     fn listen(s: *Service, path: []const u8) !std.Io.net.Server {
         std.Io.Dir.cwd().deleteFile(s.io, path) catch {};
+        if (comptime on_windows) return s.listenLoopback(path);
         const addr = try std.Io.net.UnixAddress.init(path);
         const server = try addr.listen(s.io, .{});
         // the socket file is the access control: owner only
@@ -569,6 +572,25 @@ const Service = struct {
         // Windows: the folder's own permissions (the user's profile) guard it
         if (comptime !on_windows) _ = c.chmod(&z, 0o600);
         log.info("listening on {s}", .{path});
+        return server;
+    }
+
+    /// Windows: on the loopback, at a port the system picks; the file at
+    /// `path` says where, with the secret a client must send first
+    /// (`ipc.Endpoint`). Written whole under another name and renamed, so
+    /// a window never reads half of it.
+    fn listenLoopback(s: *Service, path: []const u8) !std.Io.net.Server {
+        const here: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var server = try here.listen(s.io, .{});
+        errdefer server.deinit(s.io);
+        s.endpoint = .fresh(s.io, server.socket.address.getPort());
+        var text_buf: [ipc.Endpoint.max_text]u8 = undefined;
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.new", .{path});
+        const dir = std.Io.Dir.cwd();
+        try dir.writeFile(s.io, .{ .sub_path = tmp, .data = s.endpoint.text(&text_buf) });
+        try dir.rename(tmp, dir, path, s.io);
+        log.info("listening on 127.0.0.1:{d}", .{s.endpoint.port});
         return server;
     }
 
@@ -583,7 +605,12 @@ const Service = struct {
             var r = conn.reader(s.io, &rb);
             var wb: [64 * 1024]u8 = undefined;
             var w = conn.writer(s.io, &wb);
-            const line = r.interface.takeDelimiterExclusive('\n') catch continue;
+            // Windows: anyone on the machine reaches the port; the secret first
+            var req_buf: [ipc.Endpoint.max_text + 1024]u8 = undefined;
+            const line = if (comptime on_windows)
+                (ipc.readAdmitted(s.io, &s.endpoint, conn.socket.handle, &req_buf) orelse continue)
+            else
+                (r.interface.takeDelimiterExclusive('\n') catch continue);
             const req = std.json.parseFromSlice(ipc.Request, s.gpa, line, .{ .ignore_unknown_fields = true }) catch {
                 w.interface.writeAll("{\"error\":\"bad request\"}\n") catch {};
                 w.interface.flush() catch {};
@@ -960,7 +987,9 @@ fn serve(init: std.process.Init, argv: []const []const u8) !void {
     }
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = ipc.socketPath(&path_buf, s.config_dir);
+    // which step failed goes to the events (a report shows them)
     var server = s.listen(path) catch |err| {
+        log.err("window channel: {t}", .{err});
         s.writeError(err);
         return err;
     };
@@ -970,6 +999,7 @@ fn serve(init: std.process.Init, argv: []const []const u8) !void {
         std.Io.Dir.cwd().deleteFile(init.io, path) catch {};
     }
     s.start() catch |err| {
+        log.err("start: {t}", .{err});
         s.writeError(err);
         return err;
     };
