@@ -947,20 +947,42 @@ pub const Tunnel = struct {
         t.device = dev;
         var buf: [65536 + 4]u8 = undefined;
         var last_sweep = t.nowMs();
+        // Windows: whether the last batch stopped at its limit, and what
+        // woke the loop (logged while busy, see below)
+        var more = false;
+        var woke: [3]u32 = @splat(0);
+        var in_packets: u64 = 0;
+        var full_batches: u32 = 0;
         while (!t.stopping.load(.acquire)) {
             const wait = @min(t.stack.tick(), 10_000);
             if (t.nowMs() - last_sweep > 10_000) {
                 last_sweep = t.nowMs();
                 t.sweepUdp();
                 t.group.tick();
+                if (comptime windows) {
+                    if (in_packets > 1000) std.log.scoped(.tun).info("woken by packets {d}, by time {d}; {d} packets in, {d} full batches, {d} dropped out", .{
+                        woke[0], woke[2], in_packets, full_batches, dev.dropped.load(.monotonic),
+                    });
+                    woke = @splat(0);
+                    in_packets = 0;
+                    full_batches = 0;
+                }
             }
             if (comptime windows) {
-                dev.wait(@intCast(wait));
+                // Wintun sets its event only after a read found the ring
+                // empty: after a batch that stopped at its limit, read on
+                // at once instead of waiting for an event that may not come
+                if (!more) woke[@intFromEnum(dev.wait(@intCast(wait)))] += 1;
+                more = false;
                 var batch: usize = 0;
-                while (batch < 64) : (batch += 1) {
+                while (batch < 256) : (batch += 1) {
                     const pkt = dev.read(&buf) orelse break;
                     if (pkt.len > 0) t.stack.input(pkt);
+                } else {
+                    more = true;
+                    full_batches += 1;
                 }
+                in_packets += batch;
                 if (batch > 0) t.stack.flush();
                 continue;
             }
