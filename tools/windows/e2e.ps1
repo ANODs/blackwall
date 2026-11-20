@@ -44,6 +44,9 @@ function Check([string]$what, [bool]$ok) {
 }
 
 Write-Host "== before: $(Fetch)"
+# the same long download without the tunnel, to compare its speed with
+$r = & curl.exe -s -m 90 -o NUL -w "%{http_code} %{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=32000000" 2>$null
+Write-Host "   32 MB without the tunnel: $r"
 
 Write-Host "== direct through the tunnel"
 Config 'direct'
@@ -61,7 +64,9 @@ $f = "$r".Split(' ')
 Check "a long download through the tunnel ($r)" (($f[0] -eq '200') -and ([int64]$f[1] -eq $big))
 $urls = 1..6 | ForEach-Object { "https://speed.cloudflare.com/__down?bytes=8000000&n=$_" }
 $out = 1..6 | ForEach-Object { '-o'; 'NUL' }
+$t0 = Get-Date
 $r = & curl.exe -s -m 90 --parallel --parallel-max 6 -w "%{size_download}\n" $out $urls 2>$null
+Write-Host "   six at once took $([int]((Get-Date) - $t0).TotalMilliseconds) ms"
 $sizes = @($r | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int64]$_ })
 Check "six at once through the tunnel ($($sizes -join ', '))" (($sizes.Count -eq 6) -and (($sizes | Where-Object { $_ -ne 8000000 }).Count -eq 0))
 Get-Content (Join-Path $cfg 'direct.err') -Tail 30 | Write-Host
