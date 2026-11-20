@@ -254,7 +254,12 @@ test "socket path falls back to /tmp when the folder path is too long" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("/Users/a/Library/Application Support/BLACKWALL/service.sock", socketPath(&buf, "/Users/a/Library/Application Support/BLACKWALL"));
     const long = "/private/tmp/claude-501/a-rather-long-scratch-directory-name/8c639711-a540-4344-8ec2-eb9a04170d16/linktest";
-    try std.testing.expect(std.mem.startsWith(u8, socketPath(&buf, long), "/tmp/blackwall-"));
+    // Windows: a plain file, which any path can hold
+    if (on_windows) {
+        try std.testing.expectEqualStrings(long ++ "/" ++ socket_name, socketPath(&buf, long));
+    } else {
+        try std.testing.expect(std.mem.startsWith(u8, socketPath(&buf, long), "/tmp/blackwall-"));
+    }
 }
 
 test "call: one line back, timeout on a silent peer" {
