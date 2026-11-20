@@ -1046,7 +1046,7 @@ pub fn stopConflict(i: usize, kill: bool) void {
 }
 
 fn conflictStopThread(cf: Conflict, kill: bool) void {
-    const err: ?conflicts_mod.StopError = if (conflicts_mod.stop(gpa, io, &cf, kill)) |_| null else |e| e;
+    const err: ?conflicts_mod.StopError = if (conflicts_mod.stop(gpa, io, config_dir, &cf, kill)) |_| null else |e| e;
     pushResult(.{ .conflict_stop = err });
 }
 

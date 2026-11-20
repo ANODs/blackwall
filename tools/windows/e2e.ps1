@@ -145,6 +145,68 @@ Start-Sleep -Seconds 5
 $code = Fetch
 Check "a clean stop lets the traffic go ($code)" ($code -eq '200')
 
+Write-Host "== zapret or GoodbyeDPI beside it is stopped at the window's word"
+Config 'direct'
+# stand-ins: zapret's winws.exe as a plain process (a copy of cmd.exe that
+# waits), and zapret-discord-youtube's service "zapret" (a copy of our own
+# service, which answers the SCM, under that name)
+$dpi = Join-Path $env:RUNNER_TEMP 'dpi'
+$zcfg = Join-Path $dpi 'cfg'
+New-Item -ItemType Directory -Force (Join-Path $dpi 'svc'), $zcfg | Out-Null
+Copy-Item (Join-Path $env:SystemRoot 'System32\cmd.exe') (Join-Path $dpi 'winws.exe')
+Copy-Item (Join-Path $Bin 'blackwall-service.exe') (Join-Path $dpi 'svc\winws.exe')
+function Start-Winws {
+    $t = Start-Process -FilePath (Join-Path $dpi 'winws.exe') -ArgumentList '/d', '/c', 'ping -n 120 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 1
+    return $t
+}
+# what the window sends: the secret from the file, then one request line
+function Ask([string]$line) {
+    $ep = (Get-Content (Join-Path $cfg 'service.sock') -Raw).Trim().Split(' ')
+    $c = [System.Net.Sockets.TcpClient]::new('127.0.0.1', [int]$ep[0])
+    try {
+        $s = $c.GetStream()
+        $s.ReadTimeout = 30000
+        $b = [System.Text.Encoding]::ASCII.GetBytes($ep[1] + "`n" + $line + "`n")
+        $s.Write($b, 0, $b.Length)
+        return [System.IO.StreamReader]::new($s).ReadLine()
+    } catch { return "fail: $_" } finally { $c.Close() }
+}
+
+# no BLACKWALL service runs: the installed one is started for just this
+$t = Start-Winws
+(Get-Service BLACKWALL).Start([string[]]@('--stop-dpi', ('{"pid":' + $t.Id + '}')))
+Check 'started for it, the service ends the stand-in' ($t.WaitForExit(15000))
+Start-Sleep -Seconds 2
+Check "and is stopped again ($((Get-Service BLACKWALL).Status))" ((Get-Service BLACKWALL).Status -eq 'Stopped')
+
+New-Service -Name zapret -StartupType Manual -BinaryPathName ('"' + (Join-Path $dpi 'svc\winws.exe') + '" --scm --config "' + $zcfg + '"') | Out-Null
+(Get-Service zapret).Start([string[]]@('--socks', '18099'))
+Start-Sleep -Seconds 4
+Check "the service zapret runs ($((Get-Service zapret).Status))" ((Get-Service zapret).Status -eq 'Running')
+
+# over the running service's channel
+& sc.exe start BLACKWALL --socks 18098 | Out-Null
+Start-Sleep -Seconds 4
+$r = Ask '{"cmd":"stop_dpi","service":"zapret"}'
+Check "the service zapret through the SCM ($r)" ($r -like '*"ok":true*')
+Check "it is stopped ($((Get-Service zapret).Status))" ((Get-Service zapret).Status -eq 'Stopped')
+$t = Start-Winws
+$r = Ask ('{"cmd":"stop_dpi","pid":' + $t.Id + '}')
+Check "a plain process ($r)" (($r -like '*"ok":true*') -and $t.WaitForExit(5000))
+# nothing but the tools: not this PowerShell, not BLACKWALL, not the system's
+$r = Ask ('{"cmd":"stop_dpi","pid":' + $PID + '}')
+Check "another process is left alone ($r)" ($r -like '*"ok":false*')
+$r = Ask '{"cmd":"stop_dpi","service":"BLACKWALL"}'
+Check "its own service too ($r)" (($r -like '*"ok":false*') -and (Get-Service BLACKWALL).Status -eq 'Running')
+$spooler = (Get-Service Spooler -ErrorAction SilentlyContinue).Status
+$r = Ask '{"cmd":"stop_dpi","service":"Spooler"}'
+Check "and a service of the system ($r)" (($r -like '*"ok":false*') -and (Get-Service Spooler -ErrorAction SilentlyContinue).Status -eq $spooler)
+& sc.exe stop BLACKWALL | Out-Null
+Start-Sleep -Seconds 4
+& sc.exe delete zapret | Out-Null
+if (Test-Path (Join-Path $zcfg 'service.events')) { Get-Content (Join-Path $zcfg 'service.events') -Tail 10 | Write-Host }
+
 & (Join-Path $Bin 'blackwall-service.exe') uninstall
 Check 'uninstalled' ($null -eq (Get-Service BLACKWALL -ErrorAction SilentlyContinue))
 

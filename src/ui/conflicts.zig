@@ -52,13 +52,14 @@ pub fn show() void {
     }
     if (app.conflict_failed) {
         // the polite way did not free the network: the app's own switch,
-        // or (not for a system VPN service, which would just restart) force
+        // or (not for a system VPN service, which would just restart; a DPI
+        // tool's service on Windows ends with its process) force
         if (cf.bundle().len > 0) {
             var buf: [96]u8 = undefined;
             if (w.quietButton(@src(), std.fmt.bufPrint(&buf, tr.open_app, .{cf.name()}) catch cf.name(), .{})) app.openConflictApp(selected);
             w.gap(@src(), 8, 0);
         }
-        if (cf.service().len == 0 and cf.owner != null) {
+        if ((cf.service().len == 0 or cf.kind == .dpi) and cf.owner != null) {
             if (w.quietButton(@src(), tr.force_quit, .{ .id_extra = 1 })) app.stopConflict(selected, true);
             w.gap(@src(), 8, 0);
         }

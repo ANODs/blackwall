@@ -13,6 +13,8 @@
 //!   {"cmd":"ping","host":"h","port":443} -> {"ms":42} or {"ms":null}
 //!                                        TCP connect time from the real
 //!                                        address, past the TUN
+//!   {"cmd":"stop_dpi",...} -> {"ok":true}  Windows: stop zapret or GoodbyeDPI
+//!                                        (win_dpi.Request, as LocalSystem)
 
 const std = @import("std");
 const builtin = @import("builtin");

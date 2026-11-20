@@ -642,6 +642,10 @@ const Service = struct {
                     s.gpa.destroy(job);
                     w.interface.writeAll("{\"ms\":null}\n") catch {};
                 }
+            } else if (on_windows and std.mem.eql(u8, cmd, "stop_dpi")) {
+                // zapret or GoodbyeDPI beside us, at the window's word (core/win_dpi.zig);
+                // it answers from a thread of its own
+                if (core.win_dpi.serve(s.io, conn, line)) conn_kept = true else w.interface.writeAll("{\"ok\":false}\n") catch {};
             } else if (std.mem.eql(u8, cmd, "stop") or std.mem.eql(u8, cmd, "suspend")) {
                 s.keep_capture = std.mem.eql(u8, cmd, "suspend");
                 w.interface.writeAll("{\"ok\":true}\n") catch {};
@@ -950,6 +954,10 @@ fn serve(init: std.process.Init, argv: []const []const u8) !void {
             i += 1;
         } else if (on_windows and std.mem.eql(u8, arg, "--upgrade")) {
             return upgradeWindows(init, val);
+        } else if (on_windows and std.mem.eql(u8, arg, "--stop-dpi")) {
+            // started by the window just for this, when no service ran to ask
+            core.win_dpi.handle(val) catch {};
+            return;
         } else if (std.mem.eql(u8, arg, "--release")) {
             // let go of what a service that is gone still holds
             linux.remove();
