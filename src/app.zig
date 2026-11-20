@@ -95,7 +95,7 @@ pub fn init(w: *dvui.Window) !void {
     if (dvui.App.main_init) |mi| {
         const env = mi.environ_map;
         home_dir = env.get("HOME") orelse env.get("USERPROFILE");
-        config_dir = try configDir(env, home_dir);
+        config_dir = try configDir(env);
         env_paths = .{ .home = env.get("HOME"), .xdg_config = env.get("XDG_CONFIG_HOME") };
         // screenshot mode (src/shots.zig) touches neither the config nor the service
         if (env.get("BLACKWALL_SHOTS") != null) persist = false;
@@ -129,16 +129,23 @@ pub fn init(w: *dvui.Window) !void {
     // nothing: see `.idle`), and the guard starts from there
 }
 
-fn configDir(env: *std.process.Environ.Map, home: ?[]const u8) ![]const u8 {
-    const h = home orelse return gpa.dupe(u8, ".blackwall");
+fn configDir(env: *std.process.Environ.Map) ![]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    return gpa.dupe(u8, settingsDir(&buf, env) orelse return error.NameTooLong);
+}
+
+/// The user's settings folder; also asked before the window exists (its
+/// log, src/report.zig).
+pub fn settingsDir(buf: []u8, env: *std.process.Environ.Map) ?[]const u8 {
+    const h = env.get("HOME") orelse env.get("USERPROFILE") orelse return std.fmt.bufPrint(buf, ".blackwall", .{}) catch null;
     return switch (builtin.os.tag) {
-        .macos => std.fmt.allocPrint(gpa, "{s}/Library/Application Support/BLACKWALL", .{h}),
-        .windows => std.fmt.allocPrint(gpa, "{s}\\BLACKWALL", .{env.get("APPDATA") orelse h}),
+        .macos => std.fmt.bufPrint(buf, "{s}/Library/Application Support/BLACKWALL", .{h}),
+        .windows => std.fmt.bufPrint(buf, "{s}\\BLACKWALL", .{env.get("APPDATA") orelse h}),
         else => if (env.get("XDG_CONFIG_HOME")) |x|
-            std.fmt.allocPrint(gpa, "{s}/blackwall", .{x})
+            std.fmt.bufPrint(buf, "{s}/blackwall", .{x})
         else
-            std.fmt.allocPrint(gpa, "{s}/.config/blackwall", .{h}),
-    };
+            std.fmt.bufPrint(buf, "{s}/.config/blackwall", .{h}),
+    } catch null;
 }
 
 pub fn deinit() void {

@@ -210,6 +210,31 @@ if (Test-Path (Join-Path $zcfg 'service.events')) { Get-Content (Join-Path $zcfg
 & (Join-Path $Bin 'blackwall-service.exe') uninstall
 Check 'uninstalled' ($null -eq (Get-Service BLACKWALL -ErrorAction SilentlyContinue))
 
+Write-Host "== a crash of the window is in its log"
+# BLACKWALL_CRASH makes it crash at once, as it would (an illegal
+# instruction, a panic), and without the message box that asks the user
+$wcfg = Join-Path $env:RUNNER_TEMP 'bwwin'
+New-Item -ItemType Directory -Force $wcfg | Out-Null
+$appdata = $env:APPDATA
+$wlog = Join-Path $wcfg 'BLACKWALL\window.log'
+foreach ($how in 'trap', 'panic') {
+    $env:APPDATA = $wcfg
+    $env:BLACKWALL_CRASH = $how
+    $p = Start-Process -FilePath (Join-Path $Bin 'blackwall.exe') -PassThru -WindowStyle Hidden
+    $env:APPDATA = $appdata
+    Remove-Item Env:BLACKWALL_CRASH
+    $ended = $p.WaitForExit(30000)
+    if (-not $ended) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    $text = if (Test-Path $wlog) { Get-Content $wlog -Raw } else { '' }
+    Write-Host $text
+    if ($how -eq 'trap') {
+        Check "an illegal instruction, and where ($($p.ExitCode))" ($ended -and $text -match 'crash: illegal instruction \(0xc000001d\) at BLACKWALL\+0x[0-9a-f]+')
+    } else {
+        Check "a panic ($($p.ExitCode))" ($ended -and $text -match 'panic: BLACKWALL_CRASH')
+        Check 'the run before is kept' ((Get-Content (Join-Path $wcfg 'BLACKWALL\window.previous.log') -Raw) -match 'crash: illegal instruction')
+    }
+}
+
 if (Test-Path (Join-Path $cfg 'service.events')) {
     Write-Host "== service.events"
     Get-Content (Join-Path $cfg 'service.events') -Tail 40 | Write-Host
