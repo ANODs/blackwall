@@ -984,6 +984,11 @@ pub const Tunnel = struct {
                         @divTrunc(spent[0], 1_000_000), @divTrunc(spent[1], 1_000_000), ins[0] / 1_000_000, ins[1] / 1_000_000, ins[2] / 1_000_000, @divTrunc(spent[2], 1_000_000), @divTrunc(spent[3], 1_000_000),
                         outs,                           out_ms,
                     });
+                    if (in_packets > 1000) std.log.scoped(.tun).info("udp: {d} datagrams, {d} ms in their handler, last ports {any}", .{
+                        t.stack.stats.udp_in, t.stack.stats.udp_ns / 1_000_000, t.stack.stats.udp_ports,
+                    });
+                    t.stack.stats.udp_in = 0;
+                    t.stack.stats.udp_ns = 0;
                     woke = @splat(0);
                     in_packets = 0;
                     full_batches = 0;

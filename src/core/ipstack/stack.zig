@@ -80,6 +80,11 @@ pub const Stats = struct {
     input_lock_ns: u64 = 0,
     input_tcp_ns: u64 = 0,
     input_unlock_ns: u64 = 0,
+    /// UDP datagrams handed to the handler, the time it took, and the
+    /// destination ports of the last few (diagnostics, the loop's thread only)
+    udp_in: u64 = 0,
+    udp_ns: u64 = 0,
+    udp_ports: [4]u16 = @splat(0),
 };
 
 const ns_per_ms = std.time.ns_per_ms;
@@ -843,7 +848,11 @@ pub const Stack = struct {
             },
             packet.proto_udp => {
                 const u = packet.parseUdp(ip.l4) orelse return;
+                const udp_t0 = Io.Clock.awake.now(s.io).toNanoseconds();
                 s.handler.udp(s.handler.ctx, .{ .addr = ip.src, .port = u.src_port }, .{ .addr = ip.dst, .port = u.dst_port }, u.payload);
+                s.stats.udp_ns += @intCast(Io.Clock.awake.now(s.io).toNanoseconds() - udp_t0);
+                s.stats.udp_ports[s.stats.udp_in % 4] = u.dst_port;
+                s.stats.udp_in += 1;
             },
             else => {},
         }
