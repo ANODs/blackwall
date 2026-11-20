@@ -124,6 +124,9 @@ pub const Tunnel = struct {
     sessions: std.HashMapUnmanaged(Endpoint, *UdpSession, EndpointContext, 80) = .empty,
 
     workers: std.atomic.Value(u32) = .init(0),
+    /// Windows diagnostics: packets written to Wintun, and the time it took
+    out_count: std.atomic.Value(u64) = .init(0),
+    out_ns: std.atomic.Value(u64) = .init(0),
     dns_inflight: std.atomic.Value(u32) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
 
@@ -939,7 +942,11 @@ pub const Tunnel = struct {
     fn writeOut(ctx: *anyopaque, pkt: []const u8) void {
         const t: *Tunnel = @ptrCast(@alignCast(ctx));
         const d = t.device orelse return;
+        if (comptime !windows) return d.write(pkt);
+        const a = Io.Clock.awake.now(t.io).toNanoseconds();
         d.write(pkt);
+        _ = t.out_ns.fetchAdd(@intCast(Io.Clock.awake.now(t.io).toNanoseconds() - a), .monotonic);
+        _ = t.out_count.fetchAdd(1, .monotonic);
     }
 
     /// Read packets from `dev` until `stop` is called. Blocks; run it on its own thread.
@@ -969,9 +976,13 @@ pub const Tunnel = struct {
                 t.sweepUdp();
                 t.group.tick();
                 if (comptime windows) {
-                    if (in_packets > 1000) std.log.scoped(.tun).info("woken by packets {d}, by time {d}; {d} packets in, {d} full batches, {d} dropped out; ms in read {d}, input {d}, flush {d}, tick {d}", .{
-                        woke[0],                  woke[2],                  in_packets,               full_batches, dev.dropped.load(.monotonic),
-                        @divTrunc(spent[0], 1_000_000), @divTrunc(spent[1], 1_000_000), @divTrunc(spent[2], 1_000_000), @divTrunc(spent[3], 1_000_000),
+                    const lock_ns = t.stack.takeInputLockNs();
+                    const outs = t.out_count.swap(0, .monotonic);
+                    const out_ms = t.out_ns.swap(0, .monotonic) / 1_000_000;
+                    if (in_packets > 1000) std.log.scoped(.tun).info("woken by packets {d}, by time {d}; {d} packets in, {d} full batches, {d} dropped out; ms in read {d}, input {d} (of it waiting for the lock {d}), flush {d}, tick {d}; {d} packets out, {d} ms writing them", .{
+                        woke[0],                        woke[2],                        in_packets,                     full_batches,                   dev.dropped.load(.monotonic),
+                        @divTrunc(spent[0], 1_000_000), @divTrunc(spent[1], 1_000_000), lock_ns / 1_000_000,            @divTrunc(spent[2], 1_000_000), @divTrunc(spent[3], 1_000_000),
+                        outs,                           out_ms,
                     });
                     woke = @splat(0);
                     in_packets = 0;

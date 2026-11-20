@@ -75,6 +75,8 @@ pub const Stats = struct {
     dropped: u64 = 0,
     resets_sent: u64 = 0,
     retransmits: u64 = 0,
+    /// nanoseconds `input` waited for the lock (diagnostics)
+    input_lock_ns: u64 = 0,
 };
 
 const ns_per_ms = std.time.ns_per_ms;
@@ -794,6 +796,15 @@ pub const Stack = struct {
         s.gpa.destroy(s);
     }
 
+    /// Diagnostics: how long `input` waited for the lock since the last call.
+    pub fn takeInputLockNs(s: *Stack) u64 {
+        s.lock();
+        defer s.unlock();
+        const v = s.stats.input_lock_ns;
+        s.stats.input_lock_ns = 0;
+        return v;
+    }
+
     fn lock(s: *Stack) void {
         s.mutex.lockUncancelable(s.io);
     }
@@ -811,8 +822,10 @@ pub const Stack = struct {
         switch (ip.proto) {
             packet.proto_tcp => {
                 const t = packet.parseTcp(ip.l4) orelse return;
+                const w0 = Io.Clock.awake.now(s.io).toNanoseconds();
                 s.lock();
                 defer s.unlock();
+                s.stats.input_lock_ns += @intCast(Io.Clock.awake.now(s.io).toNanoseconds() - w0);
                 s.stats.packets_in += 1;
                 s.tcpInput(ip, t);
             },
