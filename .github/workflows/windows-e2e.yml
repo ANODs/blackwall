@@ -30,6 +30,7 @@ jobs:
           version: 0.17.1
       - run: zig test src/core/afd.zig
       - run: zig build test --summary failures
+        timeout-minutes: 20
       - name: Wintun
         run: |
           Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile $env:RUNNER_TEMP\wintun.zip

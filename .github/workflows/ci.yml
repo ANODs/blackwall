@@ -31,3 +31,5 @@ jobs:
         with:
           version: 0.17.1
       - run: zig build test
+        # a hung test fails the run in minutes, not after six hours
+        timeout-minutes: 20

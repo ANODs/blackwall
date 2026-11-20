@@ -79,6 +79,8 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build test
+        # a hung test fails the run in minutes, not after six hours
+        timeout-minutes: 20
 
   # Every language × platform. Windows and Linux are cross-built on Linux (Zig ships the libcs);
   # macOS needs a Mac for codesign and ditto. Explicit targets keep the CPU baseline portable.
