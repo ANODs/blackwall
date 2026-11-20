@@ -976,12 +976,12 @@ pub const Tunnel = struct {
                 t.sweepUdp();
                 t.group.tick();
                 if (comptime windows) {
-                    const lock_ns = t.stack.takeInputLockNs();
+                    const ins = t.stack.takeInputNs();
                     const outs = t.out_count.swap(0, .monotonic);
                     const out_ms = t.out_ns.swap(0, .monotonic) / 1_000_000;
-                    if (in_packets > 1000) std.log.scoped(.tun).info("woken by packets {d}, by time {d}; {d} packets in, {d} full batches, {d} dropped out; ms in read {d}, input {d} (of it waiting for the lock {d}), flush {d}, tick {d}; {d} packets out, {d} ms writing them", .{
+                    if (in_packets > 1000) std.log.scoped(.tun).info("woken by packets {d}, by time {d}; {d} packets in, {d} full batches, {d} dropped out; ms in read {d}, input {d} (lock {d}, tcp {d}, unlock {d}), flush {d}, tick {d}; {d} packets out, {d} ms writing them", .{
                         woke[0],                        woke[2],                        in_packets,                     full_batches,                   dev.dropped.load(.monotonic),
-                        @divTrunc(spent[0], 1_000_000), @divTrunc(spent[1], 1_000_000), lock_ns / 1_000_000,            @divTrunc(spent[2], 1_000_000), @divTrunc(spent[3], 1_000_000),
+                        @divTrunc(spent[0], 1_000_000), @divTrunc(spent[1], 1_000_000), ins[0] / 1_000_000, ins[1] / 1_000_000, ins[2] / 1_000_000, @divTrunc(spent[2], 1_000_000), @divTrunc(spent[3], 1_000_000),
                         outs,                           out_ms,
                     });
                     woke = @splat(0);
