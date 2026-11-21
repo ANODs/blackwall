@@ -90,7 +90,7 @@ pub fn show() void {
         w.text(@src(), build_options.version, th.mono(12), th.text2, .{});
     }
     // builds made without a release repository cannot update themselves
-    if (app.updater_built) _ = switchRow(@src(), tr.auto_update, tr.auto_update_desc, &s.auto_update);
+    if (@import("../../app/updater.zig").built) _ = switchRow(@src(), tr.auto_update, tr.auto_update_desc, &s.auto_update);
     {
         var r = row(@src(), tr.report, tr.report_desc);
         defer r.deinit();

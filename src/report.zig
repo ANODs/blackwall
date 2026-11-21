@@ -297,7 +297,7 @@ fn write(w: *std.Io.Writer, system: []const u8, t: diag.Clock) !void {
 
     try w.print("BLACKWALL report, {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}\n", .{ t.year, t.mon, t.day, t.hour, t.min });
     try w.print("version {s} ({s}), {s}\n", .{ build_options.version, build_options.lang, system });
-    try w.print("updates: {s}\n", .{app.updaterState()});
+    try w.print("updates: {s}\n", .{@import("app/updater.zig").stateText()});
     try w.writeAll("engine: ");
     if (st.demo) {
         try w.writeAll("demo\n");

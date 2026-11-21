@@ -11,6 +11,8 @@ const autostart = @import("platform/autostart.zig");
 const conflicts_mod = @import("platform/conflicts.zig");
 pub const Conflict = conflicts_mod.Conflict;
 const link_mod = @import("link.zig");
+const updater = @import("app/updater.zig");
+const build_options = @import("build_options");
 const tr = @import("i18n.zig").t;
 
 const model = core.model;
@@ -69,7 +71,7 @@ var dirty: bool = false;
 /// false in screenshot mode so reviews never touch the user's config
 pub var persist: bool = true;
 
-const Result = union(enum) {
+pub const Result = union(enum) {
     ping: struct { id: u32, member: ?u8, ms: ?u16 },
     ping_done,
     sub: struct { sub_id: u32, body: ?[]u8, meta: ?Meta = null },
@@ -90,7 +92,7 @@ pub fn init(w: *dvui.Window) !void {
     state = .init(gpa);
     proxy.io = io;
     // first, so that a fresh version crashing anywhere below is rolled back
-    resumeUpdate();
+    updater.resumeInstall();
 
     if (dvui.App.main_init) |mi| {
         const env = mi.environ_map;
@@ -126,7 +128,7 @@ pub fn init(w: *dvui.Window) !void {
     }
     dvui.reduce_motion = state.settings.reduce_motion;
     if (unreadable) notify(true, tr.config_unreadable, .{});
-    startUpdater();
+    updater.start();
     if (persist and config_dir.len > 0)
         link = link_mod.Link.init(gpa, io, config_dir, build_options.version, tr.admin_prompt, onLinkEvent);
     // follows the app if it was moved or updated in place
@@ -160,7 +162,7 @@ pub fn settingsDir(buf: []u8, env: *std.process.Environ.Map) ?[]const u8 {
 
 pub fn deinit() void {
     // a clean quit also counts as a successful first start
-    if (update_verifying) confirmUpdate();
+    if (updater.verifying) updater.confirm();
     proxy.stop();
     save();
     state.deinit();
@@ -291,7 +293,7 @@ pub fn frame() void {
         retry_at_ns = 0;
         if (want_on and !service_on and !engine.pending) startService(false);
     }
-    updateFrame(now);
+    updater.frame(now);
 
     // wake up once a second for counters; continuously only while animating
     const id = dvui.parentGet().extendId(@src(), 0);
@@ -299,7 +301,7 @@ pub fn frame() void {
     if (engine.busy()) dvui.refresh(null, @src(), null);
 }
 
-fn pushResult(r: Result) void {
+pub fn pushResult(r: Result) void {
     results_mutex.lockUncancelable(io);
     results.append(gpa, r) catch {};
     results_mutex.unlock(io);
@@ -326,8 +328,8 @@ fn drainResults() void {
             defer if (meta) |*m| m.deinit();
             applyFetched(s.sub_id, s.body, if (meta) |m| m.value else null);
         },
-        .update_staged => |v| update_staged = v,
-        .update_failed => |v| updateFailed(v),
+        .update_staged => |v| updater.staged = v,
+        .update_failed => |v| updater.failed(v),
         .link => |ev| onLink(ev),
         .conflicts => |list| onConflicts(list),
         .conflict_stop => |err| onConflictStop(err),
@@ -902,7 +904,7 @@ fn onLinkEvent(ev: link_mod.Event) void {
 var first_status = true;
 var last_status_ns: i128 = 0;
 /// a restart into a newer release's service is under way (after an update)
-var stale_restart = false;
+pub var stale_restart = false;
 
 fn onLink(ev: link_mod.Event) void {
     switch (ev) {
@@ -986,7 +988,7 @@ fn onLink(ev: link_mod.Event) void {
                 .failed => notify(true, tr.svc_failed, .{failureText(d.detail.text())}),
                 .crashed => notify(true, "{s}", .{tr.svc_crashed}),
             };
-            if (failed_restart and update_verifying) return rollBackUpdate();
+            if (failed_restart and updater.verifying) return updater.rollBack();
             if (!want_on) {
                 engine.pending = false;
                 engine.disconnect();
@@ -1209,7 +1211,7 @@ fn seenApp(id: []const u8) ?*model.App {
 const reconnect_mark = "reconnect";
 
 /// An update relaunched the window while the in-window proxy was on.
-fn takeReconnectMark() bool {
+pub fn takeReconnectMark() bool {
     if (config_dir.len == 0 or !persist) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/" ++ reconnect_mark, .{config_dir}) catch return false;
@@ -1217,7 +1219,7 @@ fn takeReconnectMark() bool {
     return true;
 }
 
-fn setReconnectMark() void {
+pub fn setReconnectMark() void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/" ++ reconnect_mark, .{config_dir}) catch return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "" }) catch {};
@@ -1286,194 +1288,4 @@ pub fn summary() Summary {
         }
     }
     return s;
-}
-
-// ---------------------------------------------------------------- updates
-
-const update = @import("update");
-const build_options = @import("build_options");
-
-/// Every build knows the project's releases and their signing key, unless
-/// it was made with `-Dupdate-repo=` (empty): that one never updates itself.
-pub const updater_built = build_options.update_repo.len > 0;
-
-const update_cfg: update.Config = .{
-    .repo = build_options.update_repo,
-    .public_key = if (updater_built)
-        update.decodeKey(build_options.update_pubkey) catch @compileError("-Dupdate-pubkey is not a base64 Ed25519 public key")
-    else
-        @splat(0),
-    .lang = build_options.lang,
-    .version = build_options.version,
-};
-
-/// The updater refuses a downloaded executable without the expected stamp,
-/// so an old signed release cannot be passed off as a new one.
-const version_stamp = update.stamp(build_options.version);
-
-const update_first_check_s = 15;
-const update_interval_s = 6 * 60 * 60;
-/// How long a freshly installed version runs before its old copy is removed.
-const update_confirm_ns = 3 * std.time.ns_per_s;
-
-var update_install: ?update.Install = null;
-/// mirror of settings.auto_update for the updater thread
-var update_enabled: std.atomic.Value(bool) = .init(false);
-/// verified and unpacked, waiting for a moment without open dialogs
-var update_staged: ?std.SemanticVersion = null;
-var update_verifying = false;
-var update_confirm_at_ns: i128 = 0;
-var update_failed_shown = false;
-
-/// rolled-back version from `resumeUpdate`, never offered again
-var update_skip: ?std.SemanticVersion = null;
-
-/// Finishes or undoes an install from the previous run. Silent for builds
-/// not installed from a release.
-fn resumeUpdate() void {
-    if (!updater_built) return;
-    // release builds drop unreferenced data; the stamp must survive
-    std.mem.doNotOptimizeAway(&version_stamp);
-    // kept for the whole run: the install location points into it
-    const exe = std.process.executablePathAlloc(io, gpa) catch |err| return std.log.warn("update: off, no executable path: {t}", .{err});
-    const inst = update.Install.locate(exe, builtin.os.tag) catch |err| {
-        gpa.free(exe);
-        return std.log.info("update: off, not installed from a release ({t})", .{err});
-    };
-    const startup = inst.startup(io) catch |err| return std.log.err("update: off, install state unreadable: {t}", .{err});
-    switch (startup) {
-        .normal => |rejected| update_skip = rejected,
-        .verifying => update_verifying = true,
-        .rolled_back => {
-            std.log.warn("update: the new version never started; the previous one is back", .{});
-            inst.relaunch(gpa, io) catch |err| return std.log.err("update: relaunch failed: {t}", .{err});
-            std.process.exit(0);
-        },
-    }
-    update_install = inst;
-}
-
-/// For the report: whether this copy updates itself, and if not, why.
-pub fn updaterState() []const u8 {
-    if (!updater_built) return "not in this build";
-    if (update_install == null) return "off: this copy was not installed as a release lays it out";
-    if (!state.settings.auto_update) return "off in the settings";
-    return "on";
-}
-
-/// Background checks, once the settings are loaded.
-fn startUpdater() void {
-    const inst = update_install orelse return;
-    update_enabled.store(state.settings.auto_update, .monotonic);
-    const t = std.Thread.spawn(.{}, updateThread, .{ inst, update_skip }) catch return;
-    t.detach();
-}
-
-fn updateFrame(now: i128) void {
-    if (!updater_built) return;
-    update_enabled.store(state.settings.auto_update, .monotonic);
-    if (update_verifying) {
-        if (update_confirm_at_ns == 0) update_confirm_at_ns = now + update_confirm_ns;
-        // a release is good once its own service carries the traffic too
-        if (now >= update_confirm_at_ns and !stale_restart) confirmUpdate();
-    }
-    // every floating window (dialog, menu) is a subwindow above the main one
-    const calm = win.subwindows.stack.items.len <= 1;
-    // screenshot mode (persist off) never replaces the app
-    if (update_staged) |v| if (state.settings.auto_update and persist and calm) installStaged(v);
-}
-
-fn confirmUpdate() void {
-    update_verifying = false;
-    if (update_install) |inst| inst.confirm(io);
-}
-
-/// The new release's service did not come up: start again, unconfirmed, so
-/// the start-up check puts the previous release back.
-fn rollBackUpdate() void {
-    const inst = update_install orelse return;
-    std.log.err("update: the new release's service failed; rolling back", .{});
-    save();
-    inst.relaunch(gpa, io) catch |err| return std.log.err("update: relaunch failed: {t}", .{err});
-    std.process.exit(0);
-}
-
-/// Swaps the staged release in and hands over to it.
-fn installStaged(v: std.SemanticVersion) void {
-    update_staged = null;
-    const inst = update_install orelse return;
-    var buf: [32]u8 = undefined;
-    const version = std.fmt.bufPrint(&buf, "{f}", .{v}) catch return;
-    save();
-    inst.swap(io, update.native.package, version) catch |err| {
-        std.log.err("update: {s} not installed: {t}", .{ version, err });
-        return updateFailed(v);
-    };
-    // The background service keeps carrying traffic: the new window adopts
-    // it and restarts it from the new binary. Only the in-window proxy
-    // stops here, to free its port, and comes back in the new window.
-    const was_on = proxy.running.load(.acquire);
-    if (was_on) {
-        proxy.stop();
-        setReconnectMark();
-    }
-    inst.relaunch(gpa, io) catch |err| {
-        // a copy that does not start now would not start at the next login
-        // either, and could not roll itself back: put this one back
-        std.log.err("update: {s} does not start ({t}); keeping this version", .{ version, err });
-        inst.undo(io, version) catch |e| std.log.err("update: previous version not put back: {t}", .{e});
-        updateFailed(v);
-        if (was_on) {
-            _ = takeReconnectMark();
-            engine.disconnect();
-            connect();
-        }
-        return;
-    };
-    std.process.exit(0);
-}
-
-fn updateFailed(v: std.SemanticVersion) void {
-    if (update_failed_shown) return;
-    update_failed_shown = true;
-    var buf: [32]u8 = undefined;
-    notify(true, tr.update_failed, .{std.fmt.bufPrint(&buf, "{f}", .{v}) catch ""});
-}
-
-fn updateThread(inst: update.Install, skip: ?std.SemanticVersion) void {
-    io.sleep(.fromSeconds(update_first_check_s), .awake) catch return;
-    var last_check: ?i64 = null;
-    while (true) : (io.sleep(.fromSeconds(60), .awake) catch return) {
-        if (!update_enabled.load(.monotonic)) continue;
-        // boot time: wall-clock jumps must not stall or rush the checks
-        const now = Io.Clock.boot.now(io).toSeconds();
-        if (last_check) |t| if (now - t < update_interval_s) continue;
-        last_check = now;
-        if (stageUpdate(inst, skip)) return;
-    }
-}
-
-/// Check, download, verify, unpack. Network trouble is only logged; true
-/// once a release waits to be swapped in.
-fn stageUpdate(inst: update.Install, skip: ?std.SemanticVersion) bool {
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var client: std.http.Client = .{ .allocator = a, .io = io };
-    defer client.deinit();
-    const found = (update.check(a, &client, update_cfg, skip) catch |err| {
-        std.log.info("update: check failed: {t}", .{err});
-        return false;
-    }) orelse return false;
-    const asset = update.download(a, &client, update_cfg, found) catch |err| {
-        std.log.warn("update: {s} not downloaded: {t}", .{ found.asset, err });
-        return false;
-    };
-    inst.stage(a, io, update.native.package, asset, found.version_text) catch |err| {
-        std.log.err("update: {s} not unpacked: {t}", .{ found.asset, err });
-        pushResult(.{ .update_failed = found.version });
-        return false;
-    };
-    pushResult(.{ .update_staged = found.version });
-    return true;
 }
