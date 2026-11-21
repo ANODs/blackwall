@@ -594,6 +594,7 @@ fn cleanup(dir: Io.Dir, io: Io, names: *const Install.Names) void {
     for ([_][]const u8{ names.previous, names.failed, names.staging, names.marker_new }) |n| {
         dir.deleteTree(io, n) catch |err| std.log.warn("update: {s} not removed: {t}", .{ n, err });
     }
+    dropCompanions(dir, io);
 }
 
 fn checkStaged(gpa: std.mem.Allocator, io: Io, staging: Io.Dir, package: Package, version: []const u8) !void {
