@@ -133,14 +133,21 @@ pub const Device = struct {
         return buf[0..size];
     }
 
-    pub fn write(d: *Device, pkt: []const u8) void {
-        if (pkt.len == 0) return;
-        const p = d.api.allocateSendPacket(d.session, @intCast(pkt.len)) orelse {
+    /// One packet, the concatenation of `parts`, copied into the ring.
+    pub fn write(d: *Device, parts: []const []const u8) void {
+        var len: usize = 0;
+        for (parts) |part| len += part.len;
+        if (len == 0) return;
+        const p = d.api.allocateSendPacket(d.session, @intCast(len)) orelse {
             // the ring is full or the adapter is gone
             _ = d.dropped.fetchAdd(1, .monotonic);
             return;
         };
-        @memcpy(p[0..pkt.len], pkt);
+        var at: usize = 0;
+        for (parts) |part| {
+            @memcpy(p[at..][0..part.len], part);
+            at += part.len;
+        }
         d.api.sendPacket(d.session, p);
     }
 };

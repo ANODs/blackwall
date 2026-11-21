@@ -952,10 +952,10 @@ pub const Tunnel = struct {
 
     // ------------------------------------------------------------ device
 
-    fn writeOut(ctx: *anyopaque, pkt: []const u8) void {
+    fn writeOut(ctx: *anyopaque, parts: []const []const u8) void {
         const t: *Tunnel = @ptrCast(@alignCast(ctx));
         const d = t.device orelse return;
-        d.write(pkt);
+        d.write(parts);
     }
 
     /// Read packets from `dev` until `stop` is called. Blocks; run it on its own thread.
@@ -1044,20 +1044,23 @@ const PosixDevice = struct {
         _ = c.close(d.wake[1]);
     }
 
-    pub fn write(d: *PosixDevice, pkt: []const u8) void {
-        if (pkt.len == 0) return;
-        if (!d.af_header) {
-            if (c.write(d.fd, pkt.ptr, pkt.len) < 0) _ = d.dropped.fetchAdd(1, .monotonic);
-            return;
-        }
-        const af: u32 = if (pkt[0] >> 4 == 6) c.AF.INET6 else c.AF.INET;
+    /// One packet, the concatenation of `parts` (at most three), in one writev.
+    pub fn write(d: *PosixDevice, parts: []const []const u8) void {
+        if (parts.len == 0 or parts[0].len == 0) return;
+        var iov: [4]std.posix.iovec_const = undefined;
+        var n: usize = 0;
         var hdr: [4]u8 = undefined;
-        std.mem.writeInt(u32, &hdr, af, .big);
-        const iov = [2]std.posix.iovec_const{
-            .{ .base = &hdr, .len = 4 },
-            .{ .base = pkt.ptr, .len = pkt.len },
-        };
-        if (c.writev(d.fd, &iov, 2) < 0) _ = d.dropped.fetchAdd(1, .monotonic);
+        if (d.af_header) {
+            const af: u32 = if (parts[0][0] >> 4 == 6) c.AF.INET6 else c.AF.INET;
+            std.mem.writeInt(u32, &hdr, af, .big);
+            iov[0] = .{ .base = &hdr, .len = 4 };
+            n = 1;
+        }
+        for (parts) |p| {
+            iov[n] = .{ .base = p.ptr, .len = p.len };
+            n += 1;
+        }
+        if (c.writev(d.fd, &iov, @intCast(n)) < 0) _ = d.dropped.fetchAdd(1, .monotonic);
     }
 };
 

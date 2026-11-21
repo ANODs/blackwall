@@ -280,13 +280,17 @@ pub const TcpOut = struct {
     payload: []const u8 = &.{},
 };
 
-/// Build an IP packet with a TCP segment into `out`; returns its length.
-pub fn writeTcp(out: []u8, src: Endpoint, dst: Endpoint, seg: TcpOut) usize {
+/// Longest IP and TCP header we build: IPv6 and the MSS option.
+pub const tcp_headers_max = 40 + 24;
+
+/// The IP and TCP headers of a segment that carries `payload_len` bytes
+/// (`seg.payload` is not used), its TCP checksum left to `finishTcp`.
+/// `out` takes `tcp_headers_max`; returns the headers' length.
+pub fn tcpHeaders(out: []u8, src: Endpoint, dst: Endpoint, seg: TcpOut, payload_len: usize) usize {
     const ip_len = ipHeaderLen(&src.addr);
     const opt_len: usize = if (seg.mss != null) 4 else 0;
     const hdr_len = 20 + opt_len;
-    const l4_len = hdr_len + seg.payload.len;
-    const t = out[ip_len..][0..l4_len];
+    const t = out[ip_len..][0..hdr_len];
     std.mem.writeInt(u16, t[0..2], src.port, .big);
     std.mem.writeInt(u16, t[2..4], dst.port, .big);
     std.mem.writeInt(u32, t[4..8], seg.seq, .big);
@@ -299,10 +303,41 @@ pub fn writeTcp(out: []u8, src: Endpoint, dst: Endpoint, seg: TcpOut) usize {
         t[20..22].* = .{ 2, 4 };
         std.mem.writeInt(u16, t[22..24], m, .big);
     }
-    @memcpy(t[hdr_len..], seg.payload);
-    std.mem.writeInt(u16, t[16..18], fold(sum(pseudo(&src.addr, &dst.addr, proto_tcp, l4_len), t)), .big);
-    _ = writeIpHeader(out, &src.addr, &dst.addr, proto_tcp, l4_len);
-    return ip_len + l4_len;
+    _ = writeIpHeader(out, &src.addr, &dst.addr, proto_tcp, hdr_len + payload_len);
+    return ip_len + hdr_len;
+}
+
+/// Fill in the TCP checksum of `headers` (from `tcpHeaders`) for a
+/// payload sent as `payload`, in pieces of any length.
+pub fn finishTcp(headers: []u8, payload: []const []const u8) void {
+    const v6 = headers[0] >> 4 == 6;
+    const ip_len: usize = if (v6) 40 else 20;
+    const t = headers[ip_len..];
+    var len = t.len;
+    for (payload) |p| len += p.len;
+    var acc: u64 = proto_tcp + len;
+    acc = if (v6) sum(acc, headers[8..40]) else sum(acc, headers[12..20]);
+    acc = sum(acc, t);
+    // the TCP header is 20 or 24 bytes, so the payload starts even
+    var odd = false;
+    for (payload) |p| {
+        acc = if (odd) acc + @byteSwap(foldRaw(sum(0, p))) else sum(acc, p);
+        odd = odd != (p.len % 2 == 1);
+    }
+    std.mem.writeInt(u16, t[16..18], fold(acc), .big);
+}
+
+/// The 16-bit ones' complement sum, not complemented.
+fn foldRaw(acc: u64) u16 {
+    return ~fold(acc);
+}
+
+/// Build an IP packet with a TCP segment into `out`; returns its length.
+pub fn writeTcp(out: []u8, src: Endpoint, dst: Endpoint, seg: TcpOut) usize {
+    const n = tcpHeaders(out, src, dst, seg, seg.payload.len);
+    @memcpy(out[n..][0..seg.payload.len], seg.payload);
+    finishTcp(out[0..n], &.{out[n..][0..seg.payload.len]});
+    return n + seg.payload.len;
 }
 
 /// Build an IP packet with a UDP datagram into `out`; returns its length.
@@ -367,6 +402,34 @@ test "IPv6 UDP round trip, extension header skipped" {
     const ip2 = parseIp(ext[0 .. n + 8]).?;
     try std.testing.expectEqual(proto_udp, ip2.proto);
     try std.testing.expectEqualStrings("query", parseUdp(ip2.l4).?.payload);
+}
+
+test "TCP checksum over a payload in pieces, odd lengths included" {
+    var data: [301]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 151 +% 7);
+    const a: Endpoint = .{ .addr = v4(.{ 10, 0, 0, 2 }), .port = 51000 };
+    var b6: Endpoint = .{ .addr = @splat(0), .port = 443 };
+    b6.addr[0] = 0xfd;
+    b6.addr[15] = 1;
+    var a6 = b6;
+    a6.addr[15] = 2;
+    a6.port = 40000;
+    for ([_][2]Endpoint{ .{ a, .{ .addr = v4(.{ 93, 184, 216, 34 }), .port = 443 } }, .{ a6, b6 } }) |ends| {
+        for ([_]usize{ 0, 1, 2, 3, 150, 151, 299, 300, 301 }) |cut| {
+            for ([_]usize{ 301, 300, 1, 0 }) |len| {
+                const first = data[0..@min(cut, len)];
+                const second = data[first.len..len];
+                const seg: TcpOut = .{ .seq = 5, .ack = 9, .flags = .{ .ack = true, .psh = true }, .window = 1000, .payload = data[0..len] };
+                var whole: [tcp_headers_max + 301]u8 = undefined;
+                const n = writeTcp(&whole, ends[0], ends[1], seg);
+                var hdr: [tcp_headers_max]u8 = undefined;
+                const h = tcpHeaders(&hdr, ends[0], ends[1], seg, len);
+                finishTcp(hdr[0..h], &.{ first, second });
+                try std.testing.expectEqualSlices(u8, whole[0..h], hdr[0..h]);
+                try std.testing.expect(transportChecksumOk(parseIp(whole[0..n]).?));
+            }
+        }
+    }
 }
 
 test "fragments and garbage are refused" {
