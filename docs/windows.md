@@ -10,7 +10,9 @@ How the Windows build carries traffic, and why it is put together this way.
 signed driver library, pinned by its hash in the release workflow.
 
 - **The window** ([src/link.zig](../src/link.zig)) starts, stops and asks the service the
-  same way as on macOS and Linux, over an AF_UNIX socket in `%APPDATA%\BLACKWALL`.
+  same way as on macOS and Linux, but over a loopback TCP port: the service writes the
+  port and a secret into a file in `%APPDATA%\BLACKWALL`, and answers only who sends
+  the secret back.
 - **The service** runs as a Windows service (`BLACKWALL`, LocalSystem): Wintun adapters,
   routes and the firewall need an administrator. It is installed once, at the first
   Connect, after the UAC prompt ([src/core/win_scm.zig](../src/core/win_scm.zig)):

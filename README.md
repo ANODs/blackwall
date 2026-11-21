@@ -28,7 +28,9 @@ handshakes, HTTP/2 and every protocol are implemented in this repository, in Zig
 release is a single file of 3 to 14 MB.
 
 > **You bring the servers.** BLACKWALL is a client. It does not sell, provide or
-> recommend VPN servers, and it has no account, no backend and no analytics.
+> recommend VPN servers. The app has no account and no backend, and sends nothing about
+> you anywhere ([privacy](docs/privacy.md)). The project's website counts visits and
+> downloads per day, without cookies or addresses ([worker/](worker/src/index.js)).
 
 ## Contents
 
@@ -77,6 +79,9 @@ release is a single file of 3 to 14 MB.
 - A QR code instead of typing: from the camera or a picture on Android, from the clipboard
   or the screen on a computer, read by a decoder in this repository.
 - Latency for every server; "Fastest" picks one for you.
+- The country a server really exits in, found with one request through it, shown when it
+  differs from what the provider says.
+- Copy a server as a link or as an Xray JSON configuration.
 - Reserve servers: star the ones you trust. When the server in use stops carrying
   traffic, BLACKWALL reconnects to it once, then moves to the starred ones, fastest first,
   checking each with a real request. It moves back when the main server answers again.
@@ -84,6 +89,10 @@ release is a single file of 3 to 14 MB.
 **Protection**
 
 - Kill switch, selective or strict.
+- An application that cannot be identified is never let out past the VPN: while any
+  application or site is held to the VPN and the default route is direct, a connection
+  whose owner is unknown is refused.
+- IPv6 blocked, tunneled or left to the system.
 - Protection after Disconnect: applications with a VPN rule of their own stay offline
   while the VPN is off.
 - Hold from boot (macOS): traffic is held from the moment the system starts until the
@@ -98,7 +107,9 @@ release is a single file of 3 to 14 MB.
   three actions you need.
 - Signed automatic updates. Settings, subscriptions and rules are kept.
 - A report for GitHub issues in Settings: the recent log as a file, with links, keys and
-  the addresses of servers and sites taken out.
+  the addresses of servers and sites taken out. A crash is written to a log and says
+  where to report it.
+- A configuration file that cannot be read is kept beside the new one, never overwritten.
 - English, Russian and Chinese.
 
 <p align="center">
@@ -112,23 +123,25 @@ release is a single file of 3 to 14 MB.
 |---|---|---|---|---|
 | Capture all traffic (TUN) | Yes | Yes | Yes | Yes (Wintun) |
 | Routes per application | Yes | Yes | Yes | Yes |
-| Local SOCKS5 proxy (`127.0.0.1:1080`) | Yes | No | Yes | Yes |
+| Local SOCKS5 proxy (`127.0.0.1`, port 1080 when free) | Yes | No | Yes | Yes |
 | Protection after Disconnect | Yes | Yes | Yes | Yes |
 | Kill switch | Yes (pf) | Android's own "Always-on VPN" | Yes (nftables) | Yes (WFP) |
 | Traffic held from boot | Yes | Android's own "Always-on VPN" | No | No |
-| Menu bar / tray / notification | Yes | Yes | Built, untested | Built, untested |
+| Menu bar / tray / notification | Yes | Yes | Built, untested | In use since 0.2.10 |
 | Automatic updates | Yes | No | Yes | Yes |
 
 macOS is the platform used and tested every day. The Android app has been through an
 emulator (Android 16, arm64) from first start to a reboot with "Block connections without
 VPN" on, and not through daily use on a phone yet. On Linux the capture, the routes per
 application, the protection after Disconnect and the strict kill switch pass an end-to-end
-test in a virtual machine (Alpine, kernel 6.18); the window and the tray have not been
-through a real desktop yet. Linux needs kernel 5.7 or newer. On Windows the capture
-through Wintun, the routes per application, the system service with its install and
-signed upgrade, and both kill switch modes pass an end-to-end test on a Windows machine
-in CI on every push; protection after Disconnect runs on the same path but has no test
-of its own there, and the window and the tray have not been through a real desktop yet.
+test in a virtual machine (Alpine, kernel 6.18), run by hand before a release; the window
+and the tray have not been through a real desktop yet. Linux needs kernel 5.7 or newer.
+On Windows the capture through Wintun, the routes per application, the system service
+with its install and signed upgrade, and both kill switch modes pass an end-to-end test
+on a Windows machine in CI on every push to the code; protection after Disconnect runs on
+the same path but has no test of its own there. The window, the tray and the updater
+there have been through real Windows desktops since 0.2.10, which is where their first
+bugs were found and fixed.
 
 ## Protocols and transports
 
@@ -165,7 +178,8 @@ comes in three languages; pick the one you read.
 
 The builds are not signed by Apple or Microsoft yet:
 
-- **macOS**: right-click the app, choose Open. The first connection in TUN mode asks for
+- **macOS**: right-click the app, choose Open (on macOS 15 and newer: open it once, then
+  System Settings, Privacy & Security, Open Anyway). The first connection in TUN mode asks for
   the administrator password once, to install the network helper.
 - **Windows**: SmartScreen, More info, Run anyway. The first Connect asks once (UAC) to
   install the BLACKWALL system service, which carries the traffic; later releases replace
@@ -213,21 +227,25 @@ reserve, or no connection. There is no path from a VPN route to a direct connect
 
 **Kill switch.** *Selective* stops the applications that are routed through the VPN when
 it drops; direct ones keep working. *Strict* stops everything except the connections to
-the VPN servers themselves, using the system firewall (pf).
+the VPN servers themselves, using the system firewall (pf on macOS, nftables on Linux,
+WFP on Windows). If the firewall rules cannot be set, the connection does not start.
 
 **Protection after Disconnect.** Turning the VPN off is not the same as lifting the
 protection. Applications with their own VPN rule, and blocked ones, stay offline while the
 VPN is off; everything else uses the normal internet.
 
-**Hold from boot.** With "Launch at login" on, the network helper captures all traffic as
-soon as the system has a network and holds it until the service takes over. If no
-service comes within two minutes of a login, it lets go, so a broken installation cannot
-leave the machine offline.
+**Hold from boot** (macOS). With "Launch at login" on, TUN mode, a kill switch that is not
+off, and either "Connect automatically" or applications held after Disconnect, the network
+helper captures all traffic as soon as the system has a network and holds it until the
+service takes over. If no service comes within two minutes of a login, it lets go, so a
+broken installation cannot leave the machine offline.
 
-**Reserve.** Recovery is driven by failures, not by polling: nothing runs while the server
-works. When connections start failing, the address is looked up again and one real request
-is sent through the same server. If that fails, the starred servers that accept a
-connection are tried fastest first, each with a real request.
+**Reserve.** Recovery is driven by failures, not by polling. When connections start
+failing, the address is looked up again and one real request is sent through the same
+server. If that fails, the starred servers are tried, the ones measured fastest first,
+each with a real request. To know which is fastest, each starred server is measured
+through itself (1 MB) half a minute after the list changes and then every half hour,
+one at a time and only while traffic flows.
 
 ## How it works
 
@@ -247,7 +265,7 @@ flowchart LR
     window["BLACKWALL window<br>and menu bar item"] <-->|JSON lines over a Unix socket| service
 ```
 
-Three processes, each with one job:
+Three processes on macOS, each with one job:
 
 - **The window** shows the state and edits the configuration. It carries no traffic and
   can be closed.
@@ -258,6 +276,13 @@ Three processes, each with one job:
   the tunnel device, sets the routes and the DNS, holds the firewall rules of the strict
   kill switch, and hands the device to the service. If the service dies, the helper keeps
   the traffic captured instead of letting it leak.
+
+The other systems have the same window and the same service, and differ in who holds the
+privilege. On Linux a small program with one capability (`blackwall-tun`) creates the
+device and hands it to the service. On Windows the service is a system service
+(LocalSystem) with a Wintun adapter, and the window reaches it over the loopback
+([docs/windows.md](docs/windows.md)). On Android the core is a library inside the app,
+behind the system's own `VpnService` ([docs/android.md](docs/android.md)).
 
 A few details worth knowing:
 
@@ -280,16 +305,23 @@ A few details worth knowing:
   `CAP_NET_ADMIN`, granted to that file once through polkit. It creates the device, its
   routes and the kill switch's nftables table, hands the device to the service and exits.
   The service and the window run as you, with no capability, so updating them asks for
-  nothing; the updater replaces `blackwall-tun` only when it changed.
+  nothing; the updater replaces `blackwall-tun` only when it changed, and only the user
+  who installed it may run it. On Windows the service runs as LocalSystem from
+  `%ProgramFiles%`, where only administrators write; the user who installed it may start,
+  stop and query it, and it replaces itself only with a newer service signed by the
+  release key.
 - **Stopping another VPN** is done only for a process whose identity (pid, start time,
   executable) was re-checked at the moment of stopping, and never for a system process.
 - **Updates are signed.** The updater installs a file only when its Ed25519 signature
   matches the public key built into the running app, and only when the unpacked app really
-  is the expected, newer version. The helper accepts a newer helper on the same terms, so
-  the administrator password is asked once per installation.
+  is the expected, newer version. The helper (and the Windows service) accepts a newer one
+  of its own kind on the same terms, so the administrator is asked once per installation.
+- **Servers are verified.** With plain TLS the certificate chain is checked up to a
+  trusted root, every link of it a certificate authority; with REALITY the server proves
+  it holds the key from the link.
 - **Fail closed.** A VPN route whose server is gone, unknown or unsupported is blocked. A
-  connection whose application cannot be identified is refused while protected
-  applications are being held.
+  connection whose application cannot be identified is refused wherever letting it out
+  could bypass a rule. A strict kill switch that cannot be set stops the start.
 - **Secrets stay local.** Subscription links and keys are stored in the configuration file
   in your user folder and are never logged.
 
@@ -299,12 +331,14 @@ public issue.
 ## Build from source
 
 You need [Zig 0.17.1](https://ziglang.org/download/). Everything else is fetched by the
-build.
+build, except `wintun.dll` for a Windows package (`-Dwintun=`, from
+[wintun.net](https://www.wintun.net)) and the Android SDK for the Android app.
 
 ```sh
 zig build                 # the app, the service and the tools, into zig-out/
 zig build run             # build and start the window
 zig build test            # all tests
+zig build service         # only the background service (and the helper, or blackwall-tun)
 zig build package -Doptimize=ReleaseSafe -Dlang=en    # a release file in zig-out/package
 ```
 
@@ -313,7 +347,10 @@ zig build package -Doptimize=ReleaseSafe -Dlang=en    # a release file in zig-ou
 | `-Dlang=en\|ru\|zh` | Interface language (one build per language; default `ru`) |
 | `-Dtarget=...` | Cross-compile, for example `x86_64-windows` or `x86_64-linux-gnu` |
 | `-Doptimize=ReleaseSafe` | Release build |
-| `-Dupdate-repo=owner/name` `-Dupdate-pubkey=<base64>` | Build with the updater (release CI does this) |
+| `-Dversion=x.y.z` | Version, instead of the one in `build.zig.zon` |
+| `-Dstrip=false` | Keep debug information in a release build |
+| `-Dwintun=<path>` | Windows: the `wintun.dll` (amd64) the service carries |
+| `-Dupdate-repo=owner/name` `-Dupdate-pubkey=<base64>` | Where updates come from and the key that signs them. The default is this project's; `-Dupdate-repo=` (empty) builds without the updater |
 
 On macOS, `zig build package` produces `zig-out/BLACKWALL.app` with the service and the
 helper inside, ad-hoc signed.
@@ -327,6 +364,7 @@ Releases are built by GitHub Actions from a `v<version>` tag; see
 export ANDROID_HOME=~/Library/Android/sdk     # an SDK with a platform, build-tools and an NDK
 export JAVA_HOME=/path/to/jdk-17
 zig build android -Doptimize=ReleaseSafe      # zig-out/package/BLACKWALL-<version>-android.apk
+zig build android-bundle -Doptimize=ReleaseSafe   # the .aab Google Play takes
 ```
 
 There is no Gradle: Zig builds the core as `libblackwall.so` against the NDK's libc, and
@@ -342,9 +380,11 @@ zig build test
 ```
 
 The suite covers the protocol code against recorded and scripted peers, the TCP/IP stack,
-the routing table, the recovery logic and the release tooling, and runs on macOS, Linux and
-Windows in CI on every push. The Linux capture, routes per application, protection after
-Disconnect and the strict kill switch also have an end-to-end test in a virtual machine;
+the routing table, the recovery logic, the configuration file and the release tooling.
+CI runs it on macOS, Linux and Windows on every push that touches the code, checks the
+formatting (`zig fmt --check`), builds the window in all three languages and builds the
+Android app. The Linux capture, routes per application, protection after Disconnect and
+the strict kill switch are checked end to end in a virtual machine by hand;
 on Windows [tools/windows/e2e.ps1](tools/windows/e2e.ps1) and
 [upgrade.ps1](tools/windows/upgrade.ps1) do the same on a CI machine (the adapter, routes
 per application, the service, the kill switch, a signed upgrade and a forged one); the
@@ -360,6 +400,9 @@ zig-out/bin/blackwall-proxy 1080 'vless://...'
 zig-out/bin/blackwall-proxy check 'vless://...'
 ```
 
+Throughput and memory against other clients are measured by
+[tools/bench](tools/bench/run.py); the site shows the figures.
+
 To render every screen to PNG without touching your configuration (sample data):
 
 ```sh
@@ -371,26 +414,40 @@ HOME=$(mktemp -d) BLACKWALL_SHOTS=out zig-out/bin/blackwall
 ```
 src/
   main.zig, app.zig        the window: frame loop and application state
+  app/updater.zig          the window's side of automatic updates
   link.zig                 the window's side of the background service
+  report.zig, shots.zig    the window's log and report; every screen rendered to PNG
+  i18n.zig, countries.zig  the three languages; country names
   ui/                      screens, widgets, theme
-  platform/                autostart, tray, detection of other VPNs
+  platform/                installed applications, autostart, tray, other VPNs in the way
   core/                    everything that is not the window
-    proxy.zig              outbounds, dialing, one flow from end to end
+    outbound.zig           what a server is: share links, security, transport
+    proxy.zig              dialing, and one flow from end to end
+    socks.zig              the local SOCKS5 inbound
     tunnel.zig             the TUN data plane: flows, routes, UDP
     ipstack/               TCP/IP stack, packets, DNS and fake addresses
     tls13.zig, vision.zig  TLS 1.3, REALITY, Vision
-    ws.zig, httpupgrade.zig, grpc.zig, xhttp.zig, h2.zig, hpack.zig
-    trojan.zig, vmess.zig, shadowsocks.zig, xudp.zig
+    ws.zig, httpupgrade.zig, grpc.zig, xhttp.zig, h2.zig, hpack.zig, browser.zig
+    trojan.zig, vmess.zig, shadowsocks.zig, xudp.zig, udp_out.zig
+    dpi.zig, sni.zig       the DPI bypass route; names from a flow's first bytes
     failover.zig           the main server and its reserve
-    sublink.zig            subscriptions and links
+    model.zig, store.zig   the configuration and its file
+    sublink.zig, xrayjson.zig   subscriptions and links, in and out
+    qr.zig                 the QR decoder
+    ipc.zig, helper_ipc.zig     window, service and helper talking to each other
     update.zig             the updater
-  service/                 the background service
+    wintun.zig, win_scm.zig, afd.zig   Windows: the adapter, the system service, sockets
+  service/                 the background service; Linux and Windows capture and kill switch
+  helper/                  the root helper (macOS): utun, routes, DNS, pf
   android/                 the core as a library for the Android app
-  helper/                  the root helper (macOS)
-tools/windows/             end-to-end checks on a Windows machine
-  tools/                   release signing, headless proxy
+  tools/                   release signing, headless proxy (blackwall-proxy)
 android/                   the Android shell: VpnService, the window, resources
-docs/                      updates, Android, release notes
+assets/                    icons, fonts, the Linux installer
+tools/                     the site generator, icons, Google Play upload, benchmarks,
+                           end-to-end checks on a Windows machine
+site/, worker/             the website and the Cloudflare Worker behind it
+docs/                      Windows, Android, updates, privacy, release notes, screenshots
+.github/workflows/         tests, Windows end-to-end, releases, the site
 ```
 
 ## Known limitations
@@ -424,8 +481,10 @@ docs/                      updates, Android, release notes
 
 ## Roadmap
 
-- **0.4** — Windows on a real desktop: the window and the tray, Store applications in the
-  list, traffic held from boot.
+The current release is 0.2.x.
+
+- **0.3** — Linux on a real desktop: the window and the tray; a scripted end-to-end test.
+- **0.4** — Windows: Store applications in the list, traffic held from boot.
 - **0.5** — WireGuard.
 - **0.6** — QUIC and Hysteria2.
 - **0.7** — TUIC.
@@ -438,7 +497,8 @@ Issues and pull requests are welcome. A few things keep the project the size it 
   package stays small and the service stays cheap when idle.
 - A new protocol or transport comes with tests against the reference server.
 - The main screens carry almost no text. Explanations go into Settings.
-- `zig build test` passes on all three systems before a change lands.
+- `zig build test` and `zig fmt --check src build.zig` pass on all three systems before a
+  change lands.
 
 ## License
 

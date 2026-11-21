@@ -144,7 +144,10 @@ crashes while loading it is still caught), the app reads the marker next to itse
 
 ## Developing and testing
 
-- Local builds have no updater. To try one: `zig build -Dupdate-repo=<owner/name> -Dupdate-pubkey=<public key>`.
+- A local build takes updates from the project's releases, like a release does, but only
+  when it sits where a release would (an app bundle, or the single executable). To try
+  another source: `zig build -Dupdate-repo=<owner/name> -Dupdate-pubkey=<public key>`;
+  `-Dupdate-repo=` (empty) builds without the updater.
 - `zig build test` covers version order, tag parsing, asset names, signature checks
   (valid, tampered, wrong key), parsing a sample releases response, and the install steps
   on fake installs in a temporary folder: a fake `BLACKWALL.app` zipped with `ditto` is
