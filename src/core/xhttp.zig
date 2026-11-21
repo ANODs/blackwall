@@ -343,30 +343,16 @@ fn chromeFetch(a: Allocator, head: *Head, v: u32) (Error || Allocator.Error)!voi
     try head.setDefault("accept", "*/*");
 }
 
-/// Chromium's GREASEd brand list for major version `v`, which also seeds
-/// it (getGreasedChUa in browser.go).
+/// Chromium's GREASEd brand list for major version `v` (browser.zig).
 fn chromeBrands(a: Allocator, v: u32) Allocator.Error![]const u8 {
-    const na = " (:-./);=?_";
-    const vna = [_][]const u8{ "8", "99", "24" };
-    const orders = [6][3]u2{ .{ 0, 1, 2 }, .{ 0, 2, 1 }, .{ 1, 0, 2 }, .{ 1, 2, 0 }, .{ 2, 0, 1 }, .{ 2, 1, 0 } };
-    const grease = try print(a, "\"Not{c}A{c}Brand\";v=\"{s}\"", .{ na[v % na.len], na[(v + 1) % na.len], vna[v % vna.len] });
-    const chromium = try print(a, "\"Chromium\";v=\"{d}\"", .{v});
-    const chrome = try print(a, "\"Google Chrome\";v=\"{d}\"", .{v});
-    var placed: [3][]const u8 = undefined;
-    for (orders[v % orders.len], [_][]const u8{ grease, chromium, chrome }) |at, brand| placed[at] = brand;
-    return print(a, "{s}, {s}, {s}", .{ placed[0], placed[1], placed[2] });
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    browser.writeBrands(&w, v) catch unreachable; // 84 bytes at most
+    return a.dupe(u8, w.buffered());
 }
 
-/// Chrome's major version as Xray derives it from the date (ChromeVersion
-/// in browser.go): 144 came out on 2026-01-13, one more every 35 days,
-/// each taken to reach users 35 days later. Xray adds a lag of up to 105
-/// days, fixed per machine; like the other transports here we add none and
-/// claim the newest, which most Chrome installations run. Below 144 only
-/// for a clock that is wrong anyway.
-fn chromeMajor(now: i64) u32 {
-    const days = @divFloor(now, std.time.s_per_day) - 20466;
-    return 144 + @as(u32, @intCast(@max(0, @divTrunc(days - 35, 35))));
-}
+const browser = @import("browser.zig");
+const chromeMajor = browser.chromeMajor;
 
 // ------------------------------------------------------------ extra
 

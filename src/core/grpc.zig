@@ -29,7 +29,7 @@
 const std = @import("std");
 const Io = std.Io;
 const h2 = @import("h2.zig");
-const browser = @import("httpupgrade.zig");
+const browser = @import("browser.zig");
 
 const Field = h2.Field;
 

@@ -49,6 +49,7 @@ test {
     _ = tls13;
     _ = ws;
     _ = httpupgrade;
+    _ = @import("browser.zig");
     _ = hpack;
     _ = h2;
     _ = grpc;
