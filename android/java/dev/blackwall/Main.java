@@ -292,16 +292,10 @@ public class Main extends Activity implements Core.Listener {
 
         // the server in use (a reserve one after a switch), else the one chosen
         JSONObject sv = core.server(look == PowerButton.ON ? st.optInt("server") : 0);
+        // a group in use: where its server in use exits, once seen
+        String exit = sv != null ? st.optString("exit") : "";
         if (sv == null) sv = core.server(s.optInt("current"));
-        if (sv != null && sv.optInt("group") > 0) {
-            serverCc.setText("");
-            serverCc.setCompoundDrawablesWithIntrinsicBounds(glyph(Glyph.BOLT, TEXT, 16), null, null, null);
-            serverCc.setPadding(dp(10), 0, 0, 0);
-        } else {
-            serverCc.setCompoundDrawables(null, null, null, null);
-            serverCc.setPadding(0, 0, 0, 0);
-            serverCc.setText(country(sv));
-        }
+        showBadge(serverCc, sv, exit);
         serverName.setText(sv == null ? "" : sv.optString("name"));
         serverPing.setText(sv == null || sv.isNull("ping") ? "" : sv.optInt("ping") + " ms");
         down.setText(rate(look == PowerButton.ON ? core.rateDown : 0));
@@ -364,6 +358,43 @@ public class Main extends Activity implements Core.Listener {
     private static String country(JSONObject sv) {
         String cc = sv == null ? "" : sv.optString("cc");
         return cc.isEmpty() || cc.equals("??") ? "··" : cc;
+    }
+
+    /**
+     * A server's badge: its country, with a dot when that is where it was
+     * seen to exit; a bolt for a group, unless `exit` says where the group's
+     * server in use exits.
+     */
+    private void showBadge(TextView t, JSONObject sv, String exit) {
+        boolean group = sv != null && sv.optInt("group") > 0;
+        if (group && exit.length() != 2) {
+            bolt(t);
+            return;
+        }
+        t.setCompoundDrawables(null, null, null, null);
+        t.setPadding(0, 0, 0, 0);
+        t.setText(group ? exit : country(sv));
+        t.setBackground(badgeBack(group || sv != null && sv.optBoolean("seen")));
+    }
+
+    private void bolt(TextView t) {
+        t.setText("");
+        t.setCompoundDrawablesWithIntrinsicBounds(glyph(Glyph.BOLT, TEXT, 16), null, null, null);
+        t.setPadding(dp(10), 0, 0, 0);
+        t.setBackground(badgeBack(false));
+    }
+
+    /** The badge's tile; a dot in its corner marks a country seen at the exit. */
+    private Drawable badgeBack(boolean seen) {
+        if (!seen) return round(CARD, 8);
+        GradientDrawable dot = new GradientDrawable();
+        dot.setShape(GradientDrawable.OVAL);
+        dot.setColor(GREEN);
+        android.graphics.drawable.LayerDrawable l = new android.graphics.drawable.LayerDrawable(new Drawable[]{round(CARD, 8), dot});
+        l.setLayerSize(1, dp(4), dp(4));
+        l.setLayerGravity(1, Gravity.TOP | Gravity.END);
+        l.setLayerInset(1, 0, dp(4), dp(4), 0);
+        return l;
     }
 
     static String rate(double bytesPerSecond) {
@@ -531,9 +562,7 @@ public class Main extends Activity implements Core.Listener {
             }
             h = (Holder) old.getTag();
             if (o == null) {
-                h.cc.setText("");
-                h.cc.setCompoundDrawablesWithIntrinsicBounds(glyph(Glyph.BOLT, TEXT, 16), null, null, null);
-                h.cc.setPadding(dp(10), 0, 0, 0);
+                bolt(h.cc);
                 h.name.setText(R.string.fastest);
                 h.name.setAlpha(1);
                 h.proto.setVisibility(View.GONE);
@@ -546,15 +575,7 @@ public class Main extends Activity implements Core.Listener {
             final int id = o.optInt("id");
             // a provider's "Auto": a bolt, and how many servers it chooses among
             int group = o.optInt("group");
-            if (group > 0) {
-                h.cc.setText("");
-                h.cc.setCompoundDrawablesWithIntrinsicBounds(glyph(Glyph.BOLT, TEXT, 16), null, null, null);
-                h.cc.setPadding(dp(10), 0, 0, 0);
-            } else {
-                h.cc.setCompoundDrawables(null, null, null, null);
-                h.cc.setPadding(0, 0, 0, 0);
-                h.cc.setText(country(o));
-            }
+            showBadge(h.cc, o, "");
             h.name.setText(o.optString("name"));
             h.name.setAlpha(o.optBoolean("ok") ? 1f : 0.4f);
             h.proto.setVisibility(View.VISIBLE);
@@ -884,6 +905,7 @@ public class Main extends Activity implements Core.Listener {
 
         col.addView(toggle(R.string.s_failover, R.string.s_failover_d, s.optBoolean("failover", true), "failover"));
         col.addView(toggle(R.string.s_guard, R.string.s_guard_d, s.optBoolean("guard", true), "guard"));
+        col.addView(toggle(R.string.s_exit, R.string.s_exit_d, s.optBoolean("exitcheck", true), "exitcheck"));
 
         final String[] modes = {"block", "tunnel", "system"};
         final int[] labels = {R.string.ipv6_block, R.string.ipv6_tunnel, R.string.ipv6_system};

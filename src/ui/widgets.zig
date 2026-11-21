@@ -190,8 +190,10 @@ pub fn segmented(src: Src, labels: []const []const u8, index: *usize, opts: Opti
     return changed;
 }
 
-/// Two-letter country code in a quiet tile; stands in for a flag.
-pub fn countryTag(src: Src, code: [2]u8, opts: Options) void {
+/// Two-letter country code in a quiet tile; stands in for a flag. A
+/// country seen at the server's exit (not only named by the provider)
+/// carries a dot in the corner.
+pub fn countryTag(src: Src, code: [2]u8, seen: bool, opts: Options) void {
     const base: Options = .{
         .min_size_content = .{ .w = 30, .h = 22 },
         .background = true,
@@ -203,12 +205,20 @@ pub fn countryTag(src: Src, code: [2]u8, opts: Options) void {
     defer b.deinit();
     const known = code[0] != '?';
     text(@src(), if (known) &code else "··", th.mono(11), if (known) th.text else th.text3, .{ .gravity_x = 0.5 });
+    if (known and seen) {
+        const rs = b.data().borderRectScale();
+        const inset = 4 * rs.s;
+        draw.circleFill(.{ .x = rs.r.x + rs.r.w - inset, .y = rs.r.y + inset }, 1.6 * rs.s, th.ok);
+    }
 }
 
 /// A server's tile: its country, or a bolt for a group (the provider's
-/// "Auto", several servers chosen among by speed).
-pub fn serverTag(src: Src, sv: *const core.model.Server, opts: Options) void {
-    if (!sv.isGroup()) return countryTag(src, sv.country, opts);
+/// "Auto", several servers chosen among by speed). With `member`, the
+/// group member in use: its country once its exit was seen.
+pub fn serverTag(src: Src, sv: *const core.model.Server, member: ?usize, opts: Options) void {
+    if (!sv.isGroup()) return countryTag(src, sv.shownCountry(), core.model.knownCountry(sv.exit), opts);
+    if (member) |m| if (m < sv.members.len and core.model.knownCountry(sv.members[m].exit))
+        return countryTag(src, sv.members[m].exit, true, opts);
     const base: Options = .{
         .min_size_content = .{ .w = 30, .h = 22 },
         .background = true,

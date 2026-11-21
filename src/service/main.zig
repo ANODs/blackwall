@@ -91,9 +91,20 @@ fn openEvents(io: Io, config_dir: []const u8) void {
     events_fd = c.open(@ptrCast(path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c.mode_t, 0o600));
 }
 
+/// What this run has logged. A service runs for weeks and the events file
+/// is only rotated at a start: past `events_max`, only what went wrong is
+/// written; past twice that, nothing more (service.log and service.events).
+var logged = std.atomic.Value(usize).init(0);
+
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    const so_far = logged.load(.monotonic);
+    if (so_far > 2 * events_max) return;
+    if (so_far > events_max and @intFromEnum(level) > @intFromEnum(std.log.Level.warn)) return;
     std.log.defaultLog(level, scope, format, args);
-    if (if (on_windows) events_fd == null else events_fd < 0) return;
+    if (if (on_windows) events_fd == null else events_fd < 0) {
+        _ = logged.fetchAdd(80, .monotonic);
+        return;
+    }
     var buf: [640]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     const t = core.diag.now();
@@ -103,6 +114,7 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
     if (w.end >= buf.len) w.end = buf.len - 1;
     w.writeByte('\n') catch {};
     const line = w.buffered();
+    _ = logged.fetchAdd(line.len, .monotonic);
     if (comptime on_windows) {
         _ = k32.WriteFile(events_fd.?, line.ptr, @intCast(line.len), null, null);
     } else _ = c.write(events_fd, line.ptr, line.len);
@@ -160,13 +172,12 @@ const Service = struct {
         return if (s.settings.standby) .selective else s.settings.kill_switch;
     }
 
-    /// Server id of the group's server in use; 0 when there is none.
-    fn serverInUse(s: *Service) u32 {
-        const t = s.t orelse return 0;
-        const b = s.built orelse return 0;
-        const i = t.mainInUse();
-        if (i >= b.cfg.main.len) return 0;
-        return b.ids[b.cfg.main[i]];
+    /// The group's server in use and where it exits; server 0 when there
+    /// is none.
+    fn serverInUse(s: *Service) routes.InUse {
+        const t = s.t orelse return .{};
+        const b = s.built orelse return .{};
+        return routes.inUse(&b, t);
     }
 
     fn loadConfig(s: *Service) !void {
@@ -292,12 +303,14 @@ const Service = struct {
             errdefer t.destroy();
             try t.setConfig(s.built.?.cfg);
             s.device = try .init(fd, builtin.os.tag.isDarwin());
-            s.t = t;
+            errdefer s.device.deinit();
             s.device_thread = try std.Thread.spawn(.{ .stack_size = core.sys.stackSize(512 * 1024) }, tunnel.Tunnel.run, .{ t, &s.device });
+            s.t = t;
             log.info("tun up (fd {d}, mtu {d})", .{ fd, s.args.mtu });
         }
         if (s.args.socks) |port| {
             const p = try s.gpa.create(proxy.Proxy);
+            errdefer s.gpa.destroy(p);
             p.* = .{ .io = s.io };
             const cfg = s.built.?.cfg;
             p.setOutbound(switch (cfg.default) {
@@ -349,8 +362,8 @@ const Service = struct {
         const t = try tunnel.Tunnel.create(s.gpa, s.io, .{ .mtu = s.args.mtu, .bind = .{ .index = lease.bind_index }, .upstream_dns = dns_servers, .lookup = lookup });
         errdefer t.destroy();
         try t.setConfig(s.built.?.cfg);
-        s.t = t;
         s.device_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, tunnel.Tunnel.run, .{ t, &lease.device });
+        s.t = t;
         log.info("tun up (wintun, mtu {d})", .{s.args.mtu});
     }
 
@@ -529,6 +542,7 @@ const Service = struct {
             const f = p.meter.fault.swap(.none, .monotonic);
             if (fault == .none) fault = f;
         }
+        const in_use = s.serverInUse();
         const st: ipc.Status = .{
             .pid = if (comptime on_windows) @intCast(k32.GetCurrentProcessId()) else c.getpid(),
             .build = build_options.version,
@@ -541,8 +555,10 @@ const Service = struct {
             .direct = total.direct_down.raw,
             .fault = @tagName(fault),
             .skipped = if (s.built) |b| b.skipped else 0,
-            .server = s.serverInUse(),
+            .server = in_use.server,
             .switches = if (s.t) |t| t.mainSwitches() else 0,
+            .member = in_use.member,
+            .exit = if (core.model.knownCountry(in_use.exit)) &in_use.exit else "",
             .standby = s.settings.standby,
             .apps = apps.items,
         };
@@ -1009,6 +1025,10 @@ fn serve(init: std.process.Init, argv: []const []const u8) !void {
     s.start() catch |err| {
         log.err("start: {t}", .{err});
         s.writeError(err);
+        // what was set up is freed; a capture in place stays, as after a
+        // crash: the kill switch decides
+        s.keep_capture = true;
+        s.shutdown();
         return err;
     };
     defer s.shutdown();

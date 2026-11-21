@@ -769,6 +769,8 @@ fn hold() void {
 /// Server the service really uses for the main route (a reserve server
 /// when the main one stopped working), from its status.
 pub var active_server: ?u32 = null;
+/// which of its group's servers carries it
+var active_member: u16 = 0;
 var last_switches: u32 = 0;
 var mode_fix_sent = false;
 /// A start or restart is on its way: the statuses still arriving are the
@@ -781,6 +783,24 @@ pub fn shownServer() ?*model.Server {
         if (active_server) |id| if (state.serverById(id)) |sv| return sv;
     }
     return state.currentServer();
+}
+
+/// Which of `sv`'s group members carries the main route now; null when
+/// `sv` is not in use.
+pub fn memberInUse(sv: *const model.Server) ?usize {
+    if (!service_on or state.settings.standby) return null;
+    return if (active_server == sv.id) active_member else null;
+}
+
+/// Where `sv` was seen to exit (a group: its member in use), when that is
+/// not what its provider says; null otherwise.
+pub fn otherExit(sv: *const model.Server) ?[2]u8 {
+    const cc = if (sv.isGroup()) blk: {
+        const m = memberInUse(sv) orelse return null;
+        break :blk if (m < sv.members.len) sv.members[m].exit else return null;
+    } else sv.exit;
+    if (!model.knownCountry(cc) or std.mem.eql(u8, &cc, &sv.country)) return null;
+    return cc;
 }
 
 // ---------------------------------------------------------------- service
@@ -1118,6 +1138,15 @@ fn applyStatus(st: *const core.ipc.Status) void {
     } else mode_fix_sent = false;
     // the main route's real server; a change is worth telling
     active_server = if (st.server != 0) st.server else null;
+    active_member = st.member;
+    // where it exits, once a request through it said: kept with the server
+    if (st.server != 0 and st.exit.len == 2 and !state.demo) {
+        if (state.recordExit(st.server, st.member, st.exit[0..2].*)) {
+            // a change waiting to be saved takes this along; otherwise
+            // only the file is written, the service has nothing to reload
+            if (!dirty) _ = writeConfig();
+        }
+    }
     if (st.switches != last_switches) {
         if (!first_status and st.switches > last_switches) {
             if (state.serverById(st.server)) |sv| {

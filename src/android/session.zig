@@ -25,7 +25,7 @@
 //!   site {name, route, id}        a site's rule (made when new; route as
 //!                                 for "rule"); answered with the state
 //!   unsite {name}                 forget a site's rule
-//!   set {key, on | value}         failover, guard, ipv6
+//!   set {key, on | value}         failover, guard, exitcheck, ipv6
 //!   ping                          measure every server
 //!   connect / disconnect          the user's switch; answered with a plan
 //!   up {fd, mtu}                  the TUN the shell established for the plan
@@ -40,6 +40,7 @@
 //!            except (packages), ipv6, mtu
 //!   fetch    {id, url}: download this subscription and send its body
 //!   status   once a second while the TUN is up: counters, server in use
+//!            and where it exits ("exit", a country code once seen)
 //!   owner    {q, udp, la, lp, ra, rp}: which application owns this flow
 //!   note     {kind, n, skipped}: something to tell the user once
 //!
@@ -499,6 +500,8 @@ pub const Session = struct {
             st.failover = m.on;
         } else if (std.mem.eql(u8, m.key, "guard")) {
             st.protect_when_off = m.on;
+        } else if (std.mem.eql(u8, m.key, "exitcheck")) {
+            st.check_exit = m.on;
         } else if (std.mem.eql(u8, m.key, "ipv6")) {
             st.ipv6 = std.meta.stringToEnum(model.Ipv6Mode, m.value) orelse return;
         } else if (std.mem.eql(u8, m.key, "default")) {
@@ -513,8 +516,10 @@ pub const Session = struct {
         var arena: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        // group: how many servers a provider's "Auto" chooses among, 0 for a server
-        const Sv = struct { id: u32, sub: u32, name: []const u8, proto: []const u8, cc: []const u8, ping: ?u16, pinging: bool, star: bool, ok: bool, group: usize };
+        // group: how many servers a provider's "Auto" chooses among, 0 for a server;
+        // cc: the country to show, seen at its exit (seen) or as the provider
+        // says (said)
+        const Sv = struct { id: u32, sub: u32, name: []const u8, proto: []const u8, cc: []const u8, seen: bool, said: []const u8, ping: ?u16, pinging: bool, star: bool, ok: bool, group: usize };
         const Sub = struct { id: u32, name: []const u8, link: bool, failed: bool, updated: i64, announce: []const u8, support: []const u8 };
         const Rule = struct { app: []const u8, route: []const u8, id: u32 };
         const Site = struct { name: []const u8, route: []const u8, id: u32 };
@@ -532,7 +537,9 @@ pub const Session = struct {
             .sub = sv.sub_id,
             .name = sv.name,
             .proto = sv.protocol.label(),
-            .cc = &sv.country,
+            .cc = a.dupe(u8, &sv.shownCountry()) catch return,
+            .seen = model.knownCountry(sv.exit),
+            .said = &sv.country,
             .ping = sv.ping_ms,
             .pinging = sv.ping_state == .testing,
             .star = sv.favorite,
@@ -568,6 +575,7 @@ pub const Session = struct {
             .current = if (cur) |sv| sv.id else 0,
             .failover = st.failover,
             .guard = st.protect_when_off,
+            .exitcheck = st.check_exit,
             .ipv6 = @tagName(st.ipv6),
             .direct = st.default_route == .direct,
             .standby = st.standby,
@@ -726,7 +734,7 @@ pub const Session = struct {
     }
 
     /// What a status says, to tell whether there is anything new to say.
-    const Seen = struct { down: u64 = 0, sent: u64 = 0, active: u32 = 0, server: u32 = 0, switches: u32 = 0, standby: bool = false };
+    const Seen = struct { down: u64 = 0, sent: u64 = 0, active: u32 = 0, server: u32 = 0, member: u16 = 0, exit: [2]u8 = "??".*, switches: u32 = 0, standby: bool = false };
 
     /// A status a second while something moves or the window watches; one
     /// more when it stops (the speed falls to zero); then silence, so an
@@ -742,15 +750,22 @@ pub const Session = struct {
             if (s.state.dueForRefresh(Io.Clock.real.now(s.io).toSeconds())) |sub| s.emit(.{ .ev = "fetch", .id = sub.id, .url = sub.url });
             const t = s.t orelse continue;
             const b = s.built orelse continue;
-            const i = t.mainInUse();
+            const in_use = routes.inUse(&b, t);
             const now: Seen = .{
                 .down = t.meter.down.load(.monotonic),
                 .sent = t.meter.up.load(.monotonic),
                 .active = t.meter.active.load(.monotonic),
-                .server = if (i < b.cfg.main.len) b.ids[b.cfg.main[i]] else 0,
+                .server = in_use.server,
+                .member = in_use.member,
+                .exit = in_use.exit,
                 .switches = t.mainSwitches(),
                 .standby = s.state.settings.standby,
             };
+            // where it exits, once a request through it said: kept with the server
+            if (in_use.server != 0 and s.state.recordExit(in_use.server, in_use.member, in_use.exit)) {
+                s.save();
+                s.sendState();
+            }
             const fault = t.meter.fault.swap(.none, .monotonic);
             const moved = !std.meta.eql(now, last) or fault != .none;
             if (moved or !quiet or s.watching.load(.acquire)) s.emit(.{
@@ -761,6 +776,8 @@ pub const Session = struct {
                 .sent = now.sent,
                 .active = now.active,
                 .server = now.server,
+                .member = now.member,
+                .exit = if (model.knownCountry(now.exit)) &now.exit else "",
                 .switches = now.switches,
                 .fault = @tagName(fault),
             });
@@ -1042,6 +1059,10 @@ test "the shell's side of a session: keys, rules, plans" {
         try std.testing.expect(sv.get("ok").?.bool);
         // the secrets stay in the core
         try std.testing.expect(sv.get("link") == null);
+        // not seen at its exit yet: the country its name says
+        try std.testing.expect(!sv.get("seen").?.bool);
+        try std.testing.expectEqualStrings(sv.get("said").?.string, sv.get("cc").?.string);
+        try std.testing.expect(st.value.object.get("exitcheck").?.bool);
     }
 
     // off: nothing to set up
@@ -1067,6 +1088,8 @@ test "the shell's side of a session: keys, rules, plans" {
         defer st.deinit();
         try std.testing.expect(st.value.object.get("up").?.bool);
         try std.testing.expect(st.value.object.get("server").?.integer != 0);
+        // a server that carries nothing says nothing of where it exits
+        try std.testing.expectEqualStrings("", st.value.object.get("exit").?.string);
     }
 
     // a rule the VpnService must reflect ends in a new plan

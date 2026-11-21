@@ -33,8 +33,10 @@ pub fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comp
     const line = buf[0 .. n + 1];
     ring.add(line);
     if (!to_file) return dvui.App.logFn(level, scope, format, args);
-    // past the cap, only what went wrong
-    if (log_written.load(.monotonic) > log_cap and @intFromEnum(level) > @intFromEnum(std.log.Level.warn)) return;
+    // past the cap, only what went wrong; past twice that, nothing
+    const written = log_written.load(.monotonic);
+    if (written > 2 * log_cap) return;
+    if (written > log_cap and @intFromEnum(level) > @intFromEnum(std.log.Level.warn)) return;
     var sbuf: [256]u8 = undefined;
     const ls = std.debug.lockStderr(&sbuf);
     defer std.debug.unlockStderr();
@@ -52,7 +54,7 @@ pub fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comp
 /// kept beside it, and goes into the report.
 pub const log_name = "window.log";
 pub const previous_log_name = "window.previous.log";
-/// past this, only warnings and errors are written
+/// past this, only warnings and errors are written; past twice this, nothing
 const log_cap = 4 << 20;
 
 var to_file = false;

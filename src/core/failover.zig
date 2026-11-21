@@ -33,6 +33,11 @@
 //! speed. The rank is the time to get a megabyte that way. A pass takes a
 //! few seconds per server and runs apart from the recovery, which never
 //! waits for it.
+//!
+//! The real request asks Cloudflare's trace page, which also says in which
+//! country the server's exit to the internet is. So does one request made
+//! when a server starts being used (`check_exit`): providers often name a
+//! server after another country than the one it exits in.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -110,10 +115,19 @@ pub const Group = struct {
     /// data went through the server in use since the last pass
     used: std.atomic.Value(bool) = .init(false),
 
+    /// Where each member exits to the internet, as a request through it
+    /// showed ("??" until one did); kept while the member stays.
+    exits: [max_members][2]u8 = @splat(unknown),
+    /// Ask where the member in use exits once it is in use.
+    check_exit: bool = false,
+    /// when to ask again after a request that got no country; 0: not due
+    exit_ms: std.atomic.Value(i64) = .init(0),
+    exit_tries: std.atomic.Value(u8) = .init(0),
+
     /// called after the member in use changed
     on_switch: ?Hook = null,
     /// the checks, replaceable in tests
-    probe: *const fn (g: *Group, ob: *const proxy.Outbound) bool = realProbe,
+    probe: *const fn (g: *Group, ob: *const proxy.Outbound) Probe = realProbe,
     ping: *const fn (g: *Group, ob: *const proxy.Outbound) ?u32 = realPing,
     measure: *const fn (g: *Group, ob: *const proxy.Outbound) Mark = realMeasure,
 
@@ -130,12 +144,26 @@ pub const Group = struct {
     const waits_s = [_]u16{ 20, 40, 80, 160, 300 };
     const measure_first_ms = 30_000;
     const measure_every_ms = 30 * 60_000;
+    /// a check of the exit that got no country is made again this much
+    /// later, twice at most
+    const exit_retry_ms = 60_000;
+    const exit_retries = 2;
 
     /// Replace the members: `list[0]` is the main server, the rest the
     /// reserve in the user's order. The member in use stays in use when it
     /// is still on the list and the main server did not change. Servers
-    /// that stay keep what the measuring pass found about them.
+    /// that stay keep what the measuring pass found about them, and where
+    /// they exit.
     pub fn set(g: *Group, list: []const proxy.Outbound) void {
+        if (!g.place(list)) return g.exit_ms.store(0, .monotonic);
+        g.exit_tries.store(0, .monotonic);
+        // a recovery under way asks on its own; if it does not, the next tick
+        if (!g.start(checkExit)) g.exit_ms.store(g.nowMs() + settle_ms, .monotonic);
+    }
+
+    /// `set` under the lock; true when the member in use is to be asked
+    /// where it exits.
+    fn place(g: *Group, list: []const proxy.Outbound) bool {
         g.mutex.lockUncancelable(g.io);
         defer g.mutex.unlock(g.io);
         const n = @min(list.len, max_members);
@@ -147,15 +175,19 @@ pub const Group = struct {
             }
         }
         var marks: [max_members]Mark = @splat(.{});
+        var exits: [max_members][2]u8 = @splat(unknown);
         var unmeasured = false;
         for (list[0..n], 0..) |*o, i| {
             for (g.members[0..g.len], 0..) |*m, j| {
-                if (same(&m.get(), o)) marks[i] = g.marks[j];
+                if (!same(&m.get(), o)) continue;
+                marks[i] = g.marks[j];
+                exits[i] = g.exits[j];
             }
             unmeasured = unmeasured or (i > 0 and marks[i].state == .unknown);
         }
         for (list[0..n], 0..) |o, i| g.members[i] = .of(o);
         g.marks = marks;
+        g.exits = exits;
         g.len = n;
         // a new reserve server is measured soon, the rest when due
         const due = g.measure_ms.load(.monotonic);
@@ -171,6 +203,7 @@ pub const Group = struct {
         }
         g.active = keep;
         g.score.store(0, .monotonic);
+        return g.check_exit and n > 0 and !known(g.exits[keep]);
     }
 
     /// The server to use now, or null when the group is empty.
@@ -187,6 +220,20 @@ pub const Group = struct {
         return g.active;
     }
 
+    pub const InUse = struct {
+        /// index of the member in use; 0 is the main server
+        index: usize,
+        /// where it exits to the internet, "??" while not known
+        exit: [2]u8,
+    };
+
+    /// The member in use and where it exits.
+    pub fn inUse(g: *Group) InUse {
+        g.mutex.lockUncancelable(g.io);
+        defer g.mutex.unlock(g.io);
+        return .{ .index = g.active, .exit = if (g.len > 0) g.exits[g.active] else unknown };
+    }
+
     /// A flow through the group's server ended.
     pub fn report(g: *Group, what: Outcome) void {
         const add: u32 = switch (what) {
@@ -200,16 +247,18 @@ pub const Group = struct {
         };
         if (g.score.fetchAdd(add, .monotonic) + add < threshold) return;
         if (g.nowMs() < g.next_ms.load(.monotonic)) return;
-        g.start(recover);
+        _ = g.start(recover);
     }
 
     /// Now and then, from a thread that runs anyway: while a reserve
     /// server is in use, look whether the main one is back; measure the
-    /// reserve when that is due.
+    /// reserve, and ask again where the server in use exits, when due.
     pub fn tick(g: *Group) void {
         const now = g.nowMs();
+        const ask = g.exit_ms.load(.monotonic);
+        const asking = ask != 0 and now >= ask and g.start(checkExit);
         const at = g.back_ms.load(.monotonic);
-        if (at != 0 and now >= at) g.start(lookBack);
+        if (!asking and at != 0 and now >= at) _ = g.start(lookBack);
         const due = g.measure_ms.load(.monotonic);
         // nothing went through lately: the device is idle, wait for use
         if (due != 0 and now >= due and g.used.load(.monotonic)) g.startMeasuring();
@@ -288,20 +337,49 @@ pub const Group = struct {
         if (order.len > 0) log.info("reserve order: {any}", .{order});
     }
 
-    fn start(g: *Group, comptime work: fn (*Group) void) void {
-        if (g.stopping.load(.acquire)) return;
-        if (g.busy.swap(true, .acq_rel)) return;
+    /// Run `work` on a thread of its own, unless one runs already.
+    fn start(g: *Group, comptime work: fn (*Group) void) bool {
+        if (g.stopping.load(.acquire)) return false;
+        if (g.busy.swap(true, .acq_rel)) return false;
         const run = struct {
             fn f(gr: *Group) void {
                 work(gr);
                 gr.busy.store(false, .release);
+                // failures that came meanwhile could not start a recovery
+                if (gr.score.load(.monotonic) >= threshold and gr.nowMs() >= gr.next_ms.load(.monotonic))
+                    _ = gr.start(recover);
             }
         }.f;
         const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(256 * 1024) }, run, .{g}) catch {
             g.busy.store(false, .release);
-            return;
+            return false;
         };
         th.detach();
+        return true;
+    }
+
+    /// One request through the member in use, to see where it exits.
+    fn checkExit(g: *Group) void {
+        g.exit_ms.store(0, .monotonic);
+        const i = g.activeIndex();
+        const m = g.member(i) orelse return;
+        const ob = m.get();
+        if (g.learn(i, &ob, g.probe(g, &ob))) return;
+        if (g.stopping.load(.acquire)) return;
+        // no answer, or no country in it: a little later, a couple of times
+        if (g.exit_tries.fetchAdd(1, .monotonic) < exit_retries)
+            g.exit_ms.store(g.nowMs() + exit_retry_ms, .monotonic);
+    }
+
+    /// A request through member `i` (when it is still `ob`) showed where it
+    /// exits. True when it said.
+    fn learn(g: *Group, i: usize, ob: *const proxy.Outbound, r: Probe) bool {
+        if (!known(r.exit)) return false;
+        g.mutex.lockUncancelable(g.io);
+        defer g.mutex.unlock(g.io);
+        if (i >= g.len or !same(&g.members[i].get(), ob)) return false;
+        g.exits[i] = r.exit;
+        return true;
     }
 
     fn nowMs(g: *Group) i64 {
@@ -327,7 +405,9 @@ pub const Group = struct {
         const cur = g.member(active) orelse return;
         const cur_ob = cur.get();
         if (cur_ob.host()) |h| if (g.dialer.resolver) |r| r.forget(h);
-        if (g.probe(g, &cur_ob)) {
+        const again = g.probe(g, &cur_ob);
+        if (again.carries) {
+            _ = g.learn(active, &cur_ob, again);
             log.info("{s} answers again after a fresh connection", .{name(&cur_ob)});
             g.rounds = 0;
             g.next_ms.store(g.nowMs() + settle_ms, .monotonic);
@@ -355,7 +435,9 @@ pub const Group = struct {
             times[i] = null;
             const cand = g.member(i) orelse continue;
             const ob = cand.get();
-            if (!g.probe(g, &ob)) continue;
+            const r = g.probe(g, &ob);
+            if (!r.carries) continue;
+            _ = g.learn(i, &ob, r);
             return g.switchTo(i, &ob);
         }
         if (n > 1) log.warn("no reserve server carries traffic either", .{});
@@ -371,7 +453,11 @@ pub const Group = struct {
         const main = g.member(0) orelse return;
         const ob = main.get();
         if (ob.host()) |h| if (g.dialer.resolver) |r| r.forget(h);
-        if (g.probe(g, &ob)) return g.switchTo(0, &ob);
+        const r = g.probe(g, &ob);
+        if (r.carries) {
+            _ = g.learn(0, &ob, r);
+            return g.switchTo(0, &ob);
+        }
         g.back_ms.store(g.nowMs() + back_every_ms, .monotonic);
     }
 
@@ -389,6 +475,11 @@ pub const Group = struct {
         g.back_ms.store(if (i == 0) 0 else now + back_every_ms, .monotonic);
         _ = g.switches.fetchAdd(1, .monotonic);
         if (i == 0) log.info("back on the main server {s}", .{name(ob)}) else log.info("reserve server {s} takes over", .{name(ob)});
+        // its answer did not say where it exits: asked once it settled
+        if (g.check_exit and !known(g.inUse().exit)) {
+            g.exit_tries.store(0, .monotonic);
+            g.exit_ms.store(now + settle_ms, .monotonic);
+        }
         if (g.on_switch) |h| h.call(h.ctx);
     }
 
@@ -461,20 +552,41 @@ fn same(a: *const proxy.Outbound, b: *const proxy.Outbound) bool {
     return a.sameServer(b);
 }
 
+/// What a real request through a server showed.
+pub const Probe = struct {
+    /// an HTTP answer came back through it
+    carries: bool = false,
+    /// the country its exit to the internet appears from, as the answer
+    /// said; "??" when it did not
+    exit: [2]u8 = unknown,
+};
+
+/// A country code that is not known.
+pub const unknown: [2]u8 = "??".*;
+
+/// Whether `cc` is a country: two capital letters. Cloudflare's own "XX"
+/// (not known) and "T1" (Tor) are not.
+pub fn known(cc: [2]u8) bool {
+    return std.ascii.isUpper(cc[0]) and std.ascii.isUpper(cc[1]) and !std.mem.eql(u8, &cc, "XX");
+}
+
 /// The checks the group uses, for one server: how fast it accepts a
-/// connection, whether a real request gets through it, and what a
-/// measuring pass finds.
-pub fn check(io: Io, dialer: proxy.Dialer, ob: *const proxy.Outbound) struct { ping_ms: ?u32, carries: bool, mark: Mark } {
+/// connection, whether a real request gets through it (and where it
+/// exits), and what a measuring pass finds.
+pub fn check(io: Io, dialer: proxy.Dialer, ob: *const proxy.Outbound) struct { ping_ms: ?u32, carries: bool, exit: [2]u8, mark: Mark } {
     var g: Group = .{ .io = io, .dialer = dialer };
-    return .{ .ping_ms = realPing(&g, ob), .carries = realProbe(&g, ob), .mark = realMeasure(&g, ob) };
+    const r = realProbe(&g, ob);
+    return .{ .ping_ms = realPing(&g, ob), .carries = r.carries, .exit = r.exit, .mark = realMeasure(&g, ob) };
 }
 
 const ping_timeout_ms = 2500;
 const probe_wait_ms = 8000;
-/// A plain-HTTP address made for connectivity checks: any HTTP answer
-/// through the server proves it carries traffic.
-const check_host = "www.gstatic.com";
-const check_request = "GET /generate_204 HTTP/1.1\r\nHost: " ++ check_host ++ "\r\nConnection: close\r\n\r\n";
+/// Cloudflare's trace page, over plain HTTP: any HTTP answer through the
+/// server proves it carries traffic, and the page's "loc=" line is the
+/// country Cloudflare places the server's exit address in. Nothing about
+/// the user goes with it: no cookies, no user agent.
+const check_host = "cloudflare.com";
+const check_request = "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ check_host ++ "\r\nConnection: close\r\n\r\n";
 /// Plain HTTP too (the tunnel is the encryption): a body of any size asked for.
 const speed_host = "speed.cloudflare.com";
 const speed_bytes = 1024 * 1024;
@@ -497,14 +609,50 @@ fn realPing(g: *Group, ob: *const proxy.Outbound) ?u32 {
 }
 
 /// One real request through the server: connect, handshake, ask a known
-/// address for a page and see an HTTP answer come back.
-fn realProbe(g: *Group, ob: *const proxy.Outbound) bool {
-    return fetch(g, ob, check_host, check_request, 0, probe_wait_ms).reply_ms != null;
+/// address for a page and read what comes back.
+fn realProbe(g: *Group, ob: *const proxy.Outbound) Probe {
+    // the answer holds the server's address too: it stays in here, unlogged
+    var text: [4096]u8 = undefined;
+    const f = fetch(g, ob, check_host, check_request, std.math.maxInt(u64), probe_wait_ms, &text, traced);
+    if (f.reply_ms == null) return .{};
+    var r = parseTrace(text[0..f.kept]);
+    r.carries = true;
+    return r;
+}
+
+/// The trace page said where the exit is: nothing more to wait for.
+fn traced(answer: []const u8) bool {
+    return known(parseTrace(answer).exit);
+}
+
+/// What the trace page's answer (so far) says. After the 10 bytes that
+/// say "connected" comes the page: an HTTP answer at all means the server
+/// carries traffic; the body of a 200 is "key=value" lines, one of them
+/// "loc=" and the country.
+pub fn parseTrace(answer: []const u8) Probe {
+    const at = std.mem.indexOf(u8, answer, "HTTP/1.") orelse return .{};
+    var r: Probe = .{ .carries = true };
+    const head = answer[at..];
+    // "HTTP/1.1 200 OK": anything else (a redirect, a refusal) is no trace
+    if (head.len < 12 or !std.mem.eql(u8, head[8..12], " 200")) return r;
+    const body_at = std.mem.indexOf(u8, head, "\r\n\r\n") orelse return r;
+    const body = head[body_at + 4 ..];
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |raw| {
+        // the last piece may be cut short: only whole lines count
+        if (lines.index == null) break;
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (!std.mem.startsWith(u8, line, "loc=")) continue;
+        const v = line[4..];
+        if (v.len == 2 and known(v[0..2].*)) r.exit = v[0..2].*;
+        break;
+    }
+    return r;
 }
 
 /// The response time and the download speed through the server.
 fn realMeasure(g: *Group, ob: *const proxy.Outbound) Mark {
-    const f = fetch(g, ob, speed_host, speed_request, speed_bytes, measure_wait_ms);
+    const f = fetch(g, ob, speed_host, speed_request, speed_bytes, measure_wait_ms, &.{}, null);
     const ms = f.reply_ms orelse return .{ .state = .failed };
     return .{ .state = .ok, .reply_ms = ms, .speed = if (f.ok) f.speed else 0 };
 }
@@ -518,12 +666,16 @@ const Fetch = struct {
     body: u64 = 0,
     /// bytes per second after the warm-up; 0 when too little came to tell
     speed: u32 = 0,
+    /// bytes of the answer copied to `keep`
+    kept: usize = 0,
 };
 
 /// A request through the server, as an application would send it, and as
 /// much of the answer as `want` (bytes of the body; 0: its first line is
-/// enough) within `wait_ms`.
-fn fetch(g: *Group, ob: *const proxy.Outbound, comptime host: []const u8, request: []const u8, want: u64, wait_ms: i64) Fetch {
+/// enough) within `wait_ms`. The start of the answer is copied to `keep`;
+/// once `enough` says that holds what was looked for, the rest is not
+/// waited for.
+fn fetch(g: *Group, ob: *const proxy.Outbound, comptime host: []const u8, request: []const u8, want: u64, wait_ms: i64, keep: []u8, comptime enough: ?fn ([]const u8) bool) Fetch {
     var res: Fetch = .{};
     if (ob.via() == null) return res;
     // on Windows a loopback TCP pair (it has no socketpair)
@@ -584,6 +736,11 @@ fn fetch(g: *Group, ob: *const proxy.Outbound, comptime host: []const u8, reques
         if (n == 0) break;
         const chunk = buf[0..n];
         const now = g.nowMs();
+        if (res.kept < keep.len) {
+            const k = @min(chunk.len, keep.len - res.kept);
+            @memcpy(keep[res.kept..][0..k], chunk[0..k]);
+            res.kept += k;
+        }
         if (head_done) {
             res.body += chunk.len;
         } else {
@@ -614,6 +771,7 @@ fn fetch(g: *Group, ob: *const proxy.Outbound, comptime host: []const u8, reques
             warm_bytes = res.body;
         }
         if (head_done and res.body >= want) break;
+        if (enough) |f| if (f(keep[0..res.kept])) break;
     }
     // ends the flow, whatever it is waiting for on our side: closed, not
     // just shut down, so that its writes fail and it stops reading the
@@ -632,15 +790,21 @@ const Fake = struct {
     /// which hosts carry traffic, and how fast they accept
     var alive: [4]bool = @splat(false);
     var accepts: [4]?u32 = @splat(null);
+    /// where each exits, as its answer says
+    var exits: [4][2]u8 = @splat(unknown);
     var probes: std.atomic.Value(u32) = .init(0);
+    /// a check waits while this is set
+    var hold: std.atomic.Value(bool) = .init(false);
     var switched: std.atomic.Value(u32) = .init(0);
 
     fn index(ob: *const proxy.Outbound) usize {
         return ob.vless.host[0] - 'a';
     }
-    fn probe(_: *Group, ob: *const proxy.Outbound) bool {
+    fn probe(_: *Group, ob: *const proxy.Outbound) Probe {
         _ = probes.fetchAdd(1, .monotonic);
-        return alive[index(ob)];
+        while (hold.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        const i = index(ob);
+        return if (alive[i]) .{ .carries = true, .exit = exits[i] } else .{};
     }
     fn ping(_: *Group, ob: *const proxy.Outbound) ?u32 {
         return accepts[index(ob)];
@@ -666,6 +830,7 @@ const Fake = struct {
         probes.store(0, .monotonic);
         switched.store(0, .monotonic);
         measured.store(0, .monotonic);
+        exits = @splat(unknown);
         var g: Group = .{ .io = testing.io, .probe = probe, .ping = ping, .measure = measure };
         g.on_switch = .{ .ctx = undefined, .call = onSwitch };
         return g;
@@ -819,4 +984,93 @@ test "the cost of a server: response time plus a megabyte's transfer" {
     try testing.expectEqual(8100, (Mark{ .state = .ok, .reply_ms = 100 }).cost());
     // a fast line with a slow answer loses to a fair line that answers at once
     try testing.expect((Mark{ .reply_ms = 900, .speed = 8 << 20 }).cost() > (Mark{ .reply_ms = 80, .speed = 2 << 20 }).cost());
+}
+test "the trace page: an answer carries, its loc line is the exit's country" {
+    const head = "\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nReport-To: {\"url\":\"https://a.example/?loc=ZZ\"}\r\n\r\n";
+    const body = "fl=143f88\nh=cloudflare.com\nip=192.0.2.7\nts=1795109239.000\nvisit_scheme=http\nuag=\ncolo=AMS\nsliver=none\nhttp=http/1.1\nloc=NL\ntls=off\nsni=off\nwarp=off\n";
+    const whole = head ++ body;
+    const r = parseTrace(whole);
+    try testing.expect(r.carries);
+    try testing.expectEqualStrings("NL", &r.exit);
+    // the line is not complete yet: no country from half of it
+    const cut = std.mem.indexOf(u8, whole, "loc=NL").? + 5;
+    try testing.expect(!known(parseTrace(whole[0..cut]).exit));
+    try testing.expect(!known(parseTrace(whole[0 .. cut + 1]).exit));
+    try testing.expectEqualStrings("NL", &parseTrace(whole[0 .. cut + 2]).exit);
+    // Windows line ends
+    try testing.expectEqualStrings("DE", &parseTrace("HTTP/1.1 200 OK\r\n\r\nloc=DE\r\n").exit);
+    // not known to Cloudflare, Tor, a redirect, nothing at all
+    try testing.expect(!known(parseTrace("HTTP/1.1 200 OK\r\n\r\nloc=XX\n").exit));
+    try testing.expect(!known(parseTrace("HTTP/1.1 200 OK\r\n\r\nloc=T1\n").exit));
+    const moved = parseTrace("HTTP/1.1 301 Moved Permanently\r\nLocation: https://x/\r\n\r\nloc=US\n");
+    try testing.expect(moved.carries and !known(moved.exit));
+    try testing.expect(!parseTrace("\x05\x00\x00\x01").carries);
+}
+
+test "the server in use is asked where it exits, once; a server that stays keeps it" {
+    var g = Fake.group();
+    g.check_exit = true;
+    Fake.alive = .{ true, true, true, false };
+    Fake.accepts = .{ 10, 10, 10, null };
+    Fake.exits = .{ "NL".*, "DE".*, "FI".*, unknown };
+    g.set(&.{ Fake.server("a.example"), Fake.server("b.example") });
+    Fake.settle(&g);
+    try testing.expectEqual(1, Fake.probes.load(.monotonic));
+    try testing.expectEqualStrings("NL", &g.inUse().exit);
+    // the same list again (a reload): nothing more is asked
+    g.set(&.{ Fake.server("a.example"), Fake.server("c.example") });
+    Fake.settle(&g);
+    try testing.expectEqual(1, Fake.probes.load(.monotonic));
+    try testing.expectEqualStrings("NL", &g.inUse().exit);
+
+    // the main server dies: the reserve's own check says where it exits
+    Fake.alive[0] = false;
+    Fake.fail(&g, 3);
+    try testing.expectEqual(1, g.activeIndex());
+    try testing.expectEqualStrings("FI", &g.inUse().exit);
+    try testing.expectEqual(0, g.exit_ms.load(.monotonic));
+
+    // another main server: asked anew
+    g.set(&.{Fake.server("b.example")});
+    Fake.settle(&g);
+    try testing.expectEqualStrings("DE", &g.inUse().exit);
+
+    // an answer without a country: asked again later, a couple of times
+    g.set(&.{Fake.server("d.example")});
+    Fake.settle(&g);
+    try testing.expect(!known(g.inUse().exit));
+    try testing.expect(g.exit_ms.load(.monotonic) != 0);
+    Fake.alive[3] = true;
+    Fake.exits[3] = "SE".*;
+    g.exit_ms.store(1, .monotonic);
+    g.tick();
+    Fake.settle(&g);
+    try testing.expectEqualStrings("SE", &g.inUse().exit);
+    try testing.expectEqual(0, g.exit_ms.load(.monotonic));
+
+    // off: nothing is asked
+    var quiet = Fake.group();
+    quiet.set(&.{Fake.server("a.example")});
+    Fake.settle(&quiet);
+    try testing.expectEqual(0, Fake.probes.load(.monotonic));
+}
+
+test "failures while the exit is being asked start a recovery right after" {
+    var g = Fake.group();
+    g.check_exit = true;
+    Fake.alive = .{ false, true, false, false };
+    Fake.accepts = .{ 10, 10, null, null };
+    Fake.exits = .{ unknown, "DE".*, unknown, unknown };
+    // the check of the main server takes its time
+    Fake.hold.store(true, .release);
+    g.set(&.{ Fake.server("a.example"), Fake.server("b.example") });
+    while (Fake.probes.load(.monotonic) == 0) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    // flows fail meanwhile: no recovery can start yet
+    for (0..3) |_| g.report(.dial_failed);
+    try testing.expectEqual(0, g.activeIndex());
+    Fake.hold.store(false, .release);
+    while (Fake.switched.load(.monotonic) == 0) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    Fake.settle(&g);
+    try testing.expectEqual(1, g.activeIndex());
+    try testing.expectEqualStrings("DE", &g.inUse().exit);
 }

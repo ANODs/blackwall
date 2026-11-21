@@ -27,6 +27,8 @@
     <string name="s_failover_d">服务器无响应时先重连一次，然后切换到已加星标的服务器。绝不直连。</string>
     <string name="s_guard">断开后继续拦截应用</string>
     <string name="s_guard_d">设为“仅通过 VPN”或“禁止联网”的应用在 VPN 关闭期间无法联网。</string>
+    <string name="s_exit">服务器真实国家</string>
+    <string name="s_exit_d">服务器投入使用后，通过它向 cloudflare.com 发送一次请求，查看它实际从哪个国家接入互联网。这样确认的国家带一个圆点，即使服务商标注的是别的国家。</string>
     <string name="s_ipv6">IPv6</string>
     <string name="s_ipv6_d">拦截：连接期间禁用 IPv6。隧道：经由服务器。系统：不经过 VPN。</string>
     <string name="ipv6_block">拦截</string>

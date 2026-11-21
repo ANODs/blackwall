@@ -35,8 +35,13 @@ pub const Server = struct {
     port: u16,
     protocol: Protocol,
     security: Security = .none,
-    /// ISO 3166-1 alpha-2, upper case. "??" when unknown.
+    /// ISO 3166-1 alpha-2, upper case. "??" when unknown. What the provider
+    /// says (the name, a flag).
     country: [2]u8 = "??".*,
+    /// Where the server really exits to the internet, as a request through
+    /// it showed once it was in use; "??" until then. Shown instead of
+    /// `country` once known. A group's is its members'.
+    exit: [2]u8 = "??".*,
     /// Starred by the user. The starred servers are also the reserve: they
     /// take over, in list order, when the main server stops working.
     favorite: bool = false,
@@ -72,13 +77,26 @@ pub const Server = struct {
         for (sv.members, all) |m, *l| l.* = m.link;
         return all;
     }
+
+    /// The country to show: where it exits when that was seen, else what
+    /// the provider says.
+    pub fn shownCountry(sv: *const Server) [2]u8 {
+        return if (knownCountry(sv.exit)) sv.exit else sv.country;
+    }
 };
+
+/// Two capital letters: a country code, not "??".
+pub fn knownCountry(cc: [2]u8) bool {
+    return std.ascii.isUpper(cc[0]) and std.ascii.isUpper(cc[1]);
+}
 
 /// One server of a group. The link is a secret, as a server's.
 pub const Member = struct {
     link: []const u8,
     host: []const u8,
     port: u16,
+    /// where it exits, as `Server.exit`
+    exit: [2]u8 = "??".*,
     // runtime
     ping_ms: ?u16 = null,
 };
@@ -199,6 +217,9 @@ pub const Settings = struct {
     /// After Disconnect, applications with a rule of their own that sends
     /// them through the VPN (or blocks them) stay without network.
     protect_when_off: bool = true,
+    /// Once a server is in use, one request through it shows in which
+    /// country it really exits to the internet (`Server.exit`).
+    check_exit: bool = true,
     /// The VPN is off and the service runs only to keep those applications
     /// blocked; everything else goes direct. Set by Disconnect, cleared by
     /// Connect.
@@ -478,10 +499,15 @@ pub const State = struct {
             const host = try s.gpa.dupe(u8, n.host);
             errdefer s.gpa.free(host);
             const members = try s.dupeMembers(n.members);
-            // the member pings stay with their servers until measured again
+            // the member pings stay with their servers until measured again,
+            // and where they exit
             for (members) |*nm| for (sv.members) |old| {
-                if (std.mem.eql(u8, old.link, nm.link)) nm.ping_ms = old.ping_ms;
+                if (!std.mem.eql(u8, old.link, nm.link)) continue;
+                nm.ping_ms = old.ping_ms;
+                nm.exit = old.exit;
             };
+            // another address may well exit elsewhere
+            if (!std.mem.eql(u8, sv.host, n.host)) sv.exit = "??".*;
             s.gpa.free(sv.link);
             s.gpa.free(sv.host);
             s.freeMembers(sv.members);
@@ -671,6 +697,25 @@ pub const State = struct {
         sv.ping_state = if (best != null) .ok else .failed;
     }
 
+    /// A request through server `id` (a group: through its member `member`)
+    /// showed where it exits. True when that is news (worth saving).
+    pub fn recordExit(s: *State, id: u32, member: usize, cc: [2]u8) bool {
+        if (!knownCountry(cc)) return false;
+        const sv = s.serverById(id) orelse return false;
+        const at = if (sv.members.len == 0) &sv.exit else if (member < sv.members.len) &sv.members[member].exit else return false;
+        if (std.mem.eql(u8, at, &cc)) return false;
+        at.* = cc;
+        return true;
+    }
+
+    /// Where server `id` exits while `member` carries it (a group's member;
+    /// ignored for a plain server), as last seen; "??" when not known.
+    pub fn exitOf(s: *State, id: u32, member: usize) [2]u8 {
+        const sv = s.serverById(id) orelse return "??".*;
+        if (sv.members.len == 0) return sv.exit;
+        return if (member < sv.members.len) sv.members[member].exit else "??".*;
+    }
+
     pub fn addApp(s: *State, id: []const u8, name: []const u8, path: []const u8) !*App {
         if (s.appById(id)) |a| return a;
         try s.apps.append(s.gpa, .{
@@ -845,4 +890,43 @@ test "the provider's refresh period" {
     // tried just now: not again before a quarter of the period
     try std.testing.expectEqual(null, s.dueForRefresh(1000 + 3601));
     try std.testing.expectEqual(id, s.dueForRefresh(1000 + 3600 + 900).?.id);
+}
+
+test "where a server exits: kept across refreshes, per member of a group, reset on a new address" {
+    const gpa = std.testing.allocator;
+    var s: State = .init(gpa);
+    defer s.deinit();
+    const sub_id = (try s.addSubscription("free", "https://example.invalid/s/x")).id;
+    const m1: State.NewMember = .{ .link = "vless://a@1.example:443", .host = "1.example", .port = 443 };
+    const m2: State.NewMember = .{ .link = "vless://b@2.example:443", .host = "2.example", .port = 443 };
+    try s.applySubscription(sub_id, &.{
+        .{ .name = "Germany 1", .host = "de.example", .port = 443, .protocol = .vless, .country = "DE".* },
+        .{ .name = "Auto", .host = "1.example", .port = 443, .protocol = .vless, .link = m1.link, .members = &.{ m1, m2 } },
+    });
+    const de = s.servers.items[0].id;
+    const auto = s.servers.items[1].id;
+    try std.testing.expectEqualStrings("DE", &s.servers.items[0].shownCountry());
+    // the provider says Germany, the exit is in the Netherlands
+    try std.testing.expect(s.recordExit(de, 0, "NL".*));
+    try std.testing.expect(!s.recordExit(de, 0, "NL".*));
+    try std.testing.expect(!s.recordExit(de, 0, "??".*));
+    try std.testing.expectEqualStrings("NL", &s.serverById(de).?.shownCountry());
+    try std.testing.expect(s.recordExit(auto, 1, "FI".*));
+    try std.testing.expect(!s.recordExit(auto, 2, "FI".*));
+    try std.testing.expectEqualStrings("FI", &s.exitOf(auto, 1));
+    try std.testing.expectEqualStrings("??", &s.exitOf(auto, 0));
+
+    // refreshed: the same servers keep it; the group's member is followed by its link
+    try s.applySubscription(sub_id, &.{
+        .{ .name = "Germany 1", .host = "de.example", .port = 443, .protocol = .vless, .country = "DE".* },
+        .{ .name = "Auto", .host = "2.example", .port = 443, .protocol = .vless, .link = m2.link, .members = &.{m2} },
+    });
+    try std.testing.expectEqualStrings("NL", &s.serverById(de).?.exit);
+    try std.testing.expectEqualStrings("FI", &s.exitOf(auto, 0));
+
+    // the provider moved the server: what its old address showed is gone
+    try s.applySubscription(sub_id, &.{
+        .{ .name = "Germany 1", .host = "de2.example", .port = 443, .protocol = .vless, .country = "DE".* },
+    });
+    try std.testing.expectEqualStrings("DE", &s.serverById(de).?.shownCountry());
 }

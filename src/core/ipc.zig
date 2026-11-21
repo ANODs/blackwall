@@ -143,6 +143,10 @@ pub const Status = struct {
     server: u32 = 0,
     /// how often that server changed since the service started
     switches: u32 = 0,
+    /// which of that server's group members carries it (0 for a plain server)
+    member: u16 = 0,
+    /// the country a request through it showed its exit in; "" until then
+    exit: []const u8 = "",
     /// the VPN is off; the service only holds the applications with a rule
     standby: bool = false,
     apps: []const AppStatus = &.{},

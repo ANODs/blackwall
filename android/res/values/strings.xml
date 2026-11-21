@@ -27,6 +27,8 @@
     <string name="s_failover_d">When the server stops responding, reconnect once, then move to the starred servers. Never to a direct connection.</string>
     <string name="s_guard">Hold apps after disconnect</string>
     <string name="s_guard_d">Apps set to “Through VPN only” or “No network” stay without network while the VPN is off.</string>
+    <string name="s_exit">Real server country</string>
+    <string name="s_exit_d">Once a server is in use, one request through it to cloudflare.com shows the country it really exits in. Such a country has a dot, also where the provider named another one.</string>
     <string name="s_ipv6">IPv6</string>
     <string name="s_ipv6_d">Block: no IPv6 while connected. Tunnel: through the server. System: outside the VPN.</string>
     <string name="ipv6_block">Block</string>

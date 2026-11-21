@@ -46,6 +46,7 @@ pub fn show() void {
     }
     _ = switchRow(@src(), tr.failover, tr.failover_desc, &s.failover);
     _ = switchRow(@src(), tr.protect_off, tr.protect_off_desc, &s.protect_when_off);
+    _ = switchRow(@src(), tr.check_exit, tr.check_exit_desc, &s.check_exit);
     _ = switchRow(@src(), tr.dns, tr.dns_desc, &s.dns_over_route);
     _ = switchRow(@src(), tr.lan, tr.lan_desc, &s.allow_lan);
 
