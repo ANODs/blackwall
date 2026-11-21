@@ -42,7 +42,7 @@ const Shake128 = crypto.hash.sha3.Shake128;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = crypto.hash.sha2.Sha256;
 const Md5 = crypto.hash.Md5;
-const proxy = @import("proxy.zig");
+const outbound = @import("outbound.zig");
 
 /// The body cipher, by its number in the request header.
 pub const Security = enum(u4) {
@@ -663,18 +663,18 @@ pub const Vmess = struct {
     port: u16,
     user: User,
     security: Security = .auto,
-    tls: ?proxy.Tls = null,
-    reality: ?proxy.Reality = null,
+    tls: ?outbound.Tls = null,
+    reality: ?outbound.Reality = null,
     transport: Transport = .raw,
 };
 
 /// What carries the VMess stream: the (TLS) connection itself, or a
 /// transport inside it. The dialer's own types: one dialer serves every
 /// protocol.
-pub const Transport = proxy.Transport;
-pub const Http = proxy.Http;
-pub const Grpc = proxy.Grpc;
-pub const Xhttp = proxy.Xhttp;
+pub const Transport = outbound.Transport;
+pub const Http = outbound.Http;
+pub const Grpc = outbound.Grpc;
+pub const Xhttp = outbound.Xhttp;
 
 pub const LinkError = error{
     NotVmess,
@@ -818,7 +818,7 @@ const Params = struct {
     /// values are percent-encoded (the URL form)
     percent: bool = false,
 
-    /// `raw` into a proxy.Text, decoded if need be; false if it does not fit.
+    /// `raw` into a outbound.Text, decoded if need be; false if it does not fit.
     fn set(p: *const Params, t: anytype, raw: []const u8) bool {
         var n: usize = 0;
         var i: usize = 0;
@@ -838,7 +838,7 @@ const Params = struct {
 };
 
 fn build(p: *const Params, host: []const u8, port: u16) LinkError!Vmess {
-    var id: proxy.Text(36) = .{};
+    var id: outbound.Text(36) = .{};
     if (!p.set(&id, p.id)) return error.BadId;
     var out: Vmess = .{
         .host = host,
@@ -873,7 +873,7 @@ fn build(p: *const Params, host: []const u8, port: u16) LinkError!Vmess {
     if (p.tls.len == 0 or is(p.tls, "none")) {
         // bare: the header and the body are sealed all the same
     } else if (is(p.tls, "tls")) {
-        var t: proxy.Tls = .{};
+        var t: outbound.Tls = .{};
         // the certificate is checked against this name: sni, else the Host
         // a CDN routes by, else the address
         if (!p.set(&t.server_name, if (sni.len > 0) sni else if (p.host.len > 0) p.host else host)) return error.UnsupportedSecurity;
@@ -904,7 +904,7 @@ fn build(p: *const Params, host: []const u8, port: u16) LinkError!Vmess {
 /// An account's `id` as Xray reads it: a UUID, or a name of up to 30 bytes
 /// that stands for the UUID made of its SHA-1 (version 5 over the nil UUID).
 fn parseId(text: []const u8) ?[16]u8 {
-    if (text.len >= 32 and text.len <= 36) return proxy.parseUuid(text);
+    if (text.len >= 32 and text.len <= 36) return outbound.parseUuid(text);
     if (text.len == 0 or text.len > 30) return null;
     var h: crypto.hash.Sha1 = .init(.{});
     h.update(&@as([16]u8, @splat(0)));

@@ -44,12 +44,12 @@
 const std = @import("std");
 const Io = std.Io;
 const crypto = std.crypto;
-const proxy = @import("proxy.zig");
+const outbound = @import("outbound.zig");
 const aes_gcm = @import("aes_gcm.zig");
 /// The SOCKS5 address form, which Shadowsocks shares with Trojan.
 const writeAddress = @import("trojan.zig").writeAddress;
 
-const Target = proxy.Target;
+const Target = outbound.Target;
 
 const tag_len = 16;
 /// a sealed 2-byte length

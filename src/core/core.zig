@@ -4,6 +4,7 @@ pub const engine = @import("engine.zig");
 pub const store = @import("store.zig");
 pub const demo = @import("demo.zig");
 pub const fmt = @import("fmt.zig");
+pub const outbound = @import("outbound.zig");
 pub const proxy = @import("proxy.zig");
 pub const tls13 = @import("tls13.zig");
 pub const ws = @import("ws.zig");
@@ -43,6 +44,7 @@ test {
     _ = engine;
     _ = store;
     _ = fmt;
+    _ = outbound;
     _ = proxy;
     _ = tls13;
     _ = ws;

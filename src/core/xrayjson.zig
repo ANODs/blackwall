@@ -262,7 +262,7 @@ fn one(a: std.mem.Allocator, v: std.json.Value) !std.json.Value {
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
-const proxy = @import("proxy.zig");
+const outbound_mod = @import("outbound.zig");
 
 /// The link read back from the JSON is the same server, the same way.
 fn expectRoundTrip(link: []const u8) !void {
@@ -280,8 +280,8 @@ fn expectRoundTrip(link: []const u8) !void {
     try testing.expectEqual(want.port, got.port);
     try testing.expectEqual(want.protocol, got.protocol);
     try testing.expectEqual(want.security, got.security);
-    const ob_want = try proxy.outboundFromLink(want.link, want.host, want.port);
-    const ob_got = try proxy.outboundFromLink(got.link, got.host, got.port);
+    const ob_want = try outbound_mod.outboundFromLink(want.link, want.host, want.port);
+    const ob_got = try outbound_mod.outboundFromLink(got.link, got.host, got.port);
     try testing.expect(ob_want.sameServer(&ob_got));
     // and once more: the JSON of the link read back is the same JSON
     const again = try config(testing.allocator, "X", &.{got.link});

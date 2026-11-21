@@ -18,11 +18,11 @@
 
 const std = @import("std");
 const Io = std.Io;
-const proxy = @import("proxy.zig");
+const outbound = @import("outbound.zig");
 const tls13 = @import("tls13.zig");
 
-const Target = proxy.Target;
-const Text = proxy.Text;
+const Target = outbound.Target;
+const Text = outbound.Text;
 
 pub const Command = enum(u8) { connect = 1, udp = 3 };
 
@@ -115,17 +115,17 @@ pub const Trojan = struct {
     host: []const u8,
     port: u16,
     key: [56]u8,
-    reality: ?proxy.Reality = null,
-    tls: ?proxy.Tls = null,
+    reality: ?outbound.Reality = null,
+    tls: ?outbound.Tls = null,
     transport: Transport = .raw,
 };
 
 /// What the TLS stream carries: Trojan itself, or a transport around it.
 /// The dialer's own types: one dialer serves every protocol.
-pub const Transport = proxy.Transport;
-pub const Http = proxy.Http;
-pub const Grpc = proxy.Grpc;
-pub const Xhttp = proxy.Xhttp;
+pub const Transport = outbound.Transport;
+pub const Http = outbound.Http;
+pub const Grpc = outbound.Grpc;
+pub const Xhttp = outbound.Xhttp;
 
 pub const LinkError = error{
     NotTrojan,
@@ -229,7 +229,7 @@ pub fn fromLink(link: []const u8, host: []const u8, port: u16) LinkError!Trojan 
 
     const sni = if (p.sni.len > 0) p.sni else p.peer;
     if (p.security.len == 0 or is(p.security, "tls")) {
-        var t: proxy.Tls = .{};
+        var t: outbound.Tls = .{};
         // the certificate is checked against this name: sni, else the Host
         // a CDN routes by, else the address
         const name = if (sni.len > 0) sni else if (p.host.len > 0) p.host else host;
@@ -274,7 +274,7 @@ fn decodedAt(raw: []const u8, i: usize) struct { u8, usize } {
     return .{ raw[i], 1 };
 }
 
-/// Percent-decoded into a proxy.Text; false if it does not fit.
+/// Percent-decoded into a outbound.Text; false if it does not fit.
 fn setDecoded(t: anytype, raw: []const u8) bool {
     var n: usize = 0;
     var i: usize = 0;
