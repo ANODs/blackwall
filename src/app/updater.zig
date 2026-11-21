@@ -30,7 +30,9 @@ const update_cfg: update.Config = .{
 const version_stamp = update.stamp(build_options.version);
 
 const update_first_check_s = 15;
-const update_interval_s = 6 * 60 * 60;
+/// One small request to GitHub: an hour keeps a fix from waiting half a day
+/// for a window that is never closed.
+const update_interval_s = 60 * 60;
 /// How long a freshly installed version runs before its old copy is removed.
 const update_confirm_ns = 3 * std.time.ns_per_s;
 

@@ -84,7 +84,7 @@ BLACKWALL_UPDATE_PUBKEY='<public key>' zig-out/bin/blackwall-sign verify BLACKWA
 
 ## What the app does
 
-When auto-update is on: the first check runs 15 s after start, then every 6 hours, on a
+When auto-update is on: the first check runs 15 s after start, then every hour, on a
 background thread. Nothing of it blocks the window.
 
 1. **Check**: `GET https://api.github.com/repos/<repo>/releases?per_page=20` with the
