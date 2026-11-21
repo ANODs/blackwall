@@ -88,6 +88,44 @@ const Ed25519 = std.crypto.sign.Ed25519;
 const b64 = std.base64.standard;
 
 pub const sig_word = "blackwall-helper ";
+/// The two programs signed under `sig_word`: the macOS helper and the
+/// Windows service. The word is the same for both (installed services check
+/// their upgrades with it), so each side also checks the file is its own
+/// kind: a signed Windows service must never pass for the root helper.
+pub const Program = enum { macos_helper, windows_service };
+
+pub fn isProgram(kind: Program, bytes: []const u8) bool {
+    if (bytes.len < 64) return false;
+    return switch (kind) {
+        // a 64-bit Mach-O for arm64 (MH_MAGIC_64, CPU_TYPE_ARM64)
+        .macos_helper => std.mem.readInt(u32, bytes[0..4], .little) == 0xfeedfacf and
+            std.mem.readInt(u32, bytes[4..8], .little) == 0x0100000c,
+        // an MZ header pointing at a PE signature
+        .windows_service => blk: {
+            if (!std.mem.eql(u8, bytes[0..2], "MZ")) break :blk false;
+            const pe = std.mem.readInt(u32, bytes[0x3c..0x40], .little);
+            break :blk pe <= bytes.len - 4 and std.mem.eql(u8, bytes[pe..][0..4], "PE\x00\x00");
+        },
+    };
+}
+
+test "a signed program is checked to be the kind it replaces" {
+    var macho: [64]u8 = @splat(0);
+    std.mem.writeInt(u32, macho[0..4], 0xfeedfacf, .little);
+    std.mem.writeInt(u32, macho[4..8], 0x0100000c, .little);
+    var pe: [128]u8 = @splat(0);
+    @memcpy(pe[0..2], "MZ");
+    std.mem.writeInt(u32, pe[0x3c..0x40], 0x40, .little);
+    @memcpy(pe[0x40..0x44], "PE\x00\x00");
+    try std.testing.expect(isProgram(.macos_helper, &macho));
+    try std.testing.expect(!isProgram(.macos_helper, &pe));
+    try std.testing.expect(isProgram(.windows_service, &pe));
+    try std.testing.expect(!isProgram(.windows_service, &macho));
+    // a PE offset past the end
+    std.mem.writeInt(u32, pe[0x3c..0x40], 0xffff_fff0, .little);
+    try std.testing.expect(!isProgram(.windows_service, &pe));
+}
+
 /// Name of the signature file in the app's Resources folder.
 pub const sig_file = "blackwall-helper.sig";
 

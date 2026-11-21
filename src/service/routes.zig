@@ -93,14 +93,30 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
         else => |r| choiceOf(r, ids.items, pings.items, has_main),
     };
     var cfg: tunnel.Config = .{ .default = default, .rules = rules.items, .domains = domains.items, .outbounds = obs.items, .main = main.items, .check_exit = state.settings.check_exit };
-    // in standby everything without a rule goes direct, so a flow that
-    // cannot be attributed might be one of the held applications': refuse it
-    if (standby) cfg.unknown = .block;
+    // A flow whose application cannot be told (its owner is gone, belongs to
+    // another user, or the lookup timed out) might be one of the held
+    // applications': where everything without a rule goes direct (and in
+    // standby), it is refused rather than let out with the real address.
+    if (holdsUnknown(cfg)) cfg.unknown = .block;
     // IPv6 "block": refused inside the tunnel too, not only by the kill switch
-    if (@hasField(tunnel.Config, "block_ipv6")) cfg.block_ipv6 = state.settings.ipv6 == .block;
+    cfg.block_ipv6 = state.settings.ipv6 == .block;
     // "DNS through the route" off: real answers instead of fake addresses
-    if (@hasField(tunnel.Config, "fake_dns")) cfg.fake_dns = state.settings.dns_over_route;
+    cfg.fake_dns = state.settings.dns_over_route;
     return .{ .arena = arena, .cfg = cfg, .skipped = skipped, .ids = ids.items, .members = members_of.items };
+}
+
+/// Whether flows of unknown origin must be refused: the default lets them
+/// out of the VPN while some application or site is held to it (or blocked).
+fn holdsUnknown(cfg: tunnel.Config) bool {
+    if (!leaves(cfg.default)) return false;
+    for (cfg.rules) |r| if (!leaves(r.choice)) return true;
+    for (cfg.domains) |d| if (!leaves(d.choice)) return true;
+    return false;
+}
+
+/// A route that ends outside the VPN, with the real address.
+fn leaves(c: tunnel.Choice) bool {
+    return c == .direct or c == .dpi;
 }
 
 /// What the main route uses right now: the server (0 when there is none),
@@ -325,4 +341,29 @@ test "routes: a group is its servers, fastest first, before the starred ones" {
     try std.testing.expect(b.cfg.check_exit);
     // an application pinned to the group gets its fastest server
     try std.testing.expectEqual(tunnel.Choice{ .outbound = 3 }, b.cfg.rules[0].choice);
+}
+
+test "routes: flows of unknown origin are refused while the default leaves the VPN and something is held" {
+    const gpa = std.testing.allocator;
+    var s: model.State = .init(gpa);
+    defer s.deinit();
+    try testServers(&s, &.{"a.example"});
+    s.settings.default_route = .direct;
+    {
+        // nothing held: an unknown flow goes where everything goes
+        var b = try build(gpa, &s);
+        defer b.deinit();
+        try std.testing.expectEqual(@as(?tunnel.Choice, null), b.cfg.unknown);
+    }
+    (try s.addApp("/Applications/Claude.app", "Claude", "")).route = .auto;
+    {
+        var b = try build(gpa, &s);
+        defer b.deinit();
+        try std.testing.expectEqual(@as(?tunnel.Choice, .block), b.cfg.unknown);
+    }
+    // a default through the VPN already keeps them in it
+    s.settings.default_route = .auto;
+    var b = try build(gpa, &s);
+    defer b.deinit();
+    try std.testing.expectEqual(@as(?tunnel.Choice, null), b.cfg.unknown);
 }

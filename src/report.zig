@@ -36,7 +36,7 @@ pub fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comp
     // past the cap, only what went wrong; past twice that, nothing
     const written = log_written.load(.monotonic);
     if (written > 2 * log_cap) return;
-    if (written > log_cap and @intFromEnum(level) > @intFromEnum(std.log.Level.warn)) return;
+    if (written > log_cap and @backingInt(level) > @backingInt(std.log.Level.warn)) return;
     var sbuf: [256]u8 = undefined;
     const ls = std.debug.lockStderr(&sbuf);
     defer std.debug.unlockStderr();

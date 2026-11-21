@@ -29,18 +29,18 @@ pub fn show() void {
     {
         var r = row(@src(), tr.kill_switch, tr.kill_switch_desc);
         defer r.deinit();
-        var i: usize = @intFromEnum(s.kill_switch);
+        var i: usize = @backingInt(s.kill_switch);
         if (w.segmented(@src(), &.{ tr.ks_off, tr.ks_selective, tr.ks_strict }, &i, .{})) {
-            s.kill_switch = @enumFromInt(i);
+            s.kill_switch = @fromBackingInt(@intCast(i));
             app.markDirty();
         }
     }
     {
         var r = row(@src(), "IPv6", tr.ipv6_desc);
         defer r.deinit();
-        var i: usize = @intFromEnum(s.ipv6);
+        var i: usize = @backingInt(s.ipv6);
         if (w.segmented(@src(), &.{ tr.ipv6_block, tr.ipv6_tunnel, tr.ipv6_system }, &i, .{})) {
-            s.ipv6 = @enumFromInt(i);
+            s.ipv6 = @fromBackingInt(@intCast(i));
             app.markDirty();
         }
     }
@@ -54,9 +54,9 @@ pub fn show() void {
     {
         var r = row(@src(), tr.mode, tr.mode_desc);
         defer r.deinit();
-        var i: usize = @intFromEnum(s.tunnel_mode);
+        var i: usize = @backingInt(s.tunnel_mode);
         if (w.segmented(@src(), &.{ "TUN", tr.mode_proxy }, &i, .{})) {
-            s.tunnel_mode = @enumFromInt(i);
+            s.tunnel_mode = @fromBackingInt(@intCast(i));
             app.markDirty();
         }
     }
@@ -79,10 +79,6 @@ pub fn show() void {
         if (switchRow(@src(), tr.launch_at_login, null, &on)) app.setLaunchAtLogin(on);
     }
     _ = switchRow(@src(), tr.auto_connect, null, &s.auto_connect);
-
-    section(@src(), tr.sec_notifications);
-    _ = switchRow(@src(), tr.notifications, tr.notifications_desc, &s.notifications);
-    _ = switchRow(@src(), tr.sound, null, &s.sounds);
 
     section(@src(), tr.sec_interface);
     if (switchRow(@src(), tr.reduce_motion, null, &s.reduce_motion)) dvui.reduce_motion = s.reduce_motion;

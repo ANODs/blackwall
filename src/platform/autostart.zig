@@ -73,7 +73,7 @@ fn applyOrFail(gpa: std.mem.Allocator, io: Io, env: Env, on: bool) !void {
             const value = try std.unicode.utf8ToUtf16LeAllocZ(gpa, quoted);
             defer gpa.free(value);
             const bytes: w.DWORD = @intCast((value.len + 1) * 2);
-            if (RegSetKeyValueW(w.HKEY_CURRENT_USER, run_key, name, @intFromEnum(w.REG.ValueType.SZ), value.ptr, bytes) != 0)
+            if (RegSetKeyValueW(w.HKEY_CURRENT_USER, run_key, name, @backingInt(w.REG.ValueType.SZ), value.ptr, bytes) != 0)
                 return error.RegistryFailed;
         },
         else => {},

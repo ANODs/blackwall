@@ -433,7 +433,7 @@ pub const Link = struct {
             return true;
         }
         if (l.pid <= 0) return false;
-        if (c.kill(l.pid, @enumFromInt(0)) == 0 or c.errno(@as(c_int, -1)) != .SRCH) return false;
+        if (c.kill(l.pid, @fromBackingInt(@intCast(0))) == 0 or c.errno(@as(c_int, -1)) != .SRCH) return false;
         l.pid = 0;
         return true;
     }

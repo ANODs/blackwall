@@ -73,6 +73,13 @@ pub const Config = struct {
     /// ask, through the server in use, where it exits to the internet
     /// (failover.zig); `mainExit` tells
     check_exit: bool = false,
+    /// IPv6 "block": flows to IPv6 addresses are refused here, whatever the
+    /// route (names never resolve to one: AAAA is answered empty)
+    block_ipv6: bool = false,
+    /// answer address lookups with fake addresses, so a flow arrives with
+    /// its name and the server resolves it. Off ("DNS through the route"
+    /// off): every query goes to the network's own resolver
+    fake_dns: bool = true,
 };
 
 /// Finds which application owns a flow; writes a stable identity (macOS:
@@ -236,10 +243,31 @@ pub const Tunnel = struct {
         t.main_mutex.lockUncancelable(t.io);
         for (t.main_conns.items) |key| t.stack.abortKey(key);
         t.main_mutex.unlock(t.io);
+        t.endSessions();
+    }
+
+    /// End every UDP session: taken out of the map, each with a reference
+    /// of its own, and shut once the lock is let go (a session's downlink may
+    /// sit in a read from its server until the stream is shut).
+    fn endSessions(t: *Tunnel) void {
+        var ended: std.ArrayList(*UdpSession) = .empty;
+        defer ended.deinit(t.gpa);
         t.udp_mutex.lockUncancelable(t.io);
         var it = t.sessions.valueIterator();
-        while (it.next()) |x| x.*.closed.store(true, .release);
+        while (it.next()) |x| {
+            if (ended.append(t.gpa, x.*)) |_| {
+                _ = x.*.refs.fetchAdd(1, .acq_rel);
+            } else |_| {
+                // no memory to list it: it ends at its next idle check
+                x.*.closed.store(true, .release);
+            }
+        }
+        for (ended.items) |x| _ = t.sessions.remove(x.app);
         t.udp_mutex.unlock(t.io);
+        for (ended.items) |x| {
+            x.end();
+            x.release();
+        }
     }
 
     fn holdMain(t: *Tunnel, conn: *tcp.Conn) bool {
@@ -273,7 +301,15 @@ pub const Tunnel = struct {
             for (suffix) |*ch| ch.* = std.ascii.toLower(ch.*);
             dst.* = .{ .suffix = suffix, .choice = src.choice };
         }
-        return .{ .default = cfg.default, .unknown = cfg.unknown, .rules = rules, .domains = doms, .outbounds = obs, .main = try a.dupe(u16, cfg.main), .dns_exclusions = ex, .drop_quic = cfg.drop_quic, .check_exit = cfg.check_exit };
+        // every plain field as it is (a new one must not be lost here);
+        // everything that points somewhere, at the copy
+        var copy = cfg;
+        copy.rules = rules;
+        copy.domains = doms;
+        copy.outbounds = obs;
+        copy.main = try a.dupe(u16, cfg.main);
+        copy.dns_exclusions = ex;
+        return copy;
     }
 
     const Decision = struct {
@@ -418,6 +454,8 @@ pub const Tunnel = struct {
     fn onTcp(ctx: *anyopaque, conn: *tcp.Conn) bool {
         const t: *Tunnel = @ptrCast(@alignCast(ctx));
         if (t.stopping.load(.acquire)) return false;
+        // refused at once, so the application falls back to IPv4
+        if (!packet.isV4(&conn.remote().addr) and t.blocksIpv6()) return false;
         _ = t.workers.fetchAdd(1, .acq_rel);
         const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(proxy.dial_stack_size) }, tcpWorker, .{ t, conn }) catch {
             _ = t.workers.fetchSub(1, .acq_rel);
@@ -494,15 +532,17 @@ pub const Tunnel = struct {
         // their answers came back in: the acknowledgements of every TCP
         // flow waited behind them (issue #5)
         if (packet.isLocalOnly(&dst.addr)) return;
+        if (!packet.isV4(&dst.addr) and t.blocksIpv6()) return;
         if (dst.port == 53) return t.dnsQuery(src, dst, payload);
         t.udpDatagram(src, dst, payload);
     }
 
     fn dnsQuery(t: *Tunnel, src: Endpoint, dst: Endpoint, query: []const u8) void {
         var out: [1500]u8 = undefined;
-        const verdict = blk: {
+        const verdict: dns.Verdict = blk: {
             t.cfg_mutex.lockUncancelable(t.io);
             defer t.cfg_mutex.unlock(t.io);
+            if (!t.cfg.fake_dns) break :blk .forward;
             break :blk dns.answerLocally(&t.fake, query, &out, t.cfg.dns_exclusions);
         };
         switch (verdict) {
@@ -572,6 +612,12 @@ pub const Tunnel = struct {
         return Io.Clock.awake.now(t.io).toMilliseconds();
     }
 
+    fn blocksIpv6(t: *Tunnel) bool {
+        t.cfg_mutex.lockUncancelable(t.io);
+        defer t.cfg_mutex.unlock(t.io);
+        return t.cfg.block_ipv6;
+    }
+
     fn dropQuic(t: *Tunnel) bool {
         t.cfg_mutex.lockUncancelable(t.io);
         defer t.cfg_mutex.unlock(t.io);
@@ -582,7 +628,8 @@ pub const Tunnel = struct {
         const key: UdpKey = .{ .app = src, .remote = dst };
         t.udp_mutex.lockUncancelable(t.io);
         if (t.udp.get(key)) |f| {
-            t.udp_mutex.unlock(t.io);
+            // under the lock: the flow's reader may end and free it at any time
+            defer t.udp_mutex.unlock(t.io);
             return t.udpSend(f, payload);
         }
         if (t.sessions.get(src)) |sess| {
@@ -640,6 +687,8 @@ pub const Tunnel = struct {
             flow.sock.?.close();
             return t.gpa.destroy(flow);
         };
+        // the first datagram goes before the reader exists, which may free the flow
+        t.udpSend(flow, payload);
         t.udp_mutex.unlock(t.io);
         _ = t.workers.fetchAdd(1, .acq_rel);
         const th = std.Thread.spawn(.{ .stack_size = sys.stackSize(128 * 1024) }, udpReader, .{ t, flow }) catch {
@@ -648,7 +697,6 @@ pub const Tunnel = struct {
             return;
         };
         th.detach();
-        t.udpSend(flow, payload);
     }
 
     fn udpSend(t: *Tunnel, f: *UdpFlow, payload: []const u8) void {
@@ -709,10 +757,10 @@ pub const Tunnel = struct {
 
     fn closeAllUdp(t: *Tunnel) void {
         t.udp_mutex.lockUncancelable(t.io);
-        defer t.udp_mutex.unlock(t.io);
         var it = t.udp.valueIterator();
         while (it.next()) |f| f.*.closed.store(true, .release);
-        // XUDP sessions notice `stopping` within a second and close themselves
+        t.udp_mutex.unlock(t.io);
+        t.endSessions();
     }
 
     fn freeDrops(t: *Tunnel) void {
@@ -755,7 +803,8 @@ pub const Tunnel = struct {
         stats: ?*AppStats,
         conn: udp_out.Conn,
         closed: std.atomic.Value(bool) = .init(false),
-        /// threads still using this session (the uplink, then the downlink)
+        /// threads still using this session (the uplink, then the downlink),
+        /// and a server switch ending it
         refs: std.atomic.Value(u8) = .init(1),
         last_ms: std.atomic.Value(i64) = .init(0),
         idle_ms: i64 = udp_idle_ms,
@@ -858,17 +907,25 @@ pub const Tunnel = struct {
             };
         }
 
+        /// End the session from one of its own threads: out of the map, and
+        /// both directions stop.
         fn close(x: *UdpSession) void {
-            if (x.closed.swap(true, .acq_rel)) return;
             const t = x.tunnel;
-            x.mutex.lockUncancelable(t.io);
-            x.cond.broadcast(t.io);
-            x.mutex.unlock(t.io);
             t.udp_mutex.lockUncancelable(t.io);
             if (t.sessions.get(x.app)) |cur| {
                 if (cur == x) _ = t.sessions.remove(x.app);
             }
             t.udp_mutex.unlock(t.io);
+            x.end();
+        }
+
+        /// Stop both directions (once); the caller has taken it out of the map.
+        fn end(x: *UdpSession) void {
+            if (x.closed.swap(true, .acq_rel)) return;
+            const t = x.tunnel;
+            x.mutex.lockUncancelable(t.io);
+            x.cond.broadcast(t.io);
+            x.mutex.unlock(t.io);
             x.conn.close();
         }
 
@@ -1314,4 +1371,49 @@ test "tunnel: flows through the main server are forgotten when they end, also wh
     t.main_mutex.lockUncancelable(t.io);
     defer t.main_mutex.unlock(t.io);
     try std.testing.expectEqual(0, t.main_conns.items.len);
+}
+
+test "tunnel: a server switch ends the UDP sessions through it, and the next datagram starts anew" {
+    const t = try Tunnel.create(std.testing.allocator, std.testing.io, .{});
+    defer t.destroy();
+    // Shadowsocks UDP to a port nobody listens on: the session opens at once
+    const link = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwdw@127.0.0.1:9";
+    try t.setConfig(.{ .default = .{ .outbound = 0 }, .outbounds = &.{try proxy.outboundFromLink(link, "127.0.0.1", 9)}, .drop_quic = false });
+    const app: Endpoint = .{ .addr = packet.v4(.{ 198, 18, 0, 1 }), .port = 50000 };
+    const there: Endpoint = .{ .addr = packet.v4(.{ 203, 0, 113, 9 }), .port = 4000 };
+    t.udpDatagram(app, there, "first");
+    {
+        t.udp_mutex.lockUncancelable(t.io);
+        defer t.udp_mutex.unlock(t.io);
+        try std.testing.expectEqual(1, t.sessions.count());
+    }
+    Tunnel.onSwitch(t);
+    {
+        t.udp_mutex.lockUncancelable(t.io);
+        defer t.udp_mutex.unlock(t.io);
+        // out of the map: its datagrams are no longer dropped into a dead session
+        try std.testing.expectEqual(0, t.sessions.count());
+    }
+    t.udpDatagram(app, there, "after the switch");
+    t.udp_mutex.lockUncancelable(t.io);
+    defer t.udp_mutex.unlock(t.io);
+    try std.testing.expectEqual(1, t.sessions.count());
+}
+
+test "tunnel: IPv6 block refuses flows to IPv6 addresses, and only those" {
+    const t = try Tunnel.create(std.testing.allocator, std.testing.io, .{});
+    defer t.destroy();
+    try t.setConfig(.{ .default = .block, .block_ipv6 = true });
+    const app: Endpoint = .{ .addr = packet.v4(.{ 198, 18, 0, 1 }), .port = 50000 };
+    var v6: packet.Addr = @splat(0);
+    v6[0] = 0x20;
+    v6[1] = 0x01;
+    Tunnel.onUdp(t, app, .{ .addr = v6, .port = 4000 }, "six");
+    Tunnel.onUdp(t, app, .{ .addr = packet.v4(.{ 203, 0, 113, 9 }), .port = 4000 }, "four");
+    t.udp_mutex.lockUncancelable(t.io);
+    defer t.udp_mutex.unlock(t.io);
+    // the IPv4 one reached the routes (and was remembered as blocked there)
+    try std.testing.expectEqual(1, t.udp.count());
+    var keys = t.udp.keyIterator();
+    try std.testing.expect(packet.isV4(&keys.next().?.remote.addr));
 }

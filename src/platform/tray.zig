@@ -68,11 +68,11 @@ pub fn init() void {
         c.SDL_free(@ptrCast(list));
     }
     for (std.enums.values(Look)) |look| {
-        const i = @intFromEnum(look);
+        const i = @backingInt(look);
         paint(&icons[i], look);
         surfaces[i] = c.SDL_CreateSurfaceFrom(icon_px, icon_px, c.SDL_PIXELFORMAT_RGBA32, &icons[i], icon_px * 4);
     }
-    const t = c.SDL_CreateTray(surfaces[@intFromEnum(Look.off)], "BLACKWALL") orelse return;
+    const t = c.SDL_CreateTray(surfaces[@backingInt(Look.off)], "BLACKWALL") orelse return;
     const menu = c.SDL_CreateTrayMenu(t) orelse {
         c.SDL_DestroyTray(t);
         return;
@@ -126,7 +126,7 @@ fn update() void {
     };
     if (shown_look != look) {
         shown_look = look;
-        c.SDL_SetTrayIcon(tray, surfaces[@intFromEnum(look)]);
+        c.SDL_SetTrayIcon(tray, surfaces[@backingInt(look)]);
     }
 
     var buf: [160]u8 = undefined;

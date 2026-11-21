@@ -1140,7 +1140,7 @@ pub const Flow = struct {
                 }
             } else |_| {}
             upstream.close(f.io);
-            s = @enumFromInt((@intFromEnum(s) + 1) % dpi.Strategy.count);
+            s = @fromBackingInt(@intCast((@backingInt(s) + 1) % dpi.Strategy.count));
         }
         f.fault(.unreachable_server);
         local.reset(f.io);

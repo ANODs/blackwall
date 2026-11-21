@@ -46,7 +46,7 @@ pub const Padder = struct {
             n = 16;
             p.uuid = null;
         }
-        out[n] = @intFromEnum(command);
+        out[n] = @backingInt(command);
         std.mem.writeInt(u16, out[n + 1 ..][0..2], @intCast(content.len), .big);
         std.mem.writeInt(u16, out[n + 3 ..][0..2], @intCast(pad), .big);
         n += 5;

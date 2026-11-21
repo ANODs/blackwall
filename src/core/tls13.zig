@@ -454,6 +454,9 @@ pub const HandshakeError = error{
 /// Run the handshake on an established TCP stream. On success `rr` and `rw`
 /// carry application traffic.
 pub fn handshake(io: Io, r: *Io.Reader, w: *Io.Writer, opts: Options, rr: *RecordReader, rw: *RecordWriter) HandshakeError!Negotiated {
+    // a host name is at most 253 bytes; a longer one (a REALITY name comes
+    // straight from the link) would overrun the hello's buffer
+    if (opts.server_name.len > 253) return error.TlsIllegalParameter;
     var random: [32]u8 = undefined;
     io.random(&random);
     const x_kp = X25519.KeyPair.generate(io);
@@ -788,6 +791,8 @@ const LeafKey = struct {
                 switch (parts.modulus.len) {
                     inline 256, 384, 512 => |n| {
                         const pk = Cert.rsa.PublicKey.fromBytes(parts.exponent, parts.modulus) catch return error.TlsBadSignature;
+                        // a longer one would overrun std's copy into the modulus-sized buffer
+                        if (sig.len != n) return error.TlsBadSignature;
                         const signature = Cert.rsa.PSSSignature.fromBytes(n, sig);
                         Cert.rsa.PSSSignature.verify(n, &signature, content, pk, Hash) catch return error.TlsBadSignature;
                     },
@@ -804,9 +809,53 @@ const LeafKey = struct {
     }
 };
 
+/// Whether a certificate (DER) says it is a certificate authority: its
+/// basicConstraints extension with cA true. Malformed means no.
+fn isAuthority(cert: []const u8) bool {
+    const oid_basic_constraints = [_]u8{ 0x55, 0x1D, 0x13 };
+    const outer = derElement(cert, 0) orelse return false;
+    const tbs = derElement(cert, outer.slice.start) orelse return false;
+    var i = tbs.slice.start;
+    while (i < tbs.slice.end) {
+        const field = derElement(cert, i) orelse return false;
+        i = field.slice.end;
+        // extensions: [3] EXPLICIT SEQUENCE OF Extension
+        if (field.identifier.class != .context_specific or @backingInt(field.identifier.tag) != 3) continue;
+        const list = derElement(cert, field.slice.start) orelse return false;
+        var j = list.slice.start;
+        while (j < list.slice.end) {
+            const ext = derElement(cert, j) orelse return false;
+            j = ext.slice.end;
+            const oid = derElement(cert, ext.slice.start) orelse return false;
+            if (!std.mem.eql(u8, cert[oid.slice.start..oid.slice.end], &oid_basic_constraints)) continue;
+            var value = derElement(cert, oid.slice.end) orelse return false;
+            if (value.identifier.tag == .boolean) value = derElement(cert, value.slice.end) orelse return false; // critical
+            // OCTET STRING { SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLen INTEGER OPTIONAL } }
+            const seq = derElement(cert, value.slice.start) orelse return false;
+            if (seq.slice.start == seq.slice.end) return false;
+            const ca = derElement(cert, seq.slice.start) orelse return false;
+            return ca.identifier.tag == .boolean and ca.slice.end - ca.slice.start == 1 and cert[ca.slice.start] != 0;
+        }
+        return false;
+    }
+    return false;
+}
+
+/// One DER element at `i`, or null when it does not fit in `bytes` (std's
+/// parser reads without checking).
+fn derElement(bytes: []const u8, i: u32) ?crypto.Certificate.der.Element {
+    if (@as(usize, i) + 2 > bytes.len) return null;
+    const size = bytes[i + 1];
+    if (size >> 7 != 0 and @as(usize, i) + 2 + (size & 0x7f) > bytes.len) return null;
+    const e = crypto.Certificate.der.Element.parse(bytes, i) catch return null;
+    if (e.slice.start > e.slice.end or e.slice.end > bytes.len) return null;
+    return e;
+}
+
 /// Check a TLS 1.3 Certificate message (leaf first): every certificate is
 /// signed by the next, one of them by a trusted root, all are within their
-/// validity, and the leaf names `host`. Returns the leaf's key.
+/// validity, every one that signs another is a certificate authority, and
+/// the leaf names `host`. Returns the leaf's key.
 fn verifyChain(body: []const u8, host: []const u8, roots: *const crypto.Certificate.Bundle, now_sec: i64) HandshakeError!LeafKey {
     const Cert = crypto.Certificate;
     var c: Cursor = .{ .b = body };
@@ -821,6 +870,10 @@ fn verifyChain(body: []const u8, host: []const u8, roots: *const crypto.Certific
         _ = try list.vec(u16); // per-certificate extensions
         const parsed = (Cert{ .buffer = der, .index = 0 }).parse() catch return error.TlsCertificateUntrusted;
         if (prev) |p| {
+            // std checks names, dates and signatures only: without this, the
+            // holder of any real certificate (one for their own domain) could
+            // sign one for the server's name with it
+            if (!isAuthority(der)) return error.TlsCertificateUntrusted;
             p.verify(parsed, now_sec) catch return error.TlsCertificateUntrusted;
         } else {
             parsed.verifyHostName(host) catch return error.TlsCertificateHostMismatch;
@@ -1023,7 +1076,7 @@ fn buildClientHello(
     for (order) |ext| {
         if (ext == .server_name and (server_name.len == 0 or isIpLiteral(server_name))) continue;
         if (ext == .application_settings and shape.alpn == .http11) continue;
-        b.int16(@intFromEnum(ext));
+        b.int16(@backingInt(ext));
         const body = b.open(2);
         switch (ext) {
             .server_name => {
@@ -1052,7 +1105,7 @@ fn buildClientHello(
                 .h2 => &.{ 0, 3, 2, 'h', '2' },
             }),
             .sct, .extended_master_secret, .session_ticket => {},
-            .compress_certificate => b.bytes(&.{ 2, 0, @intFromEnum(shape.cert_compression) }),
+            .compress_certificate => b.bytes(&.{ 2, 0, @backingInt(shape.cert_compression) }),
             .supported_versions => {
                 b.byte(6);
                 b.int16(g_version);
@@ -1212,4 +1265,41 @@ test "every handshake path compiles" {
     _ = &verifyChain;
     _ = &LeafKey.verifyCertificateVerify;
     _ = &decompressCertificate;
+}
+
+test "a chain is trusted only through certificate authorities" {
+    const gpa = std.testing.allocator;
+    // made with openssl: a root, a certificate for own.example (CA:FALSE)
+    // signed by it, and one for victim.example signed by that certificate
+    var roots: crypto.Certificate.Bundle = .empty;
+    defer roots.deinit(gpa);
+    const now: i64 = 1_800_000_000; // January 2027
+    try addPem(&roots, gpa, @embedFile("testdata/root.pem"), now);
+    const own = @embedFile("testdata/own.der");
+    const forged = @embedFile("testdata/forged.der");
+
+    var buf: [2048]u8 = undefined;
+    // the holder's own certificate is fine for their own name
+    _ = try verifyChain(testCertificateMessage(&buf, &.{own}), "own.example", &roots, now);
+    // but it signs nothing: the forged one fails however it is presented
+    try std.testing.expectError(error.TlsCertificateUntrusted, verifyChain(testCertificateMessage(&buf, &.{ forged, own }), "victim.example", &roots, now));
+    try std.testing.expect(!isAuthority(own));
+    try std.testing.expect(isAuthority(roots.bytes.items));
+    // malformed input is no authority, and no crash
+    try std.testing.expect(!isAuthority(own[0..40]));
+    try std.testing.expect(!isAuthority(&.{ 0x30, 0x84 }));
+}
+
+/// A TLS 1.3 Certificate message of these DER certificates, leaf first.
+fn testCertificateMessage(buf: []u8, certs: []const []const u8) []const u8 {
+    var n: usize = 4; // empty request context, then the list's length
+    buf[0] = 0;
+    for (certs) |c| {
+        std.mem.writeInt(u24, buf[n..][0..3], @intCast(c.len), .big);
+        @memcpy(buf[n + 3 ..][0..c.len], c);
+        std.mem.writeInt(u16, buf[n + 3 + c.len ..][0..2], 0, .big);
+        n += 3 + c.len + 2;
+    }
+    std.mem.writeInt(u24, buf[1..4], @intCast(n - 4), .big);
+    return buf[0..n];
 }

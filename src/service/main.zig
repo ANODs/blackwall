@@ -99,7 +99,7 @@ var logged = std.atomic.Value(usize).init(0);
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
     const so_far = logged.load(.monotonic);
     if (so_far > 2 * events_max) return;
-    if (so_far > events_max and @intFromEnum(level) > @intFromEnum(std.log.Level.warn)) return;
+    if (so_far > events_max and @backingInt(level) > @backingInt(std.log.Level.warn)) return;
     std.log.defaultLog(level, scope, format, args);
     if (if (on_windows) events_fd == null else events_fd < 0) {
         _ = logged.fetchAdd(80, .monotonic);
@@ -201,7 +201,8 @@ const Service = struct {
             }
         }
         if (s.via_helper and builtin.os.tag.isDarwin()) darwin.helper.servers(s.gpa, s.io, s.server_ips.items);
-        s.applyFirewall();
+        // a reload keeps the rules in place when new ones fail: they still hold
+        s.applyFirewall() catch |err| log.err("kill switch not updated: {t}", .{err});
         if (s.t) |t| try t.setConfig(b.cfg);
         if (s.built) |*old| old.deinit();
         s.built = b;
@@ -298,7 +299,8 @@ const Service = struct {
                 } else return error.Unsupported,
             };
             s.tun_fd = fd;
-            s.applyFirewall();
+            // the strict kill switch is what was asked for: no start without it
+            try s.applyFirewall();
             const t = try tunnel.Tunnel.create(s.gpa, s.io, .{ .mtu = s.args.mtu, .bind = bind, .upstream_dns = dns_servers, .lookup = lookup });
             errdefer t.destroy();
             try t.setConfig(s.built.?.cfg);
@@ -356,7 +358,7 @@ const Service = struct {
         for (lease.dns[0..lease.dns_len]) |ip| s.addDns(ip);
         for (core.ipstack.dns.Resolver.public_servers) |e| s.addDns(e.addr[12..16].*);
         log.info("adapter {d}, own traffic on interface {d}, {d} resolvers captured", .{ lease.index, lease.bind_index, lease.dns_len });
-        s.applyFirewall();
+        try s.applyFirewall();
         s.owners = .init(s.gpa, s.io);
         const lookup: tunnel.AppLookup = .{ .ctx = &s.owners, .find = findWinApp };
         const t = try tunnel.Tunnel.create(s.gpa, s.io, .{ .mtu = s.args.mtu, .bind = .{ .index = lease.bind_index }, .upstream_dns = dns_servers, .lookup = lookup });
@@ -398,7 +400,7 @@ const Service = struct {
             // which never gets here) leaves the device holding it
             if (s.own_device and !s.keep_capture) {
                 linux.release(fd);
-                s.runTunTool(&.{"open"});
+                s.runTunTool(&.{"open"}) catch {};
             }
             if (builtin.os.tag == .linux and s.own_device) s.owners.deinit();
             _ = c.close(fd);
@@ -427,34 +429,35 @@ const Service = struct {
 
     /// The strict kill switch on Linux: an nftables table that outlives the
     /// service (nft.zig), set and removed by blackwall-tun.
-    fn applyFirewall(s: *Service) void {
+    /// Fails only where the strict kill switch was asked for and could not
+    /// be set; lifting it never fails the caller.
+    fn applyFirewall(s: *Service) !void {
         if (comptime on_windows) return s.applyWfp();
         if (builtin.os.tag != .linux or !s.own_device) return;
-        if (s.killSwitch() != .strict) return s.runTunTool(&.{"open"});
+        if (s.killSwitch() != .strict) return s.runTunTool(&.{"open"}) catch {};
         var servers: std.ArrayList(u8) = .empty;
         defer servers.deinit(s.gpa);
         for (s.server_ips.items, 0..) |ip, i| {
-            if (i > 0) servers.append(s.gpa, ',') catch return;
-            servers.appendSlice(s.gpa, ip) catch return;
+            if (i > 0) try servers.append(s.gpa, ',');
+            try servers.appendSlice(s.gpa, ip);
         }
         var dns: std.ArrayList(u8) = .empty;
         defer dns.deinit(s.gpa);
         for (s.dns4[0..s.dns4_len], 0..) |ip, i| {
             var b: [16]u8 = undefined;
-            const t = std.fmt.bufPrint(&b, "{s}{d}.{d}.{d}.{d}", .{ if (i > 0) "," else "", ip[0], ip[1], ip[2], ip[3] }) catch return;
-            dns.appendSlice(s.gpa, t) catch return;
+            try dns.appendSlice(s.gpa, try std.fmt.bufPrint(&b, "{s}{d}.{d}.{d}.{d}", .{ if (i > 0) "," else "", ip[0], ip[1], ip[2], ip[3] }));
         }
         var argv_buf: [8][]const u8 = undefined;
         var argv: std.ArrayList([]const u8) = .initBuffer(&argv_buf);
         argv.appendSliceAssumeCapacity(&.{ "strict", "--servers", servers.items, "--dns", dns.items });
         if (s.settings.allow_lan) argv.appendAssumeCapacity("--lan");
         if (s.settings.ipv6 == .block) argv.appendAssumeCapacity("--ipv6-block");
-        s.runTunTool(argv.items);
+        try s.runTunTool(argv.items);
     }
 
     /// Windows: filters that hold the traffic when the service is gone
     /// (wfp.zig); off removes them.
-    fn applyWfp(s: *Service) void {
+    fn applyWfp(s: *Service) !void {
         if (comptime !on_windows) return;
         const lease = s.lease orelse return;
         const mode: wfp.Mode = switch (s.killSwitch()) {
@@ -463,11 +466,17 @@ const Service = struct {
             .strict => .strict,
         };
         var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const n = std.process.executablePath(s.io, &exe_buf) catch return log.err("kill switch: no executable path", .{});
-        var servers: [32][4]u8 = undefined;
+        const n = std.process.executablePath(s.io, &exe_buf) catch |err| {
+            log.err("kill switch: no executable path", .{});
+            return err;
+        };
+        var servers: [wfp.max_servers][4]u8 = undefined;
         var count: usize = 0;
         for (s.server_ips.items) |ip| {
-            if (count == servers.len) break;
+            if (count == servers.len) {
+                log.warn("kill switch: only the first {d} servers are let through", .{servers.len});
+                break;
+            }
             const a = std.Io.net.Ip4Address.parse(ip, 0) catch continue;
             servers[count] = a.bytes;
             count += 1;
@@ -480,24 +489,33 @@ const Service = struct {
             .dns4 = s.dns4[0..s.dns4_len],
             .allow_lan = s.settings.allow_lan,
             .ipv6_block = s.settings.ipv6 == .block,
-        }) catch |err| log.err("kill switch: {t}", .{err});
+        }) catch |err| {
+            log.err("kill switch: {t}", .{err});
+            // selective only spares the service its own filters: without
+            // them it still runs, as before the switch was set
+            if (mode == .strict) return error.KillSwitchFailed;
+        };
     }
 
     /// blackwall-tun next to this executable, with `args`.
-    fn runTunTool(s: *Service, args: []const []const u8) void {
+    fn runTunTool(s: *Service, args: []const []const u8) !void {
         if (builtin.os.tag != .linux) return;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const tool = tunToolPath(&path_buf) orelse return;
+        const tool = tunToolPath(&path_buf) orelse return error.KillSwitchFailed;
         var argv_buf: [10][]const u8 = undefined;
         var argv: std.ArrayList([]const u8) = .initBuffer(&argv_buf);
         argv.appendAssumeCapacity(tool);
         argv.appendSliceAssumeCapacity(args);
         var child = std.process.spawn(s.io, .{ .argv = argv.items, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit }) catch |err| {
             log.err("blackwall-tun {s}: {t}", .{ args[0], err });
-            return;
+            return error.KillSwitchFailed;
         };
-        const term = child.wait(s.io) catch return;
-        if (term != .exited or term.exited != 0) log.err("blackwall-tun {s} failed", .{args[0]}) else log.info("kill switch: {s}", .{args[0]});
+        const term = child.wait(s.io) catch return error.KillSwitchFailed;
+        if (term != .exited or term.exited != 0) {
+            log.err("blackwall-tun {s} failed", .{args[0]});
+            return error.KillSwitchFailed;
+        }
+        log.info("kill switch: {s}", .{args[0]});
     }
 
     /// Why the service could not start, for the window to show.
@@ -828,7 +846,7 @@ fn resolve4(gpa: std.mem.Allocator, io: Io, host: []const u8) ?[]const u8 {
     hints.family = c.AF.INET;
     hints.socktype = c.SOCK.STREAM;
     var res: ?*c.addrinfo = null;
-    if (@intFromEnum(c.getaddrinfo(&name, null, &hints, &res)) != 0) return null;
+    if (@backingInt(c.getaddrinfo(&name, null, &hints, &res)) != 0) return null;
     defer if (res) |r| c.freeaddrinfo(r);
     const ai = res orelse return null;
     const sa: *const c.sockaddr.in = @ptrCast(@alignCast(ai.addr orelse return null));
@@ -908,6 +926,8 @@ fn upgradeWindows(init: std.process.Init, dir: []const u8) !void {
     defer gpa.free(sig);
     const key = build_options.update_pubkey;
     if (key.len == 0) return log.err("upgrade: this build trusts no signature", .{});
+    // the release key also signs the macOS helper: only a Windows program may be one
+    if (!core.helper_ipc.isProgram(.windows_service, bytes)) return log.err("upgrade: not a Windows program", .{});
     const signed = core.helper_ipc.Signed.parse(sig) orelse return log.err("upgrade: no signature", .{});
     core.helper_ipc.verifyHelper(key, signed, bytes) catch return log.err("upgrade: the signature does not match", .{});
     const theirs = std.SemanticVersion.parse(signed.version) catch return log.err("upgrade: bad release", .{});

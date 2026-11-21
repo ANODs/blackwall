@@ -96,7 +96,7 @@ fn row(cf: *const app.Conflict, i: usize) void {
         });
         defer badge.deinit();
         const n = cf.name();
-        const first = if (n.len > 0) n[0..std.unicode.utf8ByteSequenceLength(n[0]) catch 1] else "?";
+        const first = if (n.len > 0) n[0 .. std.unicode.utf8ByteSequenceLength(n[0]) catch 1] else "?";
         w.text(@src(), first, th.semibold(13), th.text, .{ .gravity_x = 0.5, .gravity_y = 0.5 });
     }
     w.gap(@src(), 12, 0);

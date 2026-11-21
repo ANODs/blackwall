@@ -132,7 +132,15 @@ const cond_app_id = guid("d78e1e87-8644-4ea5-9437-d809ecefc971");
 /// up from it in Data1).
 const sublayer_key = guid("8c1a4f60-2b7e-4d1a-9f3b-6e2c5a7d0b10");
 const filter_key_base = guid("8c1a4f61-2b7e-4d1a-9f3b-6e2c5a7d0b10");
+/// Kept at 64 (older releases remove this many after a rollback): the
+/// rules take about a dozen, whatever the number of servers.
 const filters_max = 64;
+/// Addresses one permit holds; the service passes no more.
+pub const max_servers = 64;
+
+fn remoteV4(ip: [4]u8) FWPM_FILTER_CONDITION0 {
+    return .{ .field = cond_remote_address, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT32, .value = std.mem.readInt(u32, &ip, .big) } };
+}
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -272,16 +280,19 @@ const Builder = struct {
             try b.permit(layer_connect_v4, &me);
             try b.permit(layer_connect_v6, &me);
         } else {
-            for (o.servers4) |ip| {
-                const to = [_]FWPM_FILTER_CONDITION0{.{ .field = cond_remote_address, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT32, .value = std.mem.readInt(u32, &ip, .big) } }};
-                try b.permit(layer_connect_v4, &to);
+            // One filter for all the servers, one for all the resolvers:
+            // conditions on the same field are OR'ed, on different ones AND'ed.
+            // A filter per address ran past `filters_max` with a long list.
+            var conds: [max_servers + 1]FWPM_FILTER_CONDITION0 = undefined;
+            if (o.servers4.len > 0) {
+                for (o.servers4[0..@min(o.servers4.len, max_servers)], 0..) |ip, i| conds[i] = remoteV4(ip);
+                try b.permit(layer_connect_v4, conds[0..@min(o.servers4.len, max_servers)]);
             }
-            for (o.dns4) |ip| {
-                const to = [_]FWPM_FILTER_CONDITION0{
-                    .{ .field = cond_remote_address, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT32, .value = std.mem.readInt(u32, &ip, .big) } },
-                    .{ .field = cond_remote_port, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT16, .value = 53 } },
-                };
-                try b.permit(layer_connect_v4, &to);
+            if (o.dns4.len > 0) {
+                const n = @min(o.dns4.len, max_servers);
+                for (o.dns4[0..n], 0..) |ip, i| conds[i] = remoteV4(ip);
+                conds[n] = .{ .field = cond_remote_port, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT16, .value = 53 } };
+                try b.permit(layer_connect_v4, conds[0 .. n + 1]);
             }
         }
 
@@ -295,28 +306,22 @@ const Builder = struct {
                 .{ .addr = 0xe0000000, .mask = 0xf0000000 },
                 .{ .addr = 0xffffffff, .mask = 0xffffffff },
             };
-            for (&lan4) |*m| {
-                for ([_]u16{ 53, 853 }) |port| {
-                    const dns_there = [_]FWPM_FILTER_CONDITION0{
-                        .{ .field = cond_remote_address, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_V4_ADDR_MASK, .value = @intFromPtr(m) } },
-                        .{ .field = cond_remote_port, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT16, .value = port } },
-                    };
-                    // a block that weighs more than the permit below
-                    try b.add(layer_connect_v4, FWP_ACTION_BLOCK, 12, &dns_there);
-                }
-                const there = [_]FWPM_FILTER_CONDITION0{.{ .field = cond_remote_address, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_V4_ADDR_MASK, .value = @intFromPtr(m) } }};
-                try b.permit(layer_connect_v4, &there);
-            }
+            var there: [lan4.len + 2]FWPM_FILTER_CONDITION0 = undefined;
+            for (&lan4, 0..) |*m, i| there[i] = .{ .field = cond_remote_address, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_V4_ADDR_MASK, .value = @intFromPtr(m) } };
+            there[lan4.len] = .{ .field = cond_remote_port, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT16, .value = 53 } };
+            there[lan4.len + 1] = .{ .field = cond_remote_port, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT16, .value = 853 } };
+            // name lookups to any of them: a block that weighs more than the permit
+            try b.add(layer_connect_v4, FWP_ACTION_BLOCK, 12, &there);
+            try b.permit(layer_connect_v4, there[0..lan4.len]);
             if (!o.ipv6_block) {
                 const lan6 = [_]FWP_V6_ADDR_AND_MASK{
                     .{ .addr = .{ 0xfe, 0x80 } ++ @as([14]u8, @splat(0)), .prefix = 10 },
                     .{ .addr = .{ 0xfc, 0 } ++ @as([14]u8, @splat(0)), .prefix = 7 },
                     .{ .addr = .{ 0xff, 0 } ++ @as([14]u8, @splat(0)), .prefix = 8 },
                 };
-                for (&lan6) |*m| {
-                    const there = [_]FWPM_FILTER_CONDITION0{.{ .field = cond_remote_address, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_V6_ADDR_MASK, .value = @intFromPtr(m) } }};
-                    try b.permit(layer_connect_v6, &there);
-                }
+                var there6: [lan6.len]FWPM_FILTER_CONDITION0 = undefined;
+                for (&lan6, &there6) |*m, *c| c.* = .{ .field = cond_remote_address, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_V6_ADDR_MASK, .value = @intFromPtr(m) } };
+                try b.permit(layer_connect_v6, &there6);
             }
         }
 

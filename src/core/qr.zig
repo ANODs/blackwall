@@ -65,7 +65,7 @@ fn rawDataModules(ver: u8) usize {
 }
 
 fn dataCodewords(ver: u8, ecc: Ecc) usize {
-    const e = @intFromEnum(ecc);
+    const e = @backingInt(ecc);
     return rawDataModules(ver) / 8 - @as(usize, ecc_per_block[e][ver]) * num_blocks[e][ver];
 }
 
@@ -390,7 +390,7 @@ pub fn encode(text: []const u8, ecc: Ecc, mask: u3, out: *Grid) EncodeError!u8 {
 
     // blocks with their error correction, interleaved
     var all: [3706]u8 = undefined;
-    const e = @intFromEnum(ecc);
+    const e = @backingInt(ecc);
     const nb: usize = num_blocks[e][ver];
     const eb: usize = ecc_per_block[e][ver];
     const raw = rawDataModules(ver) / 8;
@@ -523,7 +523,7 @@ pub fn readGrid(g: *const Grid, out: []u8) ReadError![]u8 {
     }
 
     // de-interleave and correct each block
-    const e = @intFromEnum(ecc);
+    const e = @backingInt(ecc);
     const nb: usize = num_blocks[e][ver];
     const eb: usize = ecc_per_block[e][ver];
     const short_len = raw / nb;

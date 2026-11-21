@@ -965,12 +965,21 @@ pub const Udp = struct {
                 var header: [16]u8 = undefined;
                 blockDecrypt(m, &u.key, pkt[0..16], &header);
                 const id = std.mem.readInt(u64, header[8..16], .big);
-                const s = u.server(header[0..8].*, true);
+                const sid = header[0..8].*;
+                // a session not seen before takes a slot only once its packet
+                // opens: forged headers must not push out the real sessions
+                // (and their replay windows)
+                const known = u.find(sid);
+                var fresh: ServerSession = undefined;
+                const s = known orelse blk: {
+                    fresh = .{ .id = sid, .aead = SessionAead.of(u.method, &u.key, &sid) };
+                    break :blk &fresh;
+                };
                 if (!s.window.check(id)) return error.SsReplay;
                 const body = pkt[16 .. pkt.len - tag_len];
                 s.aead.?.open(body, pkt[pkt.len - tag_len ..][0..tag_len].*, header[4..16].*) catch return error.SsAuthFailed;
                 const d = try u.parseBody(io, body);
-                s.window.mark(id);
+                (known orelse u.install(fresh)).window.mark(id);
                 return d;
             },
             .blake3_chacha20_poly1305 => {
@@ -979,21 +988,27 @@ pub const Udp = struct {
                 crypto.aead.chacha_poly.XChaCha20Poly1305.decrypt(body, body, pkt[pkt.len - tag_len ..][0..tag_len].*, "", pkt[0..24].*, u.key) catch
                     return error.SsAuthFailed;
                 const id = std.mem.readInt(u64, body[8..16], .big);
-                const s = u.server(body[0..8].*, false);
-                if (!s.window.check(id)) return error.SsReplay;
+                const sid = body[0..8].*;
+                const known = u.find(sid);
+                if (known) |s| if (!s.window.check(id)) return error.SsReplay;
                 const d = try u.parseBody(io, body[16..]);
-                s.window.mark(id);
+                (known orelse u.install(.{ .id = sid, .aead = null })).window.mark(id);
                 return d;
             },
         }
     }
 
-    /// The server session `id`: a known one, or the older slot made over.
-    fn server(u: *Udp, id: [8]u8, aes: bool) *ServerSession {
+    /// The server session `id`, when one is kept.
+    fn find(u: *Udp, id: [8]u8) ?*ServerSession {
         for (&u.servers) |*slot| if (slot.*) |*s| if (std.mem.eql(u8, &s.id, &id)) return s;
+        return null;
+    }
+
+    /// Keep an authenticated session in the older slot.
+    fn install(u: *Udp, session: ServerSession) *ServerSession {
         const slot = &u.servers[u.next_slot];
         u.next_slot +%= 1;
-        slot.* = .{ .id = id, .aead = if (aes) SessionAead.of(u.method, &u.key, &id) else null };
+        slot.* = session;
         return &slot.*.?;
     }
 
@@ -1751,4 +1766,30 @@ test "UDP: every method there and back, replays and strangers refused" {
 test "UDP: a relay's identity headers are not carried" {
     const ss: Shadowsocks = try .init(.blake3_aes_128_gcm, "AAECAwQFBgcICQoLDA0ODw==:AAECAwQFBgcICQoLDA0ODw==", "h", 1);
     try testing.expectError(error.UdpNotSupported, Udp.init(testing.io, &ss));
+}
+
+test "UDP 2022: forged packets do not push the server's session out" {
+    const io = testing.io;
+    for ([_]Method{ .blake3_aes_128_gcm, .blake3_aes_256_gcm, .blake3_chacha20_poly1305 }) |m| {
+        const password = if (m.keyLen() == 16) "AAECAwQFBgcICQoLDA0ODw==" else "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        const ss: Shadowsocks = try .init(m, password, "h", 1);
+        var u: Udp = try .init(io, &ss);
+        defer u.deinit();
+        var server: TestUdpServer = .{ .method = m, .key = ss.key };
+        const to = Target.fromDomain("dns.example", 53);
+        var buf: [2048]u8 = undefined;
+        const got = try server.openClient(try u.seal(io, &buf, &to, "query"));
+        const from = Target.fromDomain("dns.example", 53);
+        var ans_buf: [2048]u8 = undefined;
+        _ = try u.open(io, try server.sealAnswer(io, &ans_buf, got.client_session, &from, "answer"));
+        const real = u.servers[0].?.id;
+        // anyone can send bytes that decrypt to some session id
+        var forged: [64]u8 = undefined;
+        for (0..2) |i| {
+            @memset(&forged, @intCast(0x40 + i));
+            if (u.open(io, &forged)) |_| return error.TestUnexpectedResult else |_| {}
+        }
+        try testing.expect(u.find(real) != null);
+        try testing.expect(u.servers[1] == null);
+    }
 }

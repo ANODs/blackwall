@@ -336,7 +336,7 @@ pub fn connectTcp(addr: *const Addr, port: u16, bind: Bind, timeout_ms: i32) Err
         var err: c_int = 0;
         var elen: c.socklen_t = @sizeOf(c_int);
         if (c.getsockopt(fd, c.SOL.SOCKET, c.SO.ERROR, &err, &elen) != 0) return error.ConnectFailed;
-        if (err != 0) return mapConnectErrno(@enumFromInt(err));
+        if (err != 0) return mapConnectErrno(@fromBackingInt(@intCast(err)));
     }
     setNonblocking(fd, false);
     const one: c_int = 1;
@@ -440,7 +440,12 @@ const PosixUdp = struct {
     pub fn recv(u: PosixUdp, buf: []u8, timeout_ms: i32) Error!usize {
         if (!waitFd(u.fd, false, timeout_ms)) return error.Timeout;
         const rc = c.recv(u.fd, buf.ptr, buf.len, 0);
-        if (rc < 0) return error.RecvFailed;
+        if (rc < 0) return switch (c.errno(rc)) {
+            // a signal, or an ICMP "port unreachable" from an earlier send:
+            // the flow goes on, as WinUdp's does
+            .INTR, .CONNREFUSED => error.Timeout,
+            else => error.RecvFailed,
+        };
         return @intCast(rc);
     }
 };

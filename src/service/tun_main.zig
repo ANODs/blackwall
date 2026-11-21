@@ -30,6 +30,12 @@ pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(a);
     if (argv.len < 2) return usage();
+    // the capability is on the file, so anyone who can run it would get a
+    // device carrying the whole machine's traffic: only its owner may
+    if (!ownerRuns()) {
+        std.debug.print("blackwall-tun: only the user who installed it may run it\n", .{});
+        return error.NotPermitted;
+    }
     if (std.mem.eql(u8, argv[1], "release")) {
         linux.remove();
         nftApply(init.io, nft.open_script) catch {};
@@ -92,6 +98,16 @@ pub fn main(init: std.process.Init) !void {
     try fdpass.sendFd(s, lease.fd, line.written());
 }
 
+/// Whether the real user is this file's owner (or root).
+fn ownerRuns() bool {
+    const uid = c.getuid();
+    if (uid == 0) return true;
+    const L = std.os.linux;
+    var st: L.Statx = undefined;
+    if (L.errno(L.statx(L.AT.FDCWD, "/proc/self/exe", 0, .{ .UID = true }, &st)) != .SUCCESS) return false;
+    return st.mask.UID and st.uid == uid;
+}
+
 fn usage() error{Usage} {
     std.debug.print("usage: blackwall-tun up --sock FD [--mtu N] [--hold] [--ipv6] | strict --servers A,B --dns C,D [--lan] [--ipv6-block] | open | release\n", .{});
     return error.Usage;
@@ -124,8 +140,13 @@ fn nftApply(io: std.Io, script: []const u8) !void {
     // close-on-exec: nft must not inherit the write end, or it never sees
     // the end of its input (its stdin is a dup, which drops the flag)
     if (c.pipe2(&pipe, .{ .CLOEXEC = true }) != 0) return error.PipeFailed;
+    // nft runs with the capability: nothing of the caller's environment
+    // may steer it (glibc scrubs only part of it for a capable program)
+    var no_env: std.process.Environ.Map = .init(std.heap.page_allocator);
+    defer no_env.deinit();
     var child = std.process.spawn(io, .{
         .argv = &.{ exe, "-f", "-" },
+        .environ_map = &no_env,
         .stdin = .{ .file = .{ .handle = pipe[0], .flags = .{ .nonblocking = false } } },
         .stdout = .ignore,
         .stderr = .inherit,

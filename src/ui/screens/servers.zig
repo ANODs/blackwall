@@ -58,9 +58,20 @@ pub fn show() void {
                     if (sv.sub_id == sub.id) serverRow(sv, i);
                 }
             }
+            // what a row asked for is done after the rows are drawn: both
+            // may remove servers from the list being walked
             if (remove) |id| {
                 app.state.removeSubscription(id);
                 app.markDirty();
+            }
+            if (pending_remove) |id| {
+                pending_remove = null;
+                app.state.removeServer(id);
+                app.markDirty();
+            }
+            if (pending_select) |id| {
+                pending_select = null;
+                app.selectServer(id);
             }
         }
     }
@@ -204,8 +215,7 @@ fn serverMenu(sv: *const model.Server, i: usize, rect: dvui.Rect.Physical) void 
         fm.close();
     }
     if (by_hand and menuText(tr.remove, 2)) {
-        app.state.removeServer(sv.id);
-        app.markDirty();
+        pending_remove = sv.id;
         fm.close();
     }
 }
@@ -268,6 +278,10 @@ fn autoRow() void {
     w.gap(@src(), 36, 0);
 }
 
+/// A row's click and its menu's "Remove", applied by `show` after the list.
+var pending_select: ?u32 = null;
+var pending_remove: ?u32 = null;
+
 fn serverRow(sv: *model.Server, i: usize) void {
     const selected = app.state.settings.selected_server == sv.id;
     var hb = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = i, .expand = .horizontal });
@@ -276,7 +290,7 @@ fn serverRow(sv: *model.Server, i: usize) void {
 
     var bw: dvui.ButtonWidget = undefined;
     rowButton(&bw, @src(), i, selected);
-    if (bw.clicked() and sv.available) app.selectServer(sv.id);
+    if (bw.clicked() and sv.available) pending_select = sv.id;
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer row.deinit();

@@ -1,7 +1,6 @@
 name: Release
 
-# One app, one codebase, three languages. A v<version> tag (or "Run workflow", which then creates
-# the tag) builds every language for every platform and publishes three GitHub releases:
+# One app, one codebase, three languages. A v<version> tag (or "Run workflow" on main) builds every language for every platform and publishes three GitHub releases:
 #   v<version>-en  "BLACKWALL <version>"            notes: docs/releases/<version>/en.md  (marked Latest)
 #   v<version>-ru  "BLACKWALL <version> — Русский"  notes: docs/releases/<version>/ru.md
 #   v<version>-zh  "BLACKWALL <version> — 中文"      notes: docs/releases/<version>/zh.md
@@ -24,8 +23,9 @@ on:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
 
+# Only the publishing job writes to the repository (it creates the releases).
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -54,10 +54,16 @@ jobs:
       - uses: actions/checkout@v7
       - id: v
         run: |
-          version=$(sed -n 's/^ *\.version = "\(.*\)",.*/\1/p' build.zig.zon)
+          # the package's own version: four spaces in, not a dependency's
+          version=$(sed -n 's/^    \.version = "\(.*\)",.*/\1/p' build.zig.zon)
           test -n "$version" || { echo "::error::no version in build.zig.zon"; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME, but build.zig.zon has version $version"
+            exit 1
+          fi
+          # "Run workflow" publishes the commit it runs on: only main's
+          if [ "$GITHUB_REF_TYPE" != tag ] && [ "$GITHUB_REF_NAME" != main ]; then
+            echo "::error::releases are made from main or a v<version> tag, not $GITHUB_REF_NAME"
             exit 1
           fi
           for lang in en ru zh; do
@@ -75,7 +81,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build test
@@ -99,9 +105,10 @@ jobs:
           - { name: windows, runner: ubuntu-latest, target: -Dtarget=x86_64-windows }
           - { name: linux, runner: ubuntu-latest, target: -Dtarget=x86_64-linux-gnu }
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
       # Windows: the app carries wintun.dll (the WireGuard project's signed driver library,
@@ -119,7 +126,8 @@ jobs:
         env:
           # the macOS package signs the root helper inside the app with it, so installed
           # helpers can replace themselves without the administrator (docs/updates.md)
-          BLACKWALL_UPDATE_KEY: ${{ secrets.BLACKWALL_UPDATE_KEY }}
+          # (and the Windows app the service it carries); Linux signs nothing here
+          BLACKWALL_UPDATE_KEY: ${{ matrix.platform.name != 'linux' && secrets.BLACKWALL_UPDATE_KEY || '' }}
         run: |
           # without the keys (a fork) the apps take no updates at all, not
           # even the default ones from the upstream repository
@@ -150,7 +158,7 @@ jobs:
       - uses: actions/checkout@v7
       - if: env.HAS_KEYSTORE != 'true'
         run: echo '::warning::BLACKWALL_ANDROID_KEYSTORE is not set, so this release has no Android package'
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         if: env.HAS_KEYSTORE == 'true'
         with:
           version: ${{ env.ZIG_VERSION }}
@@ -188,7 +196,9 @@ jobs:
   # or without the bundle (no keystore), it warns and succeeds.
   play:
     name: Google Play
-    needs: [version, android]
+    # only a version that was published on GitHub goes to Google Play: a versionCode
+    # spent there cannot be used again
+    needs: [version, android, publish]
     runs-on: ubuntu-latest
     env:
       HAS_PLAY_KEY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
@@ -219,9 +229,13 @@ jobs:
   publish:
     name: Publish ${{ matrix.lang }}
     needs: [version, build, android]
+    permissions:
+      contents: write
     strategy:
       # one release after another, so "Latest" ends up on the English one
       max-parallel: 1
+      # one failed language must not cancel the others: a rerun completes what is missing
+      fail-fast: false
       matrix:
         include:
           - { lang: zh, title: "BLACKWALL ${{ needs.version.outputs.version }} — 中文", latest: false }
@@ -241,7 +255,7 @@ jobs:
           pattern: pkg-android
           path: dist
           merge-multiple: true
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         if: env.UPDATE_PUBKEY != '' && env.HAS_UPDATE_KEY == 'true'
         with:
           version: ${{ env.ZIG_VERSION }}
@@ -262,8 +276,16 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           (cd dist && sha256sum BLACKWALL-* > SHA256SUMS.txt)
-          gh release create "v$VERSION-${{ matrix.lang }}" dist/* \
-            --title "${{ matrix.title }}" \
-            --notes-file "docs/releases/$VERSION/${{ matrix.lang }}.md" \
-            --target "$GITHUB_SHA" \
-            --latest=${{ matrix.latest }}
+          tag="v$VERSION-${{ matrix.lang }}"
+          # a rerun after a half-finished publish completes the release instead of failing on it
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --title "${{ matrix.title }}" \
+              --notes-file "docs/releases/$VERSION/${{ matrix.lang }}.md" --latest=${{ matrix.latest }}
+          else
+            gh release create "$tag" dist/* \
+              --title "${{ matrix.title }}" \
+              --notes-file "docs/releases/$VERSION/${{ matrix.lang }}.md" \
+              --target "$GITHUB_SHA" \
+              --latest=${{ matrix.latest }}
+          fi

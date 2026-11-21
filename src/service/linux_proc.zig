@@ -104,7 +104,7 @@ fn socketTarget(link: []const u8) ?u64 {
 }
 
 fn alive(pid: i32) bool {
-    return c.kill(pid, @enumFromInt(0)) == 0 or c.errno(@as(c_int, -1)) == .PERM;
+    return c.kill(pid, @fromBackingInt(@intCast(0))) == 0 or c.errno(@as(c_int, -1)) == .PERM;
 }
 
 /// Inode of the socket bound to `local_port` (and connected to

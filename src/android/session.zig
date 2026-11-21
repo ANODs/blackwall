@@ -610,7 +610,7 @@ pub const Session = struct {
         const mtu: u16 = if (st.mtu >= 1280) st.mtu else 9000;
 
         var h = std.hash.Wyhash.init(0);
-        h.update(&.{ @intFromBool(need), @intFromBool(narrow), @intFromEnum(st.ipv6), @intFromBool(st.allow_lan) });
+        h.update(&.{ @intFromBool(need), @intFromBool(narrow), @backingInt(st.ipv6), @intFromBool(st.allow_lan) });
         h.update(std.mem.asBytes(&mtu));
         for (only.items) |p| {
             h.update(p);

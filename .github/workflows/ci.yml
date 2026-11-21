@@ -1,7 +1,9 @@
 name: Tests
 
-# Every push to main and every pull request: the test suite on the three
-# systems the desktop app runs on. Releases (release.yml) run the same tests
+# Every push to main and every pull request, on the three systems the desktop
+# app runs on: the formatting, the test suite, and the window in every
+# language (the tests do not compile the window, and each language is its own
+# build). Releases (release.yml) run the same tests
 # before they build anything.
 
 on:
@@ -27,9 +29,32 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.1
+      - name: Formatting
+        if: runner.os == 'Linux'
+        run: zig fmt --check src build.zig build.zig.zon tools/bench/probe.zig
       - run: zig build test
         # a hung test fails the run in minutes, not after six hours
         timeout-minutes: 20
+      - name: Window, every language
+        shell: bash
+        run: for lang in en ru zh; do zig build -Dlang=$lang || exit 1; done
+        timeout-minutes: 30
+
+  # The Android app with a throwaway key: the Java shell, the resources and the
+  # link against the NDK, which otherwise first build when a release is tagged.
+  android:
+    name: Android build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+      - run: |
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          zig build android

@@ -81,15 +81,17 @@ pub fn open(fam: u16, mode: Mode) Error!Handle {
         .{ .READ = true, .WRITE = true },
         .OPEN_IF,
         .{ .IO = .ASYNCHRONOUS },
-        &w.AFD.OPEN_PACKET.FULL_EA_INFORMATION{ .Value = .{
-            .EndpointType = .{ .CONNECTIONLESS = mode == .udp, .MESSAGEMODE = mode == .udp },
-            .GroupID = 0,
-            .AddressFamily = fam,
-            .SocketType = if (mode == .tcp) 1 else 2, // SOCK_STREAM, SOCK_DGRAM
-            .Protocol = if (mode == .tcp) 6 else 17, // IPPROTO_TCP, IPPROTO_UDP
-            .TransportDeviceNameLength = 0,
-            .TransportDeviceName = undefined,
-        } },
+        &w.AFD.OPEN_PACKET.FULL_EA_INFORMATION{
+            .Value = .{
+                .EndpointType = .{ .CONNECTIONLESS = mode == .udp, .MESSAGEMODE = mode == .udp },
+                .GroupID = 0,
+                .AddressFamily = fam,
+                .SocketType = if (mode == .tcp) 1 else 2, // SOCK_STREAM, SOCK_DGRAM
+                .Protocol = if (mode == .tcp) 6 else 17, // IPPROTO_TCP, IPPROTO_UDP
+                .TransportDeviceNameLength = 0,
+                .TransportDeviceName = undefined,
+            },
+        },
         @sizeOf(w.AFD.OPEN_PACKET.FULL_EA_INFORMATION),
     );
     if (rc != .SUCCESS) return error.SocketFailed;
@@ -254,7 +256,7 @@ pub fn recv(h: Handle, buf: []u8) Error!usize {
         .SUCCESS => r.info,
         .REMOTE_DISCONNECT, .LOCAL_DISCONNECT => 0,
         else => {
-            last_status = @intFromEnum(r.status);
+            last_status = @backingInt(r.status);
             return error.RecvFailed;
         },
     };

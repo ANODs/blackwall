@@ -332,11 +332,11 @@ fn helperOwners(gpa: std.mem.Allocator, io: Io) ?std.json.Parsed(helper.Reply) {
 /// Programs known to run VPN tunnels on macOS (their executables or bundles).
 /// Only a presumption: being on this list proves nothing by itself.
 const known = [_][]const u8{
-    "happ",       "hiddify",   "v2raytun",  "v2ray",      "xray",    "sing-box", "singbox",
-    "clash",      "mihomo",    "nekoray",   "outline",    "wireguard", "openvpn", "tunnelblick",
-    "amnezia",    "nordvpn",   "expressvpn", "protonvpn", "mullvad", "windscribe", "surfshark",
-    "hidemy",     "psiphon",   "lantern",   "shadowrocket", "surge", "streisand", "foxray",
-    "tailscale",  "zerotier",  "warp",      "cloudflare", "anyconnect", "globalprotect", "forticlient",
+    "happ",      "hiddify",  "v2raytun",   "v2ray",        "xray",       "sing-box",      "singbox",
+    "clash",     "mihomo",   "nekoray",    "outline",      "wireguard",  "openvpn",       "tunnelblick",
+    "amnezia",   "nordvpn",  "expressvpn", "protonvpn",    "mullvad",    "windscribe",    "surfshark",
+    "hidemy",    "psiphon",  "lantern",    "shadowrocket", "surge",      "streisand",     "foxray",
+    "tailscale", "zerotier", "warp",       "cloudflare",   "anyconnect", "globalprotect", "forticlient",
 };
 
 /// The likeliest program behind a tunnel nobody could be seen holding: a

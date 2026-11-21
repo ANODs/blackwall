@@ -120,7 +120,7 @@ pub fn build(b: *std.Build) void {
 
     // Background service: the data plane without the window. `zig build service`
     // builds only it (also for Linux targets, where the window is not needed).
-    const service: ?*std.Build.Step.Compile = if (true) b.addExecutable(.{
+    const service = b.addExecutable(.{
         .name = "blackwall-service",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/service/main.zig"),
@@ -132,12 +132,13 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "fdpass", .module = fdpass },
             },
         }),
-    }) else null;
+    });
     // Windows: the service carries wintun.dll and puts it next to itself; the
     // app carries the service (and, in a release, its signature, so an
     // installed service can replace itself with it: core/win_scm.zig)
     const wintun_dll = b.option([]const u8, "wintun", "Windows: wintun.dll (amd64, from www.wintun.net) for the service to carry");
-    if (os == .windows) if (service) |sv| {
+    if (os == .windows) {
+        const sv = service;
         const dll = b.addWriteFiles();
         if (wintun_dll) |p| _ = dll.addCopyFile(.{ .cwd_relative = p }, "wintun.dll") else _ = dll.add("wintun.dll", "");
         sv.root_module.addAnonymousImport("wintun_dll", .{ .root_source_file = dll.getDirectory().path(b, "wintun.dll") });
@@ -165,14 +166,12 @@ pub fn build(b: *std.Build) void {
             \\
         );
         exe.root_module.addAnonymousImport("win_embed", .{ .root_source_file = embed });
-    };
-    const service_step = b.step("service", "Build only the background service (and the macOS helper)");
-    if (service) |sv| {
-        // its release is reported to the window, which restarts an older one
-        sv.root_module.addOptions("build_options", options);
-        b.installArtifact(sv);
-        service_step.dependOn(&b.addInstallArtifact(sv, .{}).step);
     }
+    const service_step = b.step("service", "Build only the background service (and the macOS helper)");
+    // its release is reported to the window, which restarts an older one
+    service.root_module.addOptions("build_options", options);
+    b.installArtifact(service);
+    service_step.dependOn(&b.addInstallArtifact(service, .{}).step);
 
     // Linux: the small program that holds CAP_NET_ADMIN and hands the TUN
     // device to the service (src/service/tun_main.zig)
@@ -241,7 +240,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run core and service tests");
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
     test_step.dependOn(&b.addRunArtifact(update_tests).step);
-    if (service) |sv| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sv.root_module })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = service.root_module })).step);
     if (os != .windows) test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fdpass })).step);
     if (helper) |h| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = h.root_module })).step);
     // what stands in the way of the connection (macOS)
@@ -250,6 +249,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "libproc", .module = m } },
+    }) })).step);
+    // the window's list of applications (shortcuts, desktop entries, bundles)
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/platform/apps.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
     }) })).step);
     // the window's link to the service (no UI inside, so it tests without DVUI)
     if (os != .windows) test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
@@ -294,7 +300,7 @@ fn android(b: *std.Build, optimize: std.builtin.OptimizeMode, strip: bool, versi
     const step = b.step("android", "Android app (APK) in zig-out/package");
     const env = b.graph.environ_map;
     const sdk = env.get("ANDROID_HOME") orelse env.get("ANDROID_SDK_ROOT") orelse {
-        step.dependOn(&b.addFail("ANDROID_HOME is not set (the Android SDK; see README, Building for Android)").step);
+        step.dependOn(&b.addFail("ANDROID_HOME is not set (the Android SDK; see docs/android.md)").step);
         return;
     };
     const ndk = env.get("ANDROID_NDK_HOME") orelse b.fmt("{s}/ndk/{s}", .{ sdk, android_ndk });
@@ -386,7 +392,7 @@ const android_ndk = "29.0.14206865";
 fn package(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
-    service: ?*std.Build.Step.Compile,
+    service: *std.Build.Step.Compile,
     helper: ?*std.Build.Step.Compile,
     tun_tool: ?*std.Build.Step.Compile,
     /// the signing tool, and whether this build carries the update key
@@ -491,7 +497,7 @@ fn package(
             // the applications menu (assets/linux/install.sh)
             const files = b.addWriteFiles();
             _ = files.addCopyFile(exe.getEmittedBin(), exe.out_filename);
-            if (service) |sv| _ = files.addCopyFile(sv.getEmittedBin(), sv.out_filename);
+            _ = files.addCopyFile(service.getEmittedBin(), service.out_filename);
             if (tun_tool) |tt| _ = files.addCopyFile(tt.getEmittedBin(), tt.out_filename);
             _ = files.addCopyFile(b.path("assets/linux/install.sh"), "install.sh");
             _ = files.addCopyFile(b.path("assets/linux/blackwall.desktop"), "blackwall.desktop");

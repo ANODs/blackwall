@@ -117,7 +117,7 @@ pub fn dispatch(args: []const []const u8, b: Body) !void {
 fn report(state: State, exit_code: u32) void {
     const h = status_handle orelse return;
     const st: SERVICE_STATUS = .{
-        .dwCurrentState = @intFromEnum(state),
+        .dwCurrentState = @backingInt(state),
         // stop and shutdown, once it runs
         .dwControlsAccepted = if (state == .running) 0x1 | 0x4 else 0,
         .dwWin32ExitCode = exit_code,
@@ -286,7 +286,7 @@ fn stopAndWait() void {
     _ = ControlService(svc, 1, &st);
     var waited: u32 = 0;
     while (waited < 20_000) : (waited += 200) {
-        if (QueryServiceStatus(svc, &st) == 0 or st.dwCurrentState == @intFromEnum(State.stopped)) return;
+        if (QueryServiceStatus(svc, &st) == 0 or st.dwCurrentState == @backingInt(State.stopped)) return;
         Sleep(200);
     }
 }
@@ -314,7 +314,7 @@ pub fn query() ?State {
     defer _ = CloseServiceHandle(svc);
     var st: SERVICE_STATUS = .{ .dwCurrentState = 0 };
     if (QueryServiceStatus(svc, &st) == 0) return null;
-    return @enumFromInt(st.dwCurrentState);
+    return @fromBackingInt(@intCast(st.dwCurrentState));
 }
 
 /// Starts the installed service with the window's options.

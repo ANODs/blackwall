@@ -91,7 +91,9 @@ if [ "$BUNDLE" = 0 ]; then
         zip -q -0 app.apk "lib/$abi/libblackwall.so"
     done
     "$BT/zipalign" -P 16 -f 4 app.apk aligned.apk
-    "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$PASS" --ks-key-alias "$ALIAS" --out "$OUT" aligned.apk
+    # the password through the environment, not the command line, which every
+    # process on the machine can read
+    BW_KS_PASS="$PASS" "$BT/apksigner" sign --ks "$KS" --ks-pass env:BW_KS_PASS --ks-key-alias "$ALIAS" --out "$OUT" aligned.apk
 else
     # the one module of the bundle, laid out as bundletool expects it
     mkdir -p base/manifest base/dex
@@ -109,7 +111,7 @@ else
 { "optimizations": { "uncompressNativeLibraries": { "enabled": true, "alignment": "PAGE_ALIGNMENT_16K" } } }
 EOF
     java -jar "$TOOL" build-bundle --modules=base.zip --config=config.json --output=app.aab
-    jarsigner -keystore "$KS" -storepass "$PASS" -keypass "$PASS" \
+    BW_KS_PASS="$PASS" jarsigner -keystore "$KS" -storepass:env BW_KS_PASS -keypass:env BW_KS_PASS \
         -sigalg SHA256withRSA -digestalg SHA-256 app.aab "$ALIAS" >/dev/null
     cp app.aab "$OUT"
 fi

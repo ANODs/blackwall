@@ -102,20 +102,30 @@ pub fn init(w: *dvui.Window) !void {
     }
 
     // screenshot mode shows sample data only, never the user's servers
-    if (persist) _ = core.store.load(gpa, io, config_dir, &state) catch |err| {
-        std.log.warn("config not loaded: {t}", .{err});
+    var unreadable = false;
+    if (persist) _ = core.store.load(gpa, io, config_dir, &state) catch |err| blk: {
+        // kept aside, so the first save does not replace it with nothing
+        std.log.err("config not loaded: {t}; kept as {s}", .{ err, core.store.unreadable_name });
+        core.store.setAside(io, config_dir) catch |e| std.log.err("config not set aside: {t}", .{e});
+        state.deinit();
+        state = .init(gpa);
+        unreadable = true;
+        break :blk false;
     };
 
     apps_platform.discover(io, &state, home_dir);
     refreshCarried();
 
-    if (state.subs.items.len == 0) {
+    // the sample data only where it replaces nothing of the user's: it sets
+    // routes and sites of its own, which leaving it clears
+    if (state.subs.items.len == 0 and state.domains.items.len == 0 and !state.hasRules()) {
         try core.demo.load(&state, tr.demo_sub);
         engine.simulate_traffic = true;
     } else {
         probeAll();
     }
     dvui.reduce_motion = state.settings.reduce_motion;
+    if (unreadable) notify(true, tr.config_unreadable, .{});
     startUpdater();
     if (persist and config_dir.len > 0)
         link = link_mod.Link.init(gpa, io, config_dir, build_options.version, tr.admin_prompt, onLinkEvent);
@@ -243,8 +253,13 @@ fn updateAutoServer() void {
 
 pub fn notify(bad: bool, comptime fmt: []const u8, args: anytype) void {
     notice_fix = false;
-    const s = std.fmt.bufPrint(&notice_buf, fmt, args) catch notice_buf[0..0];
-    notice_len = s.len;
+    // a long server name must not turn the message into nothing: what fits
+    // is shown, cut between characters
+    var w: Io.Writer = .fixed(&notice_buf);
+    w.print(fmt, args) catch {};
+    var len = w.end;
+    while (len > 0 and !std.unicode.utf8ValidateSlice(notice_buf[0..len])) len -= 1;
+    notice_len = len;
     notice_bad = bad;
     notice_until_ns = dvui.frameTimeNS() + 4 * std.time.ns_per_s;
 }

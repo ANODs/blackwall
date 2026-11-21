@@ -256,23 +256,28 @@ const Helper = struct {
     fn holdStep(h: *Helper) void {
         if (!h.boot_hold) return;
         const now = Io.Clock.awake.now(h.io).toMilliseconds();
-        if (h.utun == null) {
-            var arena: std.heap.ArenaAllocator = .init(h.gpa);
-            defer arena.deinit();
-            // fails until the network is up, and while another VPN is in the way
-            h.bringUp(arena.allocator(), .{ .cmd = "up", .killswitch = "selective", .ipv6 = "block" }) catch {
-                // only what a half-finished attempt left behind is undone
-                if (h.utun != null or h.installed.items.len > 0) h.down();
+        // the patience runs from the login whether or not the hold could be
+        // set up: one that never comes up (no network, another VPN) must not
+        // keep the helper retrying for good
+        if (someoneLoggedIn()) {
+            if (h.login_seen_ms == 0) h.login_seen_ms = now;
+            if (now - h.login_seen_ms >= hold_patience_ms) {
+                log.warn("no service came within {d} s of login: traffic is released", .{hold_patience_ms / 1000});
+                h.boot_hold = false;
+                h.down();
                 return;
-            };
-            log.info("holding traffic from boot until the service takes over", .{});
+            }
         }
-        if (!someoneLoggedIn()) return;
-        if (h.login_seen_ms == 0) h.login_seen_ms = now;
-        if (now - h.login_seen_ms < hold_patience_ms) return;
-        log.warn("no service came within {d} s of login: traffic is released", .{hold_patience_ms / 1000});
-        h.boot_hold = false;
-        h.down();
+        if (h.utun != null) return;
+        var arena: std.heap.ArenaAllocator = .init(h.gpa);
+        defer arena.deinit();
+        // fails until the network is up, and while another VPN is in the way
+        h.bringUp(arena.allocator(), .{ .cmd = "up", .killswitch = "selective", .ipv6 = "block" }) catch {
+            // only what a half-finished attempt left behind is undone
+            if (h.utun != null or h.installed.items.len > 0) h.down();
+            return;
+        };
+        log.info("holding traffic from boot until the service takes over", .{});
     }
 
     fn up(h: *Helper, conn: c.fd_t, a: std.mem.Allocator, req: proto.Request) void {
@@ -323,11 +328,7 @@ const Helper = struct {
                 h.token = try pf.enable(h.gpa, h.pfOptions(name));
                 writeToken(h.io, h.token);
             } else try pf.reload(h.gpa, h.pfOptions(name));
-        } else if (h.token != .none) {
-            pf.disable(h.gpa, h.token) catch |err| log.warn("pf disable: {t}", .{err});
-            h.token = .none;
-            std.Io.Dir.cwd().deleteFile(h.io, state_path) catch {};
-        }
+        } else if (h.token != .none) h.dropPf();
         h.killswitch = ks;
         log.info("reconfigured: kill switch {t}", .{ks});
     }
@@ -452,12 +453,17 @@ const Helper = struct {
     }
 
     /// Back to the state before `up`. Safe to call twice.
+    /// Lift the strict kill switch's rules. When pf refuses, the token and
+    /// its file stay, so the next `down` (or a restart's `recover`) tries
+    /// again instead of forgetting rules that still block everything.
+    fn dropPf(h: *Helper) void {
+        pf.disable(h.gpa, h.token) catch |err| return log.warn("pf disable: {t}; kept for another try", .{err});
+        h.token = .none;
+        std.Io.Dir.cwd().deleteFile(h.io, state_path) catch {};
+    }
+
     fn down(h: *Helper) void {
-        if (h.killswitch == .strict or h.token != .none) {
-            pf.disable(h.gpa, h.token) catch |err| log.warn("pf disable: {t}", .{err});
-            h.token = .none;
-            std.Io.Dir.cwd().deleteFile(h.io, state_path) catch {};
-        }
+        if (h.killswitch == .strict or h.token != .none) h.dropPf();
         h.killswitch = .off;
         dns.restore(h.gpa) catch |err| log.warn("dns restore: {t}", .{err});
         if (h.utun) |*u| {
@@ -564,12 +570,12 @@ fn readToken(gpa: std.mem.Allocator, io: Io) ?pf.Token {
     const text = std.Io.Dir.cwd().readFileAlloc(io, state_path, gpa, .limited(64)) catch return null;
     defer gpa.free(text);
     const v = std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch return null;
-    return @enumFromInt(v);
+    return @fromBackingInt(@intCast(v));
 }
 
 fn writeToken(io: Io, tok: pf.Token) void {
     var buf: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "{d}\n", .{@intFromEnum(tok)}) catch return;
+    const text = std.fmt.bufPrint(&buf, "{d}\n", .{@backingInt(tok)}) catch return;
     std.Io.Dir.cwd().createDirPath(io, state_dir) catch {};
     std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = state_path,
@@ -638,6 +644,8 @@ fn serve(h: *Helper) !void {
 fn checkUpgrade(key: []const u8, own: []const u8, sig_text: []const u8, bytes: []const u8) !void {
     // a build without the key (every local build) trusts nobody's signature
     if (key.len == 0) return error.UnsignedBuild;
+    // the release key also signs the Windows service: only a helper may be one
+    if (!proto.isProgram(.macos_helper, bytes)) return error.BadSignature;
     const signed = proto.Signed.parse(sig_text) orelse return error.BadSignature;
     try proto.verifyHelper(key, signed, bytes);
     const theirs = std.SemanticVersion.parse(signed.version) catch return error.BadSignature;
@@ -659,14 +667,25 @@ test "only a newer helper signed by the release key replaces this one" {
         }
     };
     var buf: [200]u8 = undefined;
-    try checkUpgrade(key, "0.1.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "new helper");
-    try checkUpgrade(key, "0.2.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "new helper");
-    try std.testing.expectError(error.OlderRelease, checkUpgrade(key, "0.3.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "new helper"));
-    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "other bytes"));
+    // a helper is an arm64 Mach-O; the Windows service, signed by the same key, is not
+    var helper: [64]u8 = @splat(0);
+    std.mem.writeInt(u32, helper[0..4], 0xfeedfacf, .little);
+    std.mem.writeInt(u32, helper[4..8], 0x0100000c, .little);
+    var other = helper;
+    other[63] = 1;
+    var windows: [128]u8 = @splat(0);
+    @memcpy(windows[0..2], "MZ");
+    std.mem.writeInt(u32, windows[0x3c..0x40], 0x40, .little);
+    @memcpy(windows[0x40..0x44], "PE\x00\x00");
+    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", try Sig.file(&buf, kp, "0.2.0", &windows), &windows));
+    try checkUpgrade(key, "0.1.0", try Sig.file(&buf, kp, "0.2.0", &helper), &helper);
+    try checkUpgrade(key, "0.2.0", try Sig.file(&buf, kp, "0.2.0", &helper), &helper);
+    try std.testing.expectError(error.OlderRelease, checkUpgrade(key, "0.3.0", try Sig.file(&buf, kp, "0.2.0", &helper), &helper));
+    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", try Sig.file(&buf, kp, "0.2.0", &helper), &other));
     const stranger = try Ed.KeyPair.generateDeterministic(@splat(6));
-    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", try Sig.file(&buf, stranger, "0.2.0", "new helper"), "new helper"));
-    try std.testing.expectError(error.UnsignedBuild, checkUpgrade("", "0.1.0", try Sig.file(&buf, kp, "0.2.0", "new helper"), "new helper"));
-    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", "garbage", "new helper"));
+    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", try Sig.file(&buf, stranger, "0.2.0", &helper), &helper));
+    try std.testing.expectError(error.UnsignedBuild, checkUpgrade("", "0.1.0", try Sig.file(&buf, kp, "0.2.0", &helper), &helper));
+    try std.testing.expectError(error.BadSignature, checkUpgrade(key, "0.1.0", "garbage", &helper));
 }
 
 /// Remember (across reboots) whether traffic is held from boot.

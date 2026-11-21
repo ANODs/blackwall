@@ -1,6 +1,7 @@
 //! Versioned JSON persistence of the user's configuration.
-//! Written atomically (temp file + rename) so a crash never leaves a
-//! half-written config; a failed load leaves the in-memory state untouched.
+//! Written atomically (temp file, flushed to disk, then renamed) so a crash
+//! or a power cut never leaves a half-written config. A file that cannot be
+//! read is set aside (`setAside`) before anything is written over it.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -181,13 +182,36 @@ fn code(text: []const u8) [2]u8 {
     return if (text.len == 2) text[0..2].* else "??".*;
 }
 
+/// Far above any real config (a thousand servers take about 1 MiB), and
+/// checked on save too, so that what was saved can always be loaded.
+const max_size = 64 << 20;
+
 pub fn save(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, s: *const model.State) !void {
     const bytes = try serialize(gpa, s);
     defer gpa.free(bytes);
+    if (bytes.len > max_size) return error.FileTooBig;
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
     defer dir.close(io);
-    try dir.writeFile(io, .{ .sub_path = "config.json.tmp", .data = bytes, .flags = .{ .permissions = private_file } });
+    {
+        var file = try dir.createFile(io, "config.json.tmp", .{ .permissions = private_file });
+        defer file.close(io);
+        try file.writeStreamingAll(io, bytes);
+        // on disk before the rename, or a power cut can leave an empty file
+        try file.sync(io);
+    }
     try dir.rename("config.json.tmp", dir, "config.json", io);
+}
+
+/// Name a config that could not be read is kept under, for the user (or a
+/// newer release, after a rollback) to take back.
+pub const unreadable_name = "config.json.unreadable";
+
+/// Move a config.json that failed to load out of the way, so the next save
+/// does not replace the user's servers and rules with an empty list.
+pub fn setAside(io: std.Io, dir_path: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    defer dir.close(io);
+    try dir.rename("config.json", dir, unreadable_name, io);
 }
 
 const private_file: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
@@ -195,11 +219,12 @@ const private_file: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissio
 else
     .default_file;
 
-/// Returns false when there is no config yet.
+/// Returns false when there is no config yet. On an error `s` may hold
+/// part of the file: start again from an empty state.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, s: *model.State) !bool {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return false;
     defer dir.close(io);
-    const bytes = dir.readFileAlloc(io, "config.json", gpa, .limited(8 << 20)) catch |err| switch (err) {
+    const bytes = dir.readFileAlloc(io, "config.json", gpa, .limited(max_size)) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -293,4 +318,50 @@ test "round trip keeps groups and what the provider said" {
     try std.testing.expectEqual(1, sub.update_hours);
     try std.testing.expectEqualStrings("72 servers", sub.announce);
     try std.testing.expectEqualStrings("https://t.me/x", sub.support_url);
+}
+
+test "a config that cannot be read is set aside, not overwritten" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPathFile(io, ".", &buf);
+    const path = buf[0..n];
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"version\": 99}" });
+
+    var s: model.State = .init(gpa);
+    defer s.deinit();
+    try std.testing.expectError(error.NewerVersion, load(gpa, io, path, &s));
+    try setAside(io, path);
+    try save(gpa, io, path, &s);
+    const kept = try tmp.dir.readFileAlloc(io, unreadable_name, gpa, .limited(1024));
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings("{\"version\": 99}", kept);
+}
+
+test "a config written by release 0.2.15 still loads" {
+    const gpa = std.testing.allocator;
+    var s: model.State = .init(gpa);
+    defer s.deinit();
+    // the field and enum names are the file's schema: renaming one in the
+    // model breaks every user's config
+    try deserialize(gpa, &s,
+        \\{"version":1,"next_id":9,
+        \\ "settings":{"tunnel_mode":"tun","kill_switch":"strict","default_route":{"auto":{}},
+        \\   "protect_when_off":true,"ipv6":"block","auto_connect":true,"selected_server":3,
+        \\   "notifications":true,"sounds":false},
+        \\ "subs":[{"id":1,"name":"Home","url":"https://example.invalid/s","updated_unix":1700000000,"update_hours":12}],
+        \\ "servers":[{"id":3,"sub_id":1,"name":"NL","host":"nl.example","port":443,"protocol":"vless",
+        \\   "security":"reality","country":"NL","exit":"DE","favorite":true,"link":"vless://x@nl.example:443"}],
+        \\ "rules":[{"app_id":"org.telegram.desktop","name":"Telegram","route":{"server":3}},
+        \\   {"app_id":"com.valvesoftware.steam","name":"Steam","route":{"direct":{}}}],
+        \\ "domains":[{"name":"youtube.com","route":{"block":{}}}]}
+    );
+    try std.testing.expectEqual(model.KillSwitch.strict, s.settings.kill_switch);
+    try std.testing.expectEqual(3, s.settings.selected_server.?);
+    try std.testing.expect(s.servers.items[0].favorite);
+    try std.testing.expect(s.appById("org.telegram.desktop").?.route.eql(.{ .server = 3 }));
+    try std.testing.expect(s.appById("com.valvesoftware.steam").?.route == .direct);
+    try std.testing.expect(s.domainByName("youtube.com").?.route == .block);
 }

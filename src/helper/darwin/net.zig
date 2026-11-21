@@ -734,9 +734,9 @@ test "prefix masks" {
 }
 
 test "default route of this machine (no root needed)" {
-    const d = try defaultRoute();
+    // a machine without a network has none: nothing to check
+    const d = defaultRoute() catch |err| if (err == error.RouteNotFound) return error.SkipZigTest else return err;
     const name = std.mem.sliceTo(&d.ifname, 0);
-    std.debug.print("\ndefault route: {s} (index {d}) via {?any}\n", .{ name, d.ifindex, d.gateway4 });
     try testing.expect(name.len > 0);
     try testing.expectEqual(d.ifindex, ifIndex(name).?);
 }
@@ -748,9 +748,7 @@ test "a missing exact route is not mistaken for the default" {
 test "foreign tunnel captures on this machine" {
     const caps = try foreignCaptures(testing.allocator, null);
     defer testing.allocator.free(caps);
-    std.debug.print("\nforeign captures: {d}\n", .{caps.len});
     for (caps) |cap| {
-        std.debug.print("  {s} {any}/{d}\n", .{ std.mem.sliceTo(&cap.ifname, 0), cap.dst, cap.prefix_len });
         try testing.expect(cap.prefix_len <= 8);
         try testing.expect(isTunnel(std.mem.sliceTo(&cap.ifname, 0)));
     }

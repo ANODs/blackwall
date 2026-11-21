@@ -81,3 +81,18 @@ pub fn load(s: *model.State, sub_name: []const u8) !void {
         }
     }
 }
+
+test "leaving the demo leaves nothing of it" {
+    var s: model.State = .init(std.testing.allocator);
+    defer s.deinit();
+    _ = try s.addApp("org.telegram.desktop", "Telegram", "");
+    try load(&s, "Demo");
+    try std.testing.expect(s.hasRules());
+    try std.testing.expect(s.domains.items.len > 0);
+    s.clearDemo();
+    try std.testing.expect(!s.demo);
+    try std.testing.expect(!s.hasRules());
+    try std.testing.expectEqual(0, s.domains.items.len);
+    try std.testing.expectEqual(0, s.subs.items.len);
+    try std.testing.expectEqual(0, s.servers.items.len);
+}

@@ -34,7 +34,7 @@ pub fn isFake(addr: *const packet.Addr) bool {
 
 /// Names that must keep their real addresses.
 pub const default_exclusions = [_][]const u8{
-    "local", "localhost", "lan", "home.arpa", "internal", "in-addr.arpa", "ip6.arpa",
+    "local",             "localhost",      "lan",              "home.arpa",    "internal",            "in-addr.arpa", "ip6.arpa",
     // captive portal and time checks expect real answers
     "captive.apple.com", "time.apple.com", "time.windows.com", "pool.ntp.org", "msftconnecttest.com",
 };

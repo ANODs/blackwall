@@ -199,8 +199,6 @@ pub const Settings = struct {
     allow_lan: bool = true,
     launch_at_login: bool = false,
     auto_connect: bool = false,
-    notifications: bool = true,
-    sounds: bool = false,
     reduce_motion: bool = false,
     /// Install new releases by itself (not in builds made with `-Dupdate-repo=`).
     auto_update: bool = true,
@@ -315,8 +313,8 @@ pub const State = struct {
             s.gpa.free(out);
         }
         for (from) |m| {
-            const link = try s.gpa.dupe(u8, m.link);
-            const host = s.gpa.dupe(u8, m.host) catch |err| {
+            const link = try dupeText(s.gpa, m.link);
+            const host = dupeText(s.gpa, m.host) catch |err| {
                 s.gpa.free(link);
                 return err;
             };
@@ -410,8 +408,8 @@ pub const State = struct {
     pub fn addSubscription(s: *State, name: []const u8, url: []const u8) !*Subscription {
         const sub: Subscription = .{
             .id = s.newId(),
-            .name = try s.gpa.dupe(u8, name),
-            .url = try s.gpa.dupe(u8, url),
+            .name = try dupeText(s.gpa, name),
+            .url = try dupeText(s.gpa, url),
         };
         try s.subs.append(s.gpa, sub);
         return &s.subs.items[s.subs.items.len - 1];
@@ -441,13 +439,13 @@ pub const State = struct {
         try s.servers.append(s.gpa, .{
             .id = s.newId(),
             .sub_id = sub_id,
-            .name = try s.gpa.dupe(u8, n.name),
-            .host = try s.gpa.dupe(u8, n.host),
+            .name = try dupeText(s.gpa, n.name),
+            .host = try dupeText(s.gpa, n.host),
             .port = n.port,
             .protocol = n.protocol,
             .security = n.security,
             .country = n.country,
-            .link = try s.gpa.dupe(u8, n.link),
+            .link = try dupeText(s.gpa, n.link),
             .members = members,
         });
         return &s.servers.items[s.servers.items.len - 1];
@@ -494,9 +492,9 @@ pub const State = struct {
                 _ = try s.addServer(sub_id, n);
                 continue;
             };
-            const link = try s.gpa.dupe(u8, n.link);
+            const link = try dupeText(s.gpa, n.link);
             errdefer s.gpa.free(link);
-            const host = try s.gpa.dupe(u8, n.host);
+            const host = try dupeText(s.gpa, n.host);
             errdefer s.gpa.free(host);
             const members = try s.dupeMembers(n.members);
             // the member pings stay with their servers until measured again,
@@ -621,18 +619,18 @@ pub const State = struct {
     pub fn applyMeta(s: *State, sub_id: u32, meta: SubMeta) !void {
         const sub = s.subById(sub_id) orelse return;
         if (meta.title) |t| if (t.len > 0) {
-            const name = try s.gpa.dupe(u8, t);
+            const name = try dupeText(s.gpa, t);
             s.gpa.free(sub.name);
             sub.name = name;
         };
         if (meta.update_hours) |h| sub.update_hours = h;
         if (meta.announce) |t| {
-            const text = try s.gpa.dupe(u8, t);
+            const text = try dupeText(s.gpa, t);
             s.gpa.free(sub.announce);
             sub.announce = text;
         }
         if (meta.support_url) |t| {
-            const text = try s.gpa.dupe(u8, t);
+            const text = try dupeText(s.gpa, t);
             s.gpa.free(sub.support_url);
             sub.support_url = text;
         }
@@ -719,17 +717,28 @@ pub const State = struct {
     pub fn addApp(s: *State, id: []const u8, name: []const u8, path: []const u8) !*App {
         if (s.appById(id)) |a| return a;
         try s.apps.append(s.gpa, .{
-            .id = try s.gpa.dupe(u8, id),
-            .name = try s.gpa.dupe(u8, name),
-            .path = try s.gpa.dupe(u8, path),
+            .id = try dupeText(s.gpa, id),
+            .name = try dupeText(s.gpa, name),
+            .path = try dupeText(s.gpa, path),
         });
         return &s.apps.items[s.apps.items.len - 1];
     }
 
+    /// Whether any application has a route of its own.
+    pub fn hasRules(s: *const State) bool {
+        for (s.apps.items) |a| if (a.route != .default) return true;
+        return false;
+    }
+
+    /// Leave the sample data: it is shown only on a state with no
+    /// subscription, rule or site of the user's (src/app.zig), so every
+    /// one of those is the demo's.
     pub fn clearDemo(s: *State) void {
         if (!s.demo) return;
         s.demo = false;
         while (s.subs.items.len > 0) s.removeSubscription(s.subs.items[0].id);
+        for (s.domains.items) |d| s.gpa.free(d.name);
+        s.domains.clearRetainingCapacity();
         for (s.apps.items) |*a| {
             a.route = .default;
             a.online = false;
@@ -741,6 +750,37 @@ pub const State = struct {
         }
     }
 };
+
+/// A copy of text the state keeps. Bytes that are not UTF-8 (a provider's
+/// title, a file name) become U+FFFD: the config is JSON, and one such byte
+/// would make the whole file unreadable on the next start.
+pub fn dupeText(gpa: std.mem.Allocator, text: []const u8) error{OutOfMemory}![]u8 {
+    if (std.unicode.utf8ValidateSlice(text)) return gpa.dupe(u8, text);
+    var out: std.ArrayList(u8) = try .initCapacity(gpa, text.len + 8);
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        if (n > 0 and i + n <= text.len and std.unicode.utf8ValidateSlice(text[i..][0..n])) {
+            try out.appendSlice(gpa, text[i..][0..n]);
+            i += n;
+        } else {
+            try out.appendSlice(gpa, "\u{FFFD}");
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "text that is not UTF-8 is kept as valid UTF-8" {
+    const gpa = std.testing.allocator;
+    const a = try dupeText(gpa, "Сервер \xff1");
+    defer gpa.free(a);
+    try std.testing.expectEqualStrings("Сервер \u{FFFD}1", a);
+    const b = try dupeText(gpa, "\xd0");
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("\u{FFFD}", b);
+}
 
 test "applySubscription keeps ids and pinned servers" {
     const gpa = std.testing.allocator;
