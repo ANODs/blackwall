@@ -192,6 +192,43 @@ pub fn hasData(fd: c.fd_t) bool {
     }
 }
 
+/// Two connected stream sockets of this process: a Unix socket pair, or on
+/// Windows, which may have no AF_UNIX at all, a TCP connection over the
+/// loopback. Null when they could not be made.
+pub fn socketPair(io: std.Io) ?[2]c.fd_t {
+    if (comptime windows) {
+        const here: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var server = here.listen(io, .{}) catch return null;
+        defer server.deinit(io);
+        const mine = afd.connectTcp(server.socket.address, 0, 2000) catch return null;
+        const theirs = server.accept(io) catch {
+            mine.close(io);
+            return null;
+        };
+        return .{ theirs.socket.handle, mine.socket.handle };
+    }
+    var fds: [2]c.fd_t = undefined;
+    if (c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) != 0) return null;
+    if (builtin.os.tag.isDarwin()) {
+        const one: c_int = 1;
+        for (fds) |fd| _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.NOSIGPIPE, &one, @sizeOf(c_int));
+    }
+    return fds;
+}
+
+/// Some bytes from a connected socket: 0 at its end, null on an error.
+pub fn recvSome(fd: c.fd_t, buf: []u8) ?usize {
+    if (comptime windows) return afd.recv(fd, buf) catch null;
+    while (true) {
+        const n = c.read(fd, buf.ptr, buf.len);
+        if (n < 0) {
+            if (c.errno(n) == .INTR) continue;
+            return null;
+        }
+        return @intCast(n);
+    }
+}
+
 /// Reads a socket like `net.Stream.Reader`, except that a read gives up
 /// once `deadline_ms` (awake clock; 0 = never) has passed. A server that
 /// accepts a connection and then says nothing would otherwise hold its
@@ -201,6 +238,8 @@ pub const SockReader = struct {
     io: std.Io,
     deadline_ms: i64 = 0,
     timed_out: bool = false,
+    /// Windows: the NTSTATUS a failed read ended with, for the log
+    os_status: u32 = 0,
     interface: std.Io.Reader,
 
     pub fn init(fd: c.fd_t, io: std.Io, buffer: []u8) SockReader {
@@ -228,7 +267,10 @@ pub const SockReader = struct {
                 }
             }
             if (comptime windows) {
-                const n = afd.recv(r.fd, dest) catch return error.ReadFailed;
+                const n = afd.recv(r.fd, dest) catch {
+                    r.os_status = afd.last_status;
+                    return error.ReadFailed;
+                };
                 if (n == 0) return error.EndOfStream;
                 w.advance(n);
                 return n;
@@ -443,4 +485,26 @@ test "udp request and reply over loopback" {
 
 test {
     _ = afd;
+}
+
+test "socketPair: what one end writes, the other reads, and its end is seen" {
+    const io = std.testing.io;
+    const fds = socketPair(io) orelse return error.TestUnexpectedResult;
+    const here: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const a: std.Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = here } };
+    const b: std.Io.net.Stream = .{ .socket = .{ .handle = fds[1], .address = here } };
+    defer b.close(io);
+    {
+        var wb: [64]u8 = undefined;
+        var w = a.writer(io, &wb);
+        try w.interface.writeAll("hello");
+        try w.interface.flush();
+    }
+    try std.testing.expect(waitFd(fds[1], false, 2000));
+    var buf: [16]u8 = undefined;
+    const n = recvSome(fds[1], &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+    a.close(io);
+    try std.testing.expect(waitFd(fds[1], false, 2000));
+    try std.testing.expectEqual(@as(?usize, 0), recvSome(fds[1], &buf));
 }

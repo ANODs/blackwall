@@ -253,9 +253,16 @@ pub fn recv(h: Handle, buf: []u8) Error!usize {
     return switch (r.status) {
         .SUCCESS => r.info,
         .REMOTE_DISCONNECT, .LOCAL_DISCONNECT => 0,
-        else => error.RecvFailed,
+        else => {
+            last_status = @intFromEnum(r.status);
+            return error.RecvFailed;
+        },
     };
 }
+
+/// Why this thread's last `recv` failed (an NTSTATUS), for the log: a
+/// reset, an abort and a cancel all read as one error otherwise.
+pub threadlocal var last_status: u32 = 0;
 
 test "connect with a timeout, wait for data, read it" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;

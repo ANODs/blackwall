@@ -11,7 +11,7 @@ import android.graphics.drawable.Drawable;
 /** The interface's pictures, drawn as lines on a 24-unit square. */
 final class Glyph extends Drawable {
     static final int POWER = 0, APPS = 1, GLOBE = 2, SLIDERS = 3, PLUS = 4, REFRESH = 5, STAR = 6, STAR_ON = 7,
-            CHECK = 8, TRASH = 9, CHEVRON = 10, DOWN = 11, UP = 12, DIRECT = 13, BLOCK = 14, BOLT = 15, DOT = 16;
+            CHECK = 8, TRASH = 9, CHEVRON = 10, DOWN = 11, UP = 12, DIRECT = 13, BLOCK = 14, BOLT = 15, DOT = 16, MORE = 17;
 
     private final int kind;
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -90,6 +90,11 @@ final class Glyph extends Drawable {
                 path.lineTo(10, 17.5f);
                 path.lineTo(19, 7);
                 c.drawPath(path, p);
+                break;
+            case MORE:
+                c.drawCircle(6, 12, 1.2f, p);
+                c.drawCircle(12, 12, 1.2f, p);
+                c.drawCircle(18, 12, 1.2f, p);
                 break;
             case TRASH:
                 c.drawLine(5, 7, 19, 7, p);

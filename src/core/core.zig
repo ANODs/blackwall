@@ -20,11 +20,13 @@ pub const xudp = @import("xudp.zig");
 pub const sys = @import("sys.zig");
 pub const wintun = @import("wintun.zig");
 pub const win_scm = @import("win_scm.zig");
+pub const win_dpi = @import("win_dpi.zig");
 pub const udp_out = @import("udp_out.zig");
 pub const dpi = @import("dpi.zig");
 pub const sni = @import("sni.zig");
 pub const qr = @import("qr.zig");
 pub const diag = @import("diag.zig");
+pub const xrayjson = @import("xrayjson.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const failover = @import("failover.zig");
 pub const ipc = @import("ipc.zig");
@@ -65,8 +67,10 @@ test {
     _ = udp_out;
     _ = sni;
     _ = dpi;
+    _ = win_dpi;
     _ = qr;
     _ = diag;
+    _ = xrayjson;
     _ = @import("aes_gcm.zig");
 }
 

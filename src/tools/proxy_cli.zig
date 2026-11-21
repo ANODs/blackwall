@@ -1,8 +1,10 @@
 //! Headless runner for the local proxy, for testing the data plane without
 //! the UI:  blackwall-proxy <listen-port> [link]
 //!          blackwall-proxy check <link>   connect time, whether a real
-//!                                         request gets through, and the
-//!                                         country the server exits in
+//!                                         request gets through and the
+//!                                         country the server exits in,
+//!                                         and the reserve's measurement
+//!                                         (response time, download speed)
 //!          blackwall-proxy udp <link> <ip:port>   one datagram through the
 //!                                         server and its answer (port 53:
 //!                                         a DNS query for example.com)
@@ -49,6 +51,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}", .{if (r.carries) "carries traffic" else "carries nothing"});
         if (core.failover.known(r.exit)) std.debug.print(", exits in {s}", .{&r.exit});
         std.debug.print("\n", .{});
+        switch (r.mark.state) {
+            .ok => std.debug.print("measured: answers in {d} ms, {d} KB/s, a megabyte in {d} ms\n", .{ r.mark.reply_ms, r.mark.speed / 1024, r.mark.cost() }),
+            else => std.debug.print("measured: no answer\n", .{}),
+        }
         return;
     }
     if (std.mem.eql(u8, args[1], "udp")) {

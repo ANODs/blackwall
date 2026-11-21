@@ -72,6 +72,8 @@ pub const Icon = enum {
     trash,
     clipboard,
     qr,
+    chat,
+    more,
 };
 
 const G = struct {
@@ -209,6 +211,12 @@ pub fn icon(which: Icon, r: Rect, color: Color, stroke_px: f32) void {
             g.box(5.5, 5.5, 13, 15, 2);
             g.box(9, 3.5, 6, 4, 1.2);
         },
+        .more => {
+            g.circle(6, 12, 1.1);
+            g.circle(12, 12, 1.1);
+            g.circle(18, 12, 1.1);
+        },
+        .chat => g.poly(&.{ .{ 4.5, 5 }, .{ 19.5, 5 }, .{ 19.5, 16 }, .{ 11, 16 }, .{ 7, 20 }, .{ 7, 16 }, .{ 4.5, 16 } }, true),
         .qr => {
             // three finder corners and a few modules
             g.box(4, 4, 6.5, 6.5, 1.2);

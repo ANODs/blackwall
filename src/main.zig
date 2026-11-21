@@ -1,6 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const dvui = @import("dvui");
+const build_options = @import("build_options");
 const app = @import("app.zig");
+const report = @import("report.zig");
 const th = @import("ui/theme.zig");
 const draw = @import("ui/draw.zig");
 const w = @import("ui/widgets.zig");
@@ -16,23 +19,40 @@ const tray = @import("platform/tray.zig");
 const tr = @import("i18n.zig").t;
 
 pub const dvui_app: dvui.App = .{
-    .config = .{ .options = .{
-        .size = .{ .w = 940, .h = 620 },
-        .min_size = .{ .w = 760, .h = 520 },
-        .title = "BLACKWALL",
-        // macOS takes the bundle icon; setting one at runtime would replace it in the Dock
-        .icon = if (@import("builtin").os.tag == .macos) null else @embedFile("icon_png"),
-        .app = "blackwall",
-        .org = "dev.blackwall",
-        .window_init_options = .{ .keybinds_zoom = true, .theme = th.theme },
-    } },
+    .config = .{ .startFn = start },
     .initFn = init,
     .deinitFn = deinit,
     .frameFn = frame,
 };
-pub const main = dvui.App.main;
-pub const panic = dvui.App.panic;
-pub const std_options: std.Options = .{ .logFn = @import("report.zig").logFn };
+
+/// The window's log goes to a file before anything opens (report.zig).
+pub fn main(main_init: std.process.Init) !u8 {
+    report.start(main_init);
+    return dvui.App.main(main_init);
+}
+/// Written to the log and, on Windows, told to the user (report.zig).
+pub const panic = std.debug.FullPanic(report.panicked);
+pub const std_options: std.Options = .{
+    .logFn = report.logFn,
+    // Windows: the window's own handler catches crashes, logs them and says
+    // where to report them (report.zig)
+    .enable_segfault_handler = builtin.os.tag != .windows and std.debug.default_enable_segfault_handler,
+};
+
+fn start() dvui.App.StartOptions {
+    // how the system names us (notifications, logs), set after dvui's own
+    _ = dvui.backend.c.SDL_SetAppMetadata("BLACKWALL", std.fmt.comptimePrint("{s}", .{build_options.version}), "dev.blackwall");
+    return .{
+        .size = .{ .w = 940, .h = 620 },
+        .min_size = .{ .w = 760, .h = 520 },
+        .title = "BLACKWALL",
+        // macOS takes the bundle icon; setting one at runtime would replace it in the Dock
+        .icon = if (builtin.os.tag == .macos) null else @embedFile("icon_png"),
+        .app = "blackwall",
+        .org = "dev.blackwall",
+        .window_init_options = .{ .keybinds_zoom = true, .theme = th.theme },
+    };
+}
 
 fn init(win: *dvui.Window) !void {
     dvui.ScrollBarWidget.defaults.min_size_content = .{ .w = 6, .h = 6 };

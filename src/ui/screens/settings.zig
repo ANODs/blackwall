@@ -87,8 +87,6 @@ pub fn show() void {
     section(@src(), tr.sec_interface);
     if (switchRow(@src(), tr.reduce_motion, null, &s.reduce_motion)) dvui.reduce_motion = s.reduce_motion;
 
-    subscriptions();
-
     section(@src(), tr.sec_about);
     {
         var r = row(@src(), tr.version, null);
@@ -118,22 +116,6 @@ pub fn show() void {
         }
     }
     w.gap(@src(), 0, 24);
-}
-
-/// What the providers say about their subscriptions (announce, support-url):
-/// here only, never on the main screens.
-fn subscriptions() void {
-    var any = false;
-    for (app.state.subs.items) |sub| any = any or sub.announce.len > 0 or sub.support_url.len > 0;
-    if (!any or app.state.demo) return;
-    section(@src(), tr.sec_subs);
-    for (app.state.subs.items, 0..) |sub, i| {
-        if (sub.announce.len == 0 and sub.support_url.len == 0) continue;
-        var r = row(@src(), sub.name, if (sub.announce.len > 0) sub.announce else null);
-        defer r.deinit();
-        if (sub.support_url.len > 0 and w.quietButton(@src(), tr.support, .{ .gravity_y = 0.5, .id_extra = i }))
-            _ = dvui.openURL(.{ .url = sub.support_url });
-    }
 }
 
 fn section(src: Src, title: []const u8) void {

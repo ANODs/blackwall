@@ -44,6 +44,10 @@ function Check([string]$what, [bool]$ok) {
 }
 
 Write-Host "== before: $(Fetch)"
+# the same long download without the tunnel, to compare its speed with
+$r = & curl.exe -s -m 90 -o NUL -w "%{http_code} %{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=32000000" 2>$null
+Write-Host "   32 MB without the tunnel: $r"
+$direct_speed = [double]("$r".Split(' ')[2])
 
 Write-Host "== direct through the tunnel"
 Config 'direct'
@@ -54,12 +58,42 @@ Check 'the service runs' (-not $p.HasExited)
 Check 'the adapter is there' ($null -ne (Get-NetAdapter -Name 'BLACKWALL' -ErrorAction SilentlyContinue))
 $code = Fetch
 Check "curl through the tunnel ($code)" ($code -eq '200')
+# what a video is: one long download, and several at once (a page, a player)
+$big = 32000000
+$r = & curl.exe -s -m 90 -o NUL -w "%{http_code} %{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=$big" 2>$null
+$f = "$r".Split(' ')
+Check "a long download through the tunnel ($r)" (($f[0] -eq '200') -and ([int64]$f[1] -eq $big))
+# the tunnel ran at 1-2 MB/s here once, beside 100 without it (issue #5)
+Check "at a quarter of the direct speed or more ($([int]([double]$f[2] / 1MB)) of $([int]($direct_speed / 1MB)) MB/s)" ([double]$f[2] -ge $direct_speed / 4)
+$urls = 1..6 | ForEach-Object { "https://speed.cloudflare.com/__down?bytes=8000000&n=$_" }
+$out = 1..6 | ForEach-Object { '-o'; 'NUL' }
+$t0 = Get-Date
+$r = & curl.exe -s -m 90 --parallel --parallel-max 6 -w "%{size_download}\n" $out $urls 2>$null
+Write-Host "   six at once took $([int]((Get-Date) - $t0).TotalMilliseconds) ms"
+$sizes = @($r | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int64]$_ })
+Check "six at once through the tunnel ($($sizes -join ', '))" (($sizes.Count -eq 6) -and (($sizes | Where-Object { $_ -ne 8000000 }).Count -eq 0))
 Get-Content (Join-Path $cfg 'direct.err') -Tail 30 | Write-Host
 Stop-Process -Id $p.Id -Force
 Start-Sleep -Seconds 3
 Check 'the adapter went with the service' ($null -eq (Get-NetAdapter -Name 'BLACKWALL' -ErrorAction SilentlyContinue))
 $code = Fetch
 Check "the network is back ($code)" ($code -eq '200')
+
+Write-Host "== the same downloads through SOCKS (no Wintun, no TCP stack)"
+# halves the path: if these are fast, the TUN side is what is slow
+Config 'direct'
+$p = Start-Process -FilePath (Join-Path $Bin 'blackwall-service.exe') `
+    -ArgumentList '--config', $cfg, '--socks', '1089' `
+    -RedirectStandardError (Join-Path $cfg "socks.err") -RedirectStandardOutput (Join-Path $cfg "socks.out") `
+    -PassThru -WindowStyle Hidden
+Start-Sleep -Seconds 4
+$r = & curl.exe -s -m 90 --socks5-hostname 127.0.0.1:1089 -o NUL -w "%{http_code} %{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=32000000" 2>$null
+Write-Host "   32 MB through SOCKS: $r"
+$t0 = Get-Date
+$r = & curl.exe -s -m 90 --socks5-hostname 127.0.0.1:1089 --parallel --parallel-max 6 -w "%{size_download}\n" $out $urls 2>$null
+Write-Host "   six at once through SOCKS took $([int]((Get-Date) - $t0).TotalMilliseconds) ms"
+Stop-Process -Id $p.Id -Force
+Start-Sleep -Seconds 2
 
 Write-Host "== blocked"
 Config 'block'
@@ -145,8 +179,95 @@ Start-Sleep -Seconds 5
 $code = Fetch
 Check "a clean stop lets the traffic go ($code)" ($code -eq '200')
 
+Write-Host "== zapret or GoodbyeDPI beside it is stopped at the window's word"
+Config 'direct'
+# stand-ins: zapret's winws.exe as a plain process (a copy of cmd.exe that
+# waits), and zapret-discord-youtube's service "zapret" (a copy of our own
+# service, which answers the SCM, under that name)
+$dpi = Join-Path $env:RUNNER_TEMP 'dpi'
+$zcfg = Join-Path $dpi 'cfg'
+New-Item -ItemType Directory -Force (Join-Path $dpi 'svc'), $zcfg | Out-Null
+Copy-Item (Join-Path $env:SystemRoot 'System32\cmd.exe') (Join-Path $dpi 'winws.exe')
+Copy-Item (Join-Path $Bin 'blackwall-service.exe') (Join-Path $dpi 'svc\winws.exe')
+function Start-Winws {
+    $t = Start-Process -FilePath (Join-Path $dpi 'winws.exe') -ArgumentList '/d', '/c', 'ping -n 120 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 1
+    return $t
+}
+# what the window sends: the secret from the file, then one request line
+function Ask([string]$line) {
+    $ep = (Get-Content (Join-Path $cfg 'service.sock') -Raw).Trim().Split(' ')
+    $c = [System.Net.Sockets.TcpClient]::new('127.0.0.1', [int]$ep[0])
+    try {
+        $s = $c.GetStream()
+        $s.ReadTimeout = 30000
+        $b = [System.Text.Encoding]::ASCII.GetBytes($ep[1] + "`n" + $line + "`n")
+        $s.Write($b, 0, $b.Length)
+        return [System.IO.StreamReader]::new($s).ReadLine()
+    } catch { return "fail: $_" } finally { $c.Close() }
+}
+
+# no BLACKWALL service runs: the installed one is started for just this
+$t = Start-Winws
+(Get-Service BLACKWALL).Start([string[]]@('--stop-dpi', ('{"pid":' + $t.Id + '}')))
+Check 'started for it, the service ends the stand-in' ($t.WaitForExit(15000))
+Start-Sleep -Seconds 2
+Check "and is stopped again ($((Get-Service BLACKWALL).Status))" ((Get-Service BLACKWALL).Status -eq 'Stopped')
+
+New-Service -Name zapret -StartupType Manual -BinaryPathName ('"' + (Join-Path $dpi 'svc\winws.exe') + '" --scm --config "' + $zcfg + '"') | Out-Null
+(Get-Service zapret).Start([string[]]@('--socks', '18099'))
+Start-Sleep -Seconds 4
+Check "the service zapret runs ($((Get-Service zapret).Status))" ((Get-Service zapret).Status -eq 'Running')
+
+# over the running service's channel
+& sc.exe start BLACKWALL --socks 18098 | Out-Null
+Start-Sleep -Seconds 4
+$r = Ask '{"cmd":"stop_dpi","service":"zapret"}'
+Check "the service zapret through the SCM ($r)" ($r -like '*"ok":true*')
+Check "it is stopped ($((Get-Service zapret).Status))" ((Get-Service zapret).Status -eq 'Stopped')
+$t = Start-Winws
+$r = Ask ('{"cmd":"stop_dpi","pid":' + $t.Id + '}')
+Check "a plain process ($r)" (($r -like '*"ok":true*') -and $t.WaitForExit(5000))
+# nothing but the tools: not this PowerShell, not BLACKWALL, not the system's
+$r = Ask ('{"cmd":"stop_dpi","pid":' + $PID + '}')
+Check "another process is left alone ($r)" ($r -like '*"ok":false*')
+$r = Ask '{"cmd":"stop_dpi","service":"BLACKWALL"}'
+Check "its own service too ($r)" (($r -like '*"ok":false*') -and (Get-Service BLACKWALL).Status -eq 'Running')
+$spooler = (Get-Service Spooler -ErrorAction SilentlyContinue).Status
+$r = Ask '{"cmd":"stop_dpi","service":"Spooler"}'
+Check "and a service of the system ($r)" (($r -like '*"ok":false*') -and (Get-Service Spooler -ErrorAction SilentlyContinue).Status -eq $spooler)
+& sc.exe stop BLACKWALL | Out-Null
+Start-Sleep -Seconds 4
+& sc.exe delete zapret | Out-Null
+if (Test-Path (Join-Path $zcfg 'service.events')) { Get-Content (Join-Path $zcfg 'service.events') -Tail 10 | Write-Host }
+
 & (Join-Path $Bin 'blackwall-service.exe') uninstall
 Check 'uninstalled' ($null -eq (Get-Service BLACKWALL -ErrorAction SilentlyContinue))
+
+Write-Host "== a crash of the window is in its log"
+# BLACKWALL_CRASH makes it crash at once, as it would (an illegal
+# instruction, a panic), and without the message box that asks the user
+$wcfg = Join-Path $env:RUNNER_TEMP 'bwwin'
+New-Item -ItemType Directory -Force $wcfg | Out-Null
+$appdata = $env:APPDATA
+$wlog = Join-Path $wcfg 'BLACKWALL\window.log'
+foreach ($how in 'trap', 'panic') {
+    $env:APPDATA = $wcfg
+    $env:BLACKWALL_CRASH = $how
+    $p = Start-Process -FilePath (Join-Path $Bin 'blackwall.exe') -PassThru -WindowStyle Hidden
+    $env:APPDATA = $appdata
+    Remove-Item Env:BLACKWALL_CRASH
+    $ended = $p.WaitForExit(30000)
+    if (-not $ended) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    $text = if (Test-Path $wlog) { Get-Content $wlog -Raw } else { '' }
+    Write-Host $text
+    if ($how -eq 'trap') {
+        Check "an illegal instruction, and where ($($p.ExitCode))" ($ended -and $text -match 'crash: illegal instruction \(0xc000001d\) at BLACKWALL\+0x[0-9a-f]+')
+    } else {
+        Check "a panic ($($p.ExitCode))" ($ended -and $text -match 'panic: BLACKWALL_CRASH')
+        Check 'the run before is kept' ((Get-Content (Join-Path $wcfg 'BLACKWALL\window.previous.log') -Raw) -match 'crash: illegal instruction')
+    }
+}
 
 if (Test-Path (Join-Path $cfg 'service.events')) {
     Write-Host "== service.events"

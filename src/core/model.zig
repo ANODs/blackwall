@@ -66,6 +66,18 @@ pub const Server = struct {
         return sv.members.len > 0;
     }
 
+    /// The links of a server: a group's, or its own.
+    pub fn linksOf(sv: *const Server, gpa: std.mem.Allocator) ![][]const u8 {
+        if (sv.members.len == 0) {
+            const one = try gpa.alloc([]const u8, 1);
+            one[0] = sv.link;
+            return one;
+        }
+        const all = try gpa.alloc([]const u8, sv.members.len);
+        for (sv.members, all) |m, *l| l.* = m.link;
+        return all;
+    }
+
     /// The country to show: where it exits when that was seen, else what
     /// the provider says.
     pub fn shownCountry(sv: *const Server) [2]u8 {
@@ -527,12 +539,40 @@ pub const State = struct {
         return false;
     }
 
+    /// One server out, and every reference to it (a key added by hand; a
+    /// subscription's would come back with its next refresh). The last key
+    /// takes its group of keys with it, so no empty heading is left.
+    pub fn removeServer(s: *State, id: u32) void {
+        for (s.servers.items, 0..) |sv, i| {
+            if (sv.id != id) continue;
+            const sub_id = sv.sub_id;
+            if (s.settings.selected_server == id) s.settings.selected_server = null;
+            if (s.settings.auto_server == id) s.settings.auto_server = null;
+            for (s.apps.items) |*a| {
+                if (a.route == .server and a.route.server == id) a.route = .default;
+            }
+            for (s.domains.items) |*d| {
+                if (d.route == .server and d.route.server == id) d.route = .default;
+            }
+            s.freeServer(sv);
+            _ = s.servers.orderedRemove(i);
+            const sub = s.subById(sub_id) orelse return;
+            if (sub.url.len > 0) return;
+            for (s.servers.items) |rest| {
+                if (rest.sub_id == sub_id) return;
+            }
+            s.removeSubscription(sub_id);
+            return;
+        }
+    }
+
     pub fn removeSubscription(s: *State, sub_id: u32) void {
         var i: usize = 0;
         while (i < s.servers.items.len) {
             const sv = s.servers.items[i];
             if (sv.sub_id == sub_id) {
                 if (s.settings.selected_server == sv.id) s.settings.selected_server = null;
+                if (s.settings.auto_server == sv.id) s.settings.auto_server = null;
                 for (s.apps.items) |*a| {
                     if (a.route == .server and a.route.server == sv.id) a.route = .default;
                 }
@@ -792,6 +832,27 @@ test "groups: matched by name when their servers change, pings by member" {
     try std.testing.expectEqual(80, g.members[0].ping_ms.?);
     try std.testing.expectEqualStrings("2.example", g.host);
     try std.testing.expectEqual(1, s.servers.items.len);
+}
+
+test "removing a key by hand: references go, and the last one takes its group" {
+    const gpa = std.testing.allocator;
+    var s: State = .init(gpa);
+    defer s.deinit();
+    const keys = (try s.addSubscription("Keys", "")).id;
+    const a = (try s.addServer(keys, .{ .name = "A", .host = "a.example", .port = 443, .protocol = .vless, .link = "vless://a@a.example:443" })).id;
+    const b = (try s.addServer(keys, .{ .name = "B", .host = "b.example", .port = 443, .protocol = .vless, .link = "vless://b@b.example:443" })).id;
+    s.settings.selected_server = a;
+    s.settings.auto_server = a;
+
+    s.removeServer(a);
+    try std.testing.expectEqual(null, s.settings.selected_server);
+    try std.testing.expectEqual(null, s.settings.auto_server);
+    try std.testing.expectEqual(1, s.servers.items.len);
+    try std.testing.expect(s.subById(keys) != null);
+
+    s.removeServer(b);
+    try std.testing.expectEqual(0, s.servers.items.len);
+    try std.testing.expectEqual(null, s.subById(keys));
 }
 
 test "a chosen server that left the subscription stays until Disconnect" {

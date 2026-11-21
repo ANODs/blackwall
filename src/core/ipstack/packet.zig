@@ -16,6 +16,29 @@ pub fn isV4(a: *const Addr) bool {
     return std.mem.eql(u8, a[0..12], &v4_prefix);
 }
 
+/// Multicast and broadcast: what the system says to its local network
+/// (LLMNR, mDNS, SSDP, NetBIOS), never meant for a tunnel.
+pub fn isLocalOnly(a: *const Addr) bool {
+    if (isV4(a)) return a[12] & 0xf0 == 0xe0 or std.mem.eql(u8, a[12..16], &.{ 255, 255, 255, 255 });
+    return a[0] == 0xff;
+}
+
+test "multicast and broadcast stay on the local network" {
+    try std.testing.expect(isLocalOnly(&v4(.{ 224, 0, 0, 252 }))); // LLMNR
+    try std.testing.expect(isLocalOnly(&v4(.{ 224, 0, 0, 251 }))); // mDNS
+    try std.testing.expect(isLocalOnly(&v4(.{ 239, 255, 255, 250 }))); // SSDP
+    try std.testing.expect(isLocalOnly(&v4(.{ 255, 255, 255, 255 })));
+    var ff02: Addr = @splat(0);
+    ff02[0] = 0xff;
+    ff02[1] = 0x02;
+    try std.testing.expect(isLocalOnly(&ff02));
+    try std.testing.expect(!isLocalOnly(&v4(.{ 104, 16, 0, 1 })));
+    try std.testing.expect(!isLocalOnly(&v4(.{ 192, 168, 1, 255 })));
+    var g: Addr = @splat(0);
+    g[0] = 0x26;
+    try std.testing.expect(!isLocalOnly(&g));
+}
+
 pub const Endpoint = struct {
     addr: Addr,
     port: u16,

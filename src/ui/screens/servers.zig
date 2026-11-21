@@ -79,7 +79,27 @@ fn empty() void {
 }
 
 fn subHeader(sub: model.Subscription, si: usize) bool {
-    var hb = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = si, .expand = .horizontal, .padding = .{ .x = 10, .w = 4 } });
+    var col = dvui.box(@src(), .{}, .{ .id_extra = si, .expand = .horizontal });
+    defer col.deinit();
+    const remove = subTitleRow(sub);
+    // what the provider says about it (announce), under its name
+    if (sub.announce.len > 0) {
+        var tl = dvui.textLayout(@src(), .{}, .{
+            .expand = .horizontal,
+            .background = false,
+            .padding = .{ .x = 10, .w = 48, .y = 3 },
+            .margin = .all(0),
+            .font = th.body(11.5).withLineHeight(1.2),
+            .color_text = w.col(th.text3),
+        });
+        tl.addText(sub.announce, .{});
+        tl.deinit();
+    }
+    return remove;
+}
+
+fn subTitleRow(sub: model.Subscription) bool {
+    var hb = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 10, .w = 4 } });
     defer hb.deinit();
     w.caption(@src(), sub.name, .{});
     if (sub.last_error) {
@@ -102,7 +122,110 @@ fn subHeader(sub: model.Subscription, si: usize) bool {
         w.gap(@src(), 6, 0);
     }
     if (app.state.demo) return false;
-    return w.iconButton(@src(), .trash, .{ .size = 26, .icon_size = 14, .color = th.text3, .tooltip = tr.remove }, .{});
+    return subMenu(sub);
+}
+
+/// The subscription's actions behind "⋯": refresh, its link, the provider's
+/// support, remove. True when it is to go.
+fn subMenu(sub: model.Subscription) bool {
+    var remove = false;
+    var m = dvui.menu(@src(), .horizontal, .{ .gravity_y = 0.5 });
+    defer m.deinit();
+    var mi = dvui.menuItem(@src(), .{ .submenu = true }, .{
+        .min_size_content = .{ .w = 18, .h = 18 },
+        .padding = .all(4),
+        .corners = .all(8),
+        .color_fill_hover = w.col(th.hover),
+    });
+    w.icon(@src(), .more, 16, th.text3, .{ .gravity_x = 0.5, .gravity_y = 0.5 });
+    const active = mi.activeRect();
+    mi.deinit();
+    const r = active orelse return false;
+    var fm = menuPopup(r);
+    defer fm.deinit();
+    if (sub.url.len > 0 and menuText(tr.refresh, 0)) {
+        app.fetch(sub.id);
+        m.close();
+    }
+    if (sub.url.len > 0 and menuText(tr.copy_link, 1)) {
+        dvui.clipboardTextSet(sub.url);
+        app.notify(false, tr.copied, .{});
+        m.close();
+    }
+    if (sub.support_url.len > 0 and menuText(tr.support, 2)) {
+        _ = dvui.openURL(.{ .url = sub.support_url });
+        m.close();
+    }
+    if (menuText(tr.remove, 3)) {
+        remove = true;
+        m.close();
+    }
+    return remove;
+}
+
+fn menuPopup(from: dvui.Rect.Natural) *dvui.FloatingMenuWidget {
+    return dvui.floatingMenu(@src(), .{ .from = from }, .{
+        .color_fill = w.col(th.raised),
+        .color_border = w.col(th.border),
+        .corners = .all(11),
+        .padding = .all(5),
+        .min_size_content = .{ .w = 190 },
+    });
+}
+
+fn menuText(label: []const u8, k: usize) bool {
+    var mi = dvui.menuItem(@src(), .{}, .{
+        .id_extra = k,
+        .expand = .horizontal,
+        .padding = .{ .x = 9, .y = 7, .w = 9, .h = 7 },
+        .corners = .all(8),
+        .color_fill_hover = w.col(th.hover),
+    });
+    defer mi.deinit();
+    w.text(@src(), label, th.body(13), th.text, .{});
+    return mi.activeRect() != null;
+}
+
+/// Right click on a server: its link (a group's, one a line), its Xray
+/// JSON, and removal of a key added by hand.
+fn serverMenu(sv: *const model.Server, i: usize, rect: dvui.Rect.Physical) void {
+    const ctx = dvui.context(@src(), .{ .rect = rect }, .{ .id_extra = i });
+    defer ctx.deinit();
+    const cp = ctx.activePoint() orelse return;
+    var fm = menuPopup(.fromPoint(cp));
+    defer fm.deinit();
+    const by_hand = if (app.state.subById(sv.sub_id)) |s| s.url.len == 0 else false;
+    if (menuText(tr.copy_link, 0)) {
+        copyLinks(sv);
+        fm.close();
+    }
+    if (menuText(tr.copy_json, 1)) {
+        copyJson(sv);
+        fm.close();
+    }
+    if (by_hand and menuText(tr.remove, 2)) {
+        app.state.removeServer(sv.id);
+        app.markDirty();
+        fm.close();
+    }
+}
+
+fn copyLinks(sv: *const model.Server) void {
+    const links = sv.linksOf(app.gpa) catch return;
+    defer app.gpa.free(links);
+    const text = std.mem.join(app.gpa, "\n", links) catch return;
+    defer app.gpa.free(text);
+    dvui.clipboardTextSet(text);
+    app.notify(false, tr.copied, .{});
+}
+
+fn copyJson(sv: *const model.Server) void {
+    const links = sv.linksOf(app.gpa) catch return;
+    defer app.gpa.free(links);
+    const json = core.xrayjson.config(app.gpa, sv.name, links) catch return app.notify(true, tr.no_json, .{});
+    defer app.gpa.free(json);
+    dvui.clipboardTextSet(json);
+    app.notify(false, tr.copied, .{});
 }
 
 fn rowButton(bw: *dvui.ButtonWidget, src: std.builtin.SourceLocation, id_extra: usize, selected: bool) void {
@@ -149,6 +272,7 @@ fn serverRow(sv: *model.Server, i: usize) void {
     const selected = app.state.settings.selected_server == sv.id;
     var hb = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = i, .expand = .horizontal });
     defer hb.deinit();
+    if (!app.state.demo) serverMenu(sv, i, hb.data().borderRectScale().r);
 
     var bw: dvui.ButtonWidget = undefined;
     rowButton(&bw, @src(), i, selected);

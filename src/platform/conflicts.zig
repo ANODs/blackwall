@@ -1,5 +1,7 @@
 //! Programs in the way of the connection (product concept 7.1), macOS:
-//! another VPN whose tunnel captures the traffic.
+//! another VPN whose tunnel captures the traffic, or DPI circumvention
+//! beside us. Windows: DPI circumvention (zapret, GoodbyeDPI, see
+//! core/win_dpi.zig), stopped by the BLACKWALL service.
 //!
 //! A conflict is what is observed: routes that send the address space into
 //! another tunnel. Who holds that tunnel is confirmed when the system says
@@ -18,10 +20,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("core");
 
-pub const supported = builtin.os.tag == .macos;
+const on_macos = builtin.os.tag == .macos;
+const on_windows = builtin.os.tag == .windows;
+pub const supported = on_macos or on_windows;
 
-const net = if (supported) @import("../helper/darwin/net.zig") else struct {};
-const proc = if (supported) @import("../helper/darwin/proc.zig") else struct {
+const net = if (on_macos) @import("../helper/darwin/net.zig") else struct {};
+const proc = if (on_macos) @import("../helper/darwin/proc.zig") else if (on_windows) struct {
+    pub const Identity = core.win_dpi.Identity;
+} else struct {
     pub const Identity = struct {
         pid: i32 = 0,
         uid: u32 = 0,
@@ -33,6 +39,7 @@ const proc = if (supported) @import("../helper/darwin/proc.zig") else struct {
 };
 const helper = core.helper_ipc;
 const ipc = core.ipc;
+const win_dpi = core.win_dpi;
 const Io = std.Io;
 
 pub const Identity = proc.Identity;
@@ -59,8 +66,9 @@ pub const Conflict = struct {
     /// "/Applications/Happ.app", to open it; empty without a bundle
     bundle_buf: [512]u8 = undefined,
     bundle_len: u16 = 0,
-    /// a connected VPN service of the system (its ID), stopped through it
-    service_buf: [36]u8 = undefined,
+    /// a connected VPN service of the system (its ID), stopped through it;
+    /// on Windows the service a DPI tool runs as (its name)
+    service_buf: [64]u8 = undefined,
     service_len: u8 = 0,
 
     pub fn ifname(c: *const Conflict) []const u8 {
@@ -98,6 +106,7 @@ fn bundleOf(path: []const u8) []const u8 {
 /// Other VPNs' tunnels that capture traffic now, with their owners.
 /// `own_ifname`: our own tunnel, when it is up. Caller frees.
 pub fn detect(gpa: std.mem.Allocator, io: Io) ![]Conflict {
+    if (comptime on_windows) return detectWindows(gpa);
     if (!supported) return &.{};
     // the helper knows our own tunnel (when it is up) and every owner
     const from_helper = helperOwners(gpa, io);
@@ -143,6 +152,32 @@ pub fn detect(gpa: std.mem.Allocator, io: Io) ![]Conflict {
         // the helper looked and found nobody: do not guess over its answer
         if (from_helper != null) continue;
         if (likelyOwner(gpa)) |id| c.setOwner(id, false);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Windows: zapret and GoodbyeDPI, one entry per tool, the one that runs
+/// as a service first (stopping only the process of a service would have
+/// the SCM start it again). Confirmed when the WinDivert driver they divert
+/// packets through is loaded.
+fn detectWindows(gpa: std.mem.Allocator) ![]Conflict {
+    const s = try win_dpi.scan(gpa);
+    defer gpa.free(s.found);
+    var out: std.ArrayList(Conflict) = .empty;
+    errdefer out.deinit(gpa);
+    for (s.found) |*f| {
+        const name = win_dpi.tools[f.tool].name;
+        const at = for (out.items, 0..) |c, i| {
+            if (std.mem.eql(u8, c.name(), name)) break i;
+        } else null;
+        if (at) |i| if (out.items[i].service_len > 0 or f.service_len == 0) continue;
+        var c: Conflict = .{ .kind = .dpi };
+        c.setOwner(f.id, s.windivert);
+        c.name_len = @intCast(name.len);
+        @memcpy(c.name_buf[0..name.len], name);
+        c.service_len = f.service_len;
+        @memcpy(c.service_buf[0..f.service_len], f.service());
+        if (at) |i| out.items[i] = c else try out.append(gpa, c);
     }
     return out.toOwnedSlice(gpa);
 }
@@ -355,8 +390,9 @@ pub const StopError = error{
 };
 
 /// Stop the owner of `c` (`kill`: without asking), then wait for its tunnel
-/// to stop capturing traffic.
-pub fn stop(gpa: std.mem.Allocator, io: Io, c: *const Conflict, kill: bool) StopError!void {
+/// to stop capturing traffic. `config_dir`: where the service listens (Windows).
+pub fn stop(gpa: std.mem.Allocator, io: Io, config_dir: []const u8, c: *const Conflict, kill: bool) StopError!void {
+    if (comptime on_windows) return stopWindows(gpa, io, config_dir, c, kill);
     if (!supported) return error.UnknownOwner;
     // zapret leaves pf sending 80/443 to a dead port when only its process
     // goes: its own script stops it and takes the rules away (as root)
@@ -420,6 +456,42 @@ pub fn stop(gpa: std.mem.Allocator, io: Io, c: *const Conflict, kill: bool) Stop
     return waitFree(gpa, io, c);
 }
 
+/// Windows: the tools run as administrators or as LocalSystem, so the
+/// BLACKWALL service (LocalSystem) stops them: the running one over its
+/// channel, or else the installed one, started just for this.
+fn stopWindows(gpa: std.mem.Allocator, io: Io, config_dir: []const u8, c: *const Conflict, kill: bool) StopError!void {
+    if (c.owner == null and c.service_len == 0) return error.UnknownOwner;
+    const id: win_dpi.Identity = c.owner orelse .{};
+    const r: win_dpi.Request = .{ .service = c.service(), .pid = id.pid, .start = id.start, .kill = kill };
+    var line_buf: [256]u8 = undefined;
+    const line = r.line(&line_buf) orelse return error.Refused;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var once = false;
+    if (ipc.request(gpa, io, ipc.socketPath(&path_buf, config_dir), line, 20_000)) |answer| {
+        defer gpa.free(answer);
+        const reply = std.json.parseFromSlice(win_dpi.Reply, gpa, answer, .{ .ignore_unknown_fields = true }) catch return error.Refused;
+        defer reply.deinit();
+        if (!reply.value.ok) return if (std.mem.eql(u8, reply.value.@"error", "Gone")) error.Gone else error.Refused;
+    } else |err| switch (err) {
+        // no service runs: the installed one does just this and ends
+        error.FileNotFound, error.ConnectionRefused => {
+            core.win_scm.start(&.{ "--stop-dpi", line[0 .. line.len - 1] }) catch return error.NeedsHelper;
+            once = true;
+        },
+        else => return error.Refused,
+    }
+    // gone once its process (and its service) is
+    for (0..75) |_| {
+        if (!win_dpi.present(c.service(), id.pid, id.start)) break;
+        io.sleep(.fromMilliseconds(200), .awake) catch {};
+    } else return error.StillActive;
+    // the service that ran for this has ended before the reconnect starts it
+    if (once) for (0..25) |_| {
+        if ((core.win_scm.query() orelse .stopped) == .stopped) break;
+        io.sleep(.fromMilliseconds(200), .awake) catch {};
+    };
+}
+
 /// The network is free once that tunnel no longer captures anything.
 fn waitFree(gpa: std.mem.Allocator, io: Io, c: *const Conflict) StopError!void {
     for (0..30) |_| {
@@ -436,7 +508,7 @@ fn waitFree(gpa: std.mem.Allocator, io: Io, c: *const Conflict) StopError!void {
 
 /// Bring the conflicting application forward, so its own switch can be used.
 pub fn openApp(io: Io, c: *const Conflict) void {
-    if (!supported or c.bundle_len == 0) return;
+    if (!on_macos or c.bundle_len == 0) return;
     var child = std.process.spawn(io, .{
         .argv = &.{ "/usr/bin/open", c.bundle() },
         .stdin = .ignore,
@@ -482,7 +554,7 @@ test "a system proxy on this machine" {
 test "bundle and name of an owner" {
     try std.testing.expectEqualStrings("/Applications/Happ.app", bundleOf("/Applications/Happ.app/Contents/MacOS/happd"));
     try std.testing.expectEqualStrings("", bundleOf("/opt/homebrew/bin/sing-box"));
-    if (!supported) return;
+    if (!on_macos) return;
     var c: Conflict = .{};
     var id: Identity = .{ .pid = 9, .uid = 0, .ppid = 1, .start_us = 1 };
     const p = "/Applications/Happ.app/Contents/MacOS/happd";

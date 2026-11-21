@@ -86,7 +86,7 @@ fn unwrap(a: std.mem.Allocator, body: []const u8) ![]const u8 {
     return (try decodeBase64(a, trimmed)) orelse trimmed;
 }
 
-fn decodeBase64(a: std.mem.Allocator, input: []const u8) !?[]u8 {
+pub fn decodeBase64(a: std.mem.Allocator, input: []const u8) !?[]u8 {
     // normalise: drop whitespace and padding, map URL-safe alphabet
     var clean = try a.alloc(u8, input.len);
     var n: usize = 0;
@@ -421,8 +421,9 @@ fn outboundLink(a: std.mem.Allocator, ob: std.json.Value) LinkError!?Converted {
 /// `announce`, `support-url`. Values may be plain or "base64:<text>".
 pub fn metaFromHeaders(a: std.mem.Allocator, title: ?[]const u8, interval: ?[]const u8, announce: ?[]const u8, support: ?[]const u8) !model.SubMeta {
     var meta: model.SubMeta = .{};
-    if (title) |t| meta.title = try headerText(a, t);
-    if (announce) |t| meta.announce = try headerText(a, t);
+    // shown as text: emoji (no glyphs for them) and blank lines go
+    if (title) |t| meta.title = try cleanName(a, try headerText(a, t));
+    if (announce) |t| meta.announce = try cleanNote(a, try headerText(a, t));
     if (interval) |t| if (std.fmt.parseInt(u16, std.mem.trim(u8, t, " "), 10)) |h| {
         // hourly at most, weekly at least
         meta.update_hours = if (h == 0) 0 else std.math.clamp(h, 1, 168);
@@ -433,6 +434,27 @@ pub fn metaFromHeaders(a: std.mem.Allocator, title: ?[]const u8, interval: ?[]co
             meta.support_url = try a.dupe(u8, url);
     }
     return meta;
+}
+
+/// A provider's note as lines of text: each cleaned as a name is (emoji out,
+/// spaces collapsed), "\\n" taken as a line break, blank lines dropped, a
+/// space left before punctuation by a removed emoji closed up.
+fn cleanNote(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitAny(u8, text, "\r\n");
+    while (lines.next()) |raw_line| {
+        var parts = std.mem.splitSequence(u8, raw_line, "\\n");
+        while (parts.next()) |part| {
+            const line = try cleanName(a, part);
+            if (line.len == 0) continue;
+            if (out.items.len > 0) try out.append(a, '\n');
+            for (line, 0..) |ch, i| {
+                if (ch == ' ' and i + 1 < line.len and std.mem.indexOfScalar(u8, ",.;:!?)", line[i + 1]) != null) continue;
+                try out.append(a, ch);
+            }
+        }
+    }
+    return out.items;
 }
 
 fn headerText(a: std.mem.Allocator, value: []const u8) ![]const u8 {
@@ -575,7 +597,7 @@ fn named(a: std.mem.Allocator, remark: []const u8, sv: model.State.NewServer) Li
     return out;
 }
 
-fn percentDecode(a: std.mem.Allocator, s: []const u8) ![]u8 {
+pub fn percentDecode(a: std.mem.Allocator, s: []const u8) ![]u8 {
     var out = try a.alloc(u8, s.len);
     var n: usize = 0;
     var i: usize = 0;
@@ -989,4 +1011,13 @@ test "a plain list's own header lines" {
     try std.testing.expectEqual(3, parsed.meta.update_hours.?);
     try std.testing.expectEqualStrings("72 серверов", parsed.meta.announce.?);
     try std.testing.expectEqual(null, parsed.meta.support_url);
+}
+
+test "a provider's note: no emoji, no blank lines, no stray spaces" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("ID: usr1\nНажмите кнопку, если у Вас не работает VPN", try cleanNote(a, "ID: usr1\n\nНажмите кнопку 🔄, если у Вас не работает VPN\n\n\n\n"));
+    try std.testing.expectEqualStrings("один\nдва", try cleanNote(a, "  один \\n два  "));
+    try std.testing.expectEqualStrings("", try cleanNote(a, "\n 🔥 \n"));
 }

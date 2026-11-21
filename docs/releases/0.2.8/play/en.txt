@@ -1,0 +1,1 @@
+Reserve servers are measured in the background for response time and speed; when the server fails, the best measured one takes over.

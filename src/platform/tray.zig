@@ -53,7 +53,9 @@ const Look = enum { off, guard, busy, on, blocked };
 
 const icon_px = 44;
 const looks = std.enums.values(Look).len;
-var icons: [looks][icon_px * icon_px * 4]u8 = undefined;
+/// Pixels SDL reads as 32-bit words: on a byte boundary its blitter's
+/// alignment check stops the process (Windows 0.2.9, issue #4).
+var icons: [looks][icon_px * icon_px * 4]u8 align(4) = undefined;
 var surfaces: [looks]?*c.SDL_Surface = @splat(null);
 
 /// Create the item. Call once the window exists.

@@ -528,7 +528,8 @@ var dial_log_skipped: std.atomic.Value(u32) = .init(0);
 
 /// Why a server could not be reached, in the log: at most one line every
 /// few seconds, with the number of failures left out in between.
-fn noteDialFailure(io: Io, host: []const u8, err: anyerror, http_status: ?u16) void {
+/// `os_status`: on Windows, the NTSTATUS a failed read ended with (0: none).
+fn noteDialFailure(io: Io, host: []const u8, err: anyerror, http_status: ?u16, os_status: u32) void {
     const now = Io.Clock.awake.now(io).toMilliseconds();
     const last = dial_log_ms.load(.monotonic);
     if (last != 0 and now - last < 5000) {
@@ -537,7 +538,9 @@ fn noteDialFailure(io: Io, host: []const u8, err: anyerror, http_status: ?u16) v
     }
     if (dial_log_ms.cmpxchgStrong(last, now, .monotonic, .monotonic) != null) return;
     const more = dial_log_skipped.swap(0, .monotonic);
-    if (http_status) |st|
+    if (os_status != 0)
+        std.log.scoped(.proxy).warn("server {s}: {t}, status 0x{x:0>8} (+{d} more failures)", .{ host, err, os_status, more })
+    else if (http_status) |st|
         std.log.scoped(.proxy).warn("server {s}: {t}, HTTP {d} (+{d} more failures)", .{ host, err, st, more })
     else
         std.log.scoped(.proxy).warn("server {s}: {t} (+{d} more failures)", .{ host, err, more });
@@ -1294,13 +1297,15 @@ pub const Flow = struct {
         var wait_ms: u32 = redial_first_ms;
         var attempt: u32 = 1;
         while (true) : (attempt += 1) {
+            // set by the reader, which a dial that fails to connect never makes
+            u.ur.os_status = 0;
             f.dialInner(ob, &v, u) catch |err| {
                 if (attempt < redial_attempts and redialable(err, u.layer_status) and f.pause(wait_ms)) {
                     wait_ms *= 2;
                     continue;
                 }
                 if (u.fault != .none) f.fault(u.fault);
-                noteDialFailure(f.io, v.host, err, if (u.layer_status != 0) u.layer_status else null);
+                noteDialFailure(f.io, v.host, err, if (u.layer_status != 0) u.layer_status else null, u.ur.os_status);
                 return err;
             };
             return;
@@ -1455,7 +1460,7 @@ pub const Flow = struct {
     fn noteRefusal(f: *const Flow, u: *Upstream, host: []const u8) void {
         const err = u.refusal() orelse return;
         f.fault(.handshake);
-        noteDialFailure(f.io, host, err, if (u.layer_status != 0) u.layer_status else null);
+        noteDialFailure(f.io, host, err, if (u.layer_status != 0) u.layer_status else null, u.ur.os_status);
     }
 
     fn runVless(f: *const Flow, ob: *const Outbound, local: *Local, target: *const Target) !void {

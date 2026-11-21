@@ -1,0 +1,1 @@
+Local network chatter (mDNS, SSDP and the like) no longer goes into the tunnel.

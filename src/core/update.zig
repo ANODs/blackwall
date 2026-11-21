@@ -318,6 +318,16 @@ pub const Install = struct {
         return Io.Dir.cwd().openDir(io, inst.parent, .{});
     }
 
+    /// One rename inside the install's folder. On Windows by MoveFileExW,
+    /// which asks only for the right to delete: std's rename also asks to
+    /// write, which a running executable refuses, so the app could never
+    /// move itself aside (FileBusy, issue #6). A file just written may be
+    /// held a moment longer by a virus scanner: that is waited out.
+    fn move(inst: Install, dir: Io.Dir, io: Io, from: []const u8, to: []const u8) !void {
+        if (comptime builtin.os.tag != .windows) return dir.rename(from, dir, to, io);
+        return moveWindows(io, inst.parent, from, to);
+    }
+
     /// Unpacks a verified asset next to the app and checks that it really is
     /// `version`. The running app is not touched.
     pub fn stage(inst: Install, gpa: std.mem.Allocator, io: Io, package: Package, asset: []const u8, version: []const u8) !void {
@@ -362,9 +372,9 @@ pub const Install = struct {
         // or a crash of it could not be rolled back
         try writeMarker(dir, io, &names, .pending, version);
         errdefer dir.deleteFile(io, names.marker) catch {};
-        try dir.rename(inst.name, dir, names.previous, io);
-        dir.rename(staged, dir, inst.name, io) catch |err| {
-            dir.rename(names.previous, dir, inst.name, io) catch {};
+        try inst.move(dir, io, inst.name, names.previous);
+        inst.move(dir, io, staged, inst.name) catch |err| {
+            inst.move(dir, io, names.previous, inst.name) catch {};
             return err;
         };
         if (package == .tar_gz) swapCompanions(dir, io, names.staging);
@@ -418,10 +428,10 @@ pub const Install = struct {
             return false;
         };
         try dir.deleteTree(io, names.failed);
-        try dir.rename(inst.name, dir, names.failed, io);
-        dir.rename(names.previous, dir, inst.name, io) catch |err| {
+        try inst.move(dir, io, inst.name, names.failed);
+        inst.move(dir, io, names.previous, inst.name) catch |err| {
             // never leave the user without an app at its usual place
-            dir.rename(names.failed, dir, inst.name, io) catch {};
+            inst.move(dir, io, names.failed, inst.name) catch {};
             return err;
         };
         restoreCompanions(dir, io);
@@ -460,6 +470,37 @@ pub const Install = struct {
         _ = try std.process.spawn(io, .{ .argv = &.{path}, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
     }
 };
+
+const win = struct {
+    extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: u32) callconv(.winapi) c_int;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+    const MOVEFILE_REPLACE_EXISTING = 0x1;
+    const ERROR_ACCESS_DENIED = 5;
+    const ERROR_SHARING_VIOLATION = 32;
+    const ERROR_LOCK_VIOLATION = 33;
+};
+
+/// `parent\from` to `parent\to`, retried for a few seconds while another
+/// process (a virus scanner) holds the file.
+fn moveWindows(io: Io, parent: []const u8, from: []const u8, to: []const u8) !void {
+    var a_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    var b_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    var a: [Io.Dir.max_path_bytes:0]u16 = undefined;
+    var b: [Io.Dir.max_path_bytes:0]u16 = undefined;
+    const an = try std.unicode.wtf8ToWtf16Le(&a, try std.fmt.bufPrint(&a_buf, "{s}\\{s}", .{ parent, from }));
+    a[an] = 0;
+    const bn = try std.unicode.wtf8ToWtf16Le(&b, try std.fmt.bufPrint(&b_buf, "{s}\\{s}", .{ parent, to }));
+    b[bn] = 0;
+    for (0..40) |_| {
+        if (win.MoveFileExW(a[0..an :0], b[0..bn :0], win.MOVEFILE_REPLACE_EXISTING) != 0) return;
+        switch (win.GetLastError()) {
+            win.ERROR_SHARING_VIOLATION, win.ERROR_LOCK_VIOLATION, win.ERROR_ACCESS_DENIED => io.sleep(.fromMilliseconds(250), .awake) catch {},
+            2, 3 => return error.FileNotFound, // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+            else => return error.Unexpected,
+        }
+    }
+    return error.FileBusy;
+}
 
 const MarkerState = enum { pending, launched, rejected };
 const Marker = struct { state: MarkerState, version: []const u8 };
@@ -553,6 +594,7 @@ fn cleanup(dir: Io.Dir, io: Io, names: *const Install.Names) void {
     for ([_][]const u8{ names.previous, names.failed, names.staging, names.marker_new }) |n| {
         dir.deleteTree(io, n) catch |err| std.log.warn("update: {s} not removed: {t}", .{ n, err });
     }
+    dropCompanions(dir, io);
 }
 
 fn checkStaged(gpa: std.mem.Allocator, io: Io, staging: Io.Dir, package: Package, version: []const u8) !void {
@@ -898,4 +940,32 @@ test "macOS bundle: unzip with ditto, swap, roll back" {
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, ".BLACKWALL.app.update", .{}));
     try testing.expectEqualStrings("0.2.0", plistVersion(try readAll(tmp.dir, "BLACKWALL.app/Contents/Info.plist", &buf)).?);
     try testing.expectEqualStrings("not ours", try readAll(tmp.dir, "Other.app", &buf));
+}
+
+test "Windows: a running executable moves aside, as the app does to update itself" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    // a copy of cmd.exe, running a few seconds
+    const cmd = try Io.Dir.cwd().readFileAlloc(io, "C:\\Windows\\System32\\cmd.exe", std.testing.allocator, .limited(16 << 20));
+    defer std.testing.allocator.free(cmd);
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.exe", .data = cmd });
+    var exe_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const exe = try std.fmt.bufPrint(&exe_buf, "{s}\\app.exe", .{dir});
+    var child = try std.process.spawn(io, .{ .argv = &.{ exe, "/c", "ping -n 6 127.0.0.1 >nul" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    defer {
+        child.kill(io);
+    }
+    io.sleep(.fromMilliseconds(300), .awake) catch {};
+    // std asks to write to it as well, which Windows refuses while it runs
+    try std.testing.expectError(error.FileBusy, tmp.dir.rename("app.exe", tmp.dir, "app.exe.previous", io));
+    const inst: Install = .{ .parent = dir, .name = "app.exe" };
+    try inst.move(tmp.dir, io, "app.exe", "app.exe.previous");
+    try tmp.dir.access(io, "app.exe.previous", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "new.exe", .data = "MZ" });
+    try inst.move(tmp.dir, io, "new.exe", "app.exe");
+    try tmp.dir.access(io, "app.exe", .{});
 }

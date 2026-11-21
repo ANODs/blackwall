@@ -91,9 +91,20 @@ fn openEvents(io: Io, config_dir: []const u8) void {
     events_fd = c.open(@ptrCast(path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c.mode_t, 0o600));
 }
 
+/// What this run has logged. A service runs for weeks and the events file
+/// is only rotated at a start: past `events_max`, only what went wrong is
+/// written; past twice that, nothing more (service.log and service.events).
+var logged = std.atomic.Value(usize).init(0);
+
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    const so_far = logged.load(.monotonic);
+    if (so_far > 2 * events_max) return;
+    if (so_far > events_max and @intFromEnum(level) > @intFromEnum(std.log.Level.warn)) return;
     std.log.defaultLog(level, scope, format, args);
-    if (if (on_windows) events_fd == null else events_fd < 0) return;
+    if (if (on_windows) events_fd == null else events_fd < 0) {
+        _ = logged.fetchAdd(80, .monotonic);
+        return;
+    }
     var buf: [640]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     const t = core.diag.now();
@@ -103,6 +114,7 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
     if (w.end >= buf.len) w.end = buf.len - 1;
     w.writeByte('\n') catch {};
     const line = w.buffered();
+    _ = logged.fetchAdd(line.len, .monotonic);
     if (comptime on_windows) {
         _ = k32.WriteFile(events_fd.?, line.ptr, @intCast(line.len), null, null);
     } else _ = c.write(events_fd, line.ptr, line.len);
@@ -135,6 +147,8 @@ const Service = struct {
     tun_fd: ?i32 = null,
     /// the Wintun adapter and its routes (Windows)
     lease: if (on_windows) ?win.Lease else void = if (on_windows) null else {},
+    /// where the window reaches the service, and the secret it sends (Windows)
+    endpoint: if (on_windows) ipc.Endpoint else void = if (on_windows) undefined else {},
     via_helper: bool = false,
     /// the device is ours to set up and take down (Linux, `--tun auto`)
     own_device: bool = false,
@@ -289,12 +303,14 @@ const Service = struct {
             errdefer t.destroy();
             try t.setConfig(s.built.?.cfg);
             s.device = try .init(fd, builtin.os.tag.isDarwin());
-            s.t = t;
+            errdefer s.device.deinit();
             s.device_thread = try std.Thread.spawn(.{ .stack_size = core.sys.stackSize(512 * 1024) }, tunnel.Tunnel.run, .{ t, &s.device });
+            s.t = t;
             log.info("tun up (fd {d}, mtu {d})", .{ fd, s.args.mtu });
         }
         if (s.args.socks) |port| {
             const p = try s.gpa.create(proxy.Proxy);
+            errdefer s.gpa.destroy(p);
             p.* = .{ .io = s.io };
             const cfg = s.built.?.cfg;
             p.setOutbound(switch (cfg.default) {
@@ -346,8 +362,8 @@ const Service = struct {
         const t = try tunnel.Tunnel.create(s.gpa, s.io, .{ .mtu = s.args.mtu, .bind = .{ .index = lease.bind_index }, .upstream_dns = dns_servers, .lookup = lookup });
         errdefer t.destroy();
         try t.setConfig(s.built.?.cfg);
-        s.t = t;
         s.device_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, tunnel.Tunnel.run, .{ t, &lease.device });
+        s.t = t;
         log.info("tun up (wintun, mtu {d})", .{s.args.mtu});
     }
 
@@ -562,6 +578,7 @@ const Service = struct {
     /// so a window waiting for the service to go sees it go only then.
     fn listen(s: *Service, path: []const u8) !std.Io.net.Server {
         std.Io.Dir.cwd().deleteFile(s.io, path) catch {};
+        if (comptime on_windows) return s.listenLoopback(path);
         const addr = try std.Io.net.UnixAddress.init(path);
         const server = try addr.listen(s.io, .{});
         // the socket file is the access control: owner only
@@ -571,6 +588,25 @@ const Service = struct {
         // Windows: the folder's own permissions (the user's profile) guard it
         if (comptime !on_windows) _ = c.chmod(&z, 0o600);
         log.info("listening on {s}", .{path});
+        return server;
+    }
+
+    /// Windows: on the loopback, at a port the system picks; the file at
+    /// `path` says where, with the secret a client must send first
+    /// (`ipc.Endpoint`). Written whole under another name and renamed, so
+    /// a window never reads half of it.
+    fn listenLoopback(s: *Service, path: []const u8) !std.Io.net.Server {
+        const here: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var server = try here.listen(s.io, .{});
+        errdefer server.deinit(s.io);
+        s.endpoint = .fresh(s.io, server.socket.address.getPort());
+        var text_buf: [ipc.Endpoint.max_text]u8 = undefined;
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.new", .{path});
+        const dir = std.Io.Dir.cwd();
+        try dir.writeFile(s.io, .{ .sub_path = tmp, .data = s.endpoint.text(&text_buf) });
+        try dir.rename(tmp, dir, path, s.io);
+        log.info("listening on 127.0.0.1:{d}", .{s.endpoint.port});
         return server;
     }
 
@@ -585,7 +621,12 @@ const Service = struct {
             var r = conn.reader(s.io, &rb);
             var wb: [64 * 1024]u8 = undefined;
             var w = conn.writer(s.io, &wb);
-            const line = r.interface.takeDelimiterExclusive('\n') catch continue;
+            // Windows: anyone on the machine reaches the port; the secret first
+            var req_buf: [ipc.Endpoint.max_text + 1024]u8 = undefined;
+            const line = if (comptime on_windows)
+                (ipc.readAdmitted(s.io, &s.endpoint, conn.socket.handle, &req_buf) orelse continue)
+            else
+                (r.interface.takeDelimiterExclusive('\n') catch continue);
             const req = std.json.parseFromSlice(ipc.Request, s.gpa, line, .{ .ignore_unknown_fields = true }) catch {
                 w.interface.writeAll("{\"error\":\"bad request\"}\n") catch {};
                 w.interface.flush() catch {};
@@ -617,6 +658,10 @@ const Service = struct {
                     s.gpa.destroy(job);
                     w.interface.writeAll("{\"ms\":null}\n") catch {};
                 }
+            } else if (on_windows and std.mem.eql(u8, cmd, "stop_dpi")) {
+                // zapret or GoodbyeDPI beside us, at the window's word (core/win_dpi.zig);
+                // it answers from a thread of its own
+                if (core.win_dpi.serve(s.io, conn, line)) conn_kept = true else w.interface.writeAll("{\"ok\":false}\n") catch {};
             } else if (std.mem.eql(u8, cmd, "stop") or std.mem.eql(u8, cmd, "suspend")) {
                 s.keep_capture = std.mem.eql(u8, cmd, "suspend");
                 w.interface.writeAll("{\"ok\":true}\n") catch {};
@@ -925,6 +970,10 @@ fn serve(init: std.process.Init, argv: []const []const u8) !void {
             i += 1;
         } else if (on_windows and std.mem.eql(u8, arg, "--upgrade")) {
             return upgradeWindows(init, val);
+        } else if (on_windows and std.mem.eql(u8, arg, "--stop-dpi")) {
+            // started by the window just for this, when no service ran to ask
+            core.win_dpi.handle(val) catch {};
+            return;
         } else if (std.mem.eql(u8, arg, "--release")) {
             // let go of what a service that is gone still holds
             linux.remove();
@@ -962,7 +1011,9 @@ fn serve(init: std.process.Init, argv: []const []const u8) !void {
     }
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = ipc.socketPath(&path_buf, s.config_dir);
+    // which step failed goes to the events (a report shows them)
     var server = s.listen(path) catch |err| {
+        log.err("window channel: {t}", .{err});
         s.writeError(err);
         return err;
     };
@@ -972,7 +1023,12 @@ fn serve(init: std.process.Init, argv: []const []const u8) !void {
         std.Io.Dir.cwd().deleteFile(init.io, path) catch {};
     }
     s.start() catch |err| {
+        log.err("start: {t}", .{err});
         s.writeError(err);
+        // what was set up is freed; a capture in place stays, as after a
+        // crash: the kill switch decides
+        s.keep_capture = true;
+        s.shutdown();
         return err;
     };
     defer s.shutdown();

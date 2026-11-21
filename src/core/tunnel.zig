@@ -488,6 +488,12 @@ pub const Tunnel = struct {
     fn onUdp(ctx: *anyopaque, src: Endpoint, dst: Endpoint, payload: []const u8) void {
         const t: *Tunnel = @ptrCast(@alignCast(ctx));
         if (t.stopping.load(.acquire)) return;
+        // the system's own talk to its network (LLMNR, mDNS, SSDP): never
+        // tunneled. On Windows LLMNR queries came in by the thousand a
+        // second, each a new flow looked up on the device's thread, and
+        // their answers came back in: the acknowledgements of every TCP
+        // flow waited behind them (issue #5)
+        if (packet.isLocalOnly(&dst.addr)) return;
         if (dst.port == 53) return t.dnsQuery(src, dst, payload);
         t.udpDatagram(src, dst, payload);
     }
@@ -957,6 +963,8 @@ pub const Tunnel = struct {
         t.device = dev;
         var buf: [65536 + 4]u8 = undefined;
         var last_sweep = t.nowMs();
+        // Windows: the last batch stopped at its limit
+        var more = false;
         while (!t.stopping.load(.acquire)) {
             const wait = @min(t.stack.tick(), 10_000);
             if (t.nowMs() - last_sweep > 10_000) {
@@ -965,12 +973,16 @@ pub const Tunnel = struct {
                 t.group.tick();
             }
             if (comptime windows) {
-                dev.wait(@intCast(wait));
+                // Wintun sets its event only after a read found the ring
+                // empty: after a batch that stopped at its limit, read on
+                // at once instead of waiting for an event that may not come
+                if (!more) dev.wait(@intCast(wait));
+                more = false;
                 var batch: usize = 0;
-                while (batch < 64) : (batch += 1) {
+                while (batch < 256) : (batch += 1) {
                     const pkt = dev.read(&buf) orelse break;
                     if (pkt.len > 0) t.stack.input(pkt);
-                }
+                } else more = true;
                 if (batch > 0) t.stack.flush();
                 continue;
             }

@@ -61,6 +61,23 @@ service dies.
 A clean stop removes the filters; "suspend" (a restart by the window) keeps them.
 Disconnect after a crash starts the service with `--release`, which only removes them.
 
+## DPI circumvention beside it
+
+zapret (`winws.exe`, also in the zapret-discord-youtube bundle) and GoodbyeDPI
+(`goodbyedpi.exe`) rewrite packets through the WinDivert driver, the VPN's own among
+them. [src/core/win_dpi.zig](../src/core/win_dpi.zig):
+
+- **Found** by the window at every Connect, without any rights: the process list, the
+  services they run as (any name; `zapret` and `GoodbyeDPI` also when the executable is
+  called otherwise), and a loaded WinDivert driver, which confirms it. Shown like a VPN
+  in the way on macOS: the notice, then the list with Stop and reconnect.
+- **Stopped** by the service, since the tools run as administrators or as LocalSystem:
+  `stop_dpi` over its channel, or, when none runs, the installed one started with
+  `--stop-dpi` for just that. A service through the SCM, its process only when it does
+  not stop (or on Force quit); a plain process only when its number and start time are
+  still the ones shown. Only those two executables, outside the Windows folder and not
+  critical, and services of those names; never `BLACKWALL` itself.
+
 ## Testing
 
 `.github/workflows/windows-e2e.yml` runs on a Windows machine of CI:
@@ -68,7 +85,8 @@ Disconnect after a crash starts the service with `--release`, which only removes
 - the socket layer;
 - the whole suite;
 - [tools/windows/e2e.ps1](../tools/windows/e2e.ps1): capture, routes per application,
-  install as a service, the kill switch;
+  install as a service, the kill switch, stopping stand-ins of zapret (a process and a
+  service) and refusing anything else;
 - [tools/windows/upgrade.ps1](../tools/windows/upgrade.ps1): a signed upgrade, and a
   forged one refused.
 
