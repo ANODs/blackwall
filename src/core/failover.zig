@@ -151,9 +151,14 @@ pub const Group = struct {
 
     /// Replace the members: `list[0]` is the main server, the rest the
     /// reserve in the user's order. The member in use stays in use when it
-    /// is still on the list and the main server did not change. Servers
-    /// that stay keep what the measuring pass found about them, and where
-    /// they exit.
+    /// is still on the list and the main server did not change. A reserve
+    /// server in use stays also when the main server did change: it is
+    /// known to carry traffic, the new main server is not, so that one is
+    /// looked at first (`lookBack`) and taken only if it answers. Servers
+    /// that stay keep what the measuring pass found about them, where they
+    /// exit, and the failures counted against the one in use: the window
+    /// rewrites the configuration often, and a reload must not make a
+    /// failing server look fresh.
     pub fn set(g: *Group, list: []const proxy.Outbound) void {
         if (!g.place(list)) return g.exit_ms.store(0, .monotonic);
         g.exit_tries.store(0, .monotonic);
@@ -168,10 +173,17 @@ pub const Group = struct {
         defer g.mutex.unlock(g.io);
         const n = @min(list.len, max_members);
         var keep: usize = 0;
-        if (g.len > 0 and n > 0 and same(&g.members[0].get(), &list[0])) {
-            const cur = g.members[g.active].get();
-            for (list[0..n], 0..) |*o, i| {
-                if (same(&cur, o)) keep = i;
+        var stays = false;
+        var new_main = false;
+        if (g.len > 0 and n > 0) {
+            new_main = !same(&g.members[0].get(), &list[0]);
+            if (!new_main or g.active != 0) {
+                const cur = g.members[g.active].get();
+                for (list[0..n], 0..) |*o, i| {
+                    if (!same(&cur, o)) continue;
+                    keep = i;
+                    stays = true;
+                }
             }
         }
         var marks: [max_members]Mark = @splat(.{});
@@ -200,9 +212,12 @@ pub const Group = struct {
         if (keep == 0) {
             g.back_ms.store(0, .monotonic);
             g.next_ms.store(0, .monotonic);
+        } else if (new_main) {
+            // on the reserve with a main server never tried: look at it now
+            g.back_ms.store(g.nowMs(), .monotonic);
         }
         g.active = keep;
-        g.score.store(0, .monotonic);
+        if (!stays) g.score.store(0, .monotonic);
         return g.check_exit and n > 0 and !known(g.exits[keep]);
     }
 
@@ -912,7 +927,7 @@ test "nothing works: the server stays, and the next recovery waits" {
     try testing.expectEqual(0, g.activeIndex());
 }
 
-test "a new list keeps the server in use; a new main server starts over" {
+test "a new list keeps the server in use; a new main server is taken only if it carries traffic" {
     var g = Fake.group();
     g.set(&.{ Fake.server("a.example"), Fake.server("b.example"), Fake.server("c.example") });
     Fake.alive = .{ false, false, true, false };
@@ -922,12 +937,40 @@ test "a new list keeps the server in use; a new main server starts over" {
     // b left the reserve: c is still the one in use
     g.set(&.{ Fake.server("a.example"), Fake.server("c.example") });
     try testing.expectEqualStrings("c.example", g.current().?.get().vless.host);
-    // the user chose another main server
+    // another main server (the window found another "fastest") that does not
+    // carry traffic: the reserve server that does stays in use
+    g.set(&.{ Fake.server("d.example"), Fake.server("c.example") });
+    try testing.expectEqualStrings("c.example", g.current().?.get().vless.host);
+    try testing.expect(g.back_ms.load(.monotonic) != 0);
+    g.tick();
+    Fake.settle(&g);
+    try testing.expectEqualStrings("c.example", g.current().?.get().vless.host);
+    // one that does is taken as soon as it was looked at
+    Fake.alive[1] = true;
+    g.set(&.{ Fake.server("b.example"), Fake.server("c.example") });
+    try testing.expectEqualStrings("c.example", g.current().?.get().vless.host);
+    g.tick();
+    Fake.settle(&g);
+    try testing.expectEqualStrings("b.example", g.current().?.get().vless.host);
+    try testing.expectEqual(0, g.back_ms.load(.monotonic));
+    // on the main server, a new main server is simply the one in use
     g.set(&.{ Fake.server("d.example"), Fake.server("c.example") });
     try testing.expectEqualStrings("d.example", g.current().?.get().vless.host);
-    try testing.expectEqual(0, g.back_ms.load(.monotonic));
     g.set(&.{});
     try testing.expect(g.current() == null);
+}
+
+test "a reload does not forget the failures counted against the server in use" {
+    var g = Fake.group();
+    g.set(&.{ Fake.server("a.example"), Fake.server("b.example") });
+    Fake.alive = .{ false, true, false, false };
+    Fake.accepts = .{ null, 5, null, null };
+    // two dial failures, the same list again (the window saved its settings), a third
+    g.report(.dial_failed);
+    g.report(.dial_failed);
+    g.set(&.{ Fake.server("a.example"), Fake.server("b.example") });
+    Fake.fail(&g, 1);
+    try testing.expectEqual(1, g.activeIndex());
 }
 
 test "the measuring pass runs when due and only while data flows, one server at a time" {
