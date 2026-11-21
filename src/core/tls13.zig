@@ -22,6 +22,7 @@
 //! decoder to carry.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const crypto = std.crypto;
 const aes_gcm = @import("aes_gcm.zig");
 const tls = crypto.tls;
@@ -68,14 +69,62 @@ pub const Negotiated = struct {
 
 /// The system's trust store, loaded on first use and kept for the life of
 /// the process (a few hundred KB; REALITY-only setups never load it).
+///
+/// Windows keeps in its store only the roots it already fetched: it adds a
+/// missing one when its own CryptoAPI first meets it, which a browser with
+/// a store of its own (Chrome) never makes it do. A server whose
+/// certificate chains to a root not fetched yet (Let's Encrypt's, say)
+/// failed there while it worked everywhere else. Windows also gets a copy
+/// of a full root store (roots.pem: macOS's system roots), checked the
+/// same way; nothing is fetched, the tunnel may be the only way out.
 pub fn systemRoots(io: Io) error{NoRoots}!*const crypto.Certificate.Bundle {
     roots_mutex.lockUncancelable(io);
     defer roots_mutex.unlock(io);
     if (!roots_loaded) {
-        roots_bundle.rescan(std.heap.page_allocator, io, Io.Clock.real.now(io)) catch return error.NoRoots;
+        const gpa = std.heap.page_allocator;
+        const now = Io.Clock.real.now(io);
+        const scanned = if (roots_bundle.rescan(gpa, io, now)) true else |_| false;
+        if (comptime builtin.os.tag == .windows) addPem(&roots_bundle, gpa, bundled_roots, now.toSeconds()) catch {};
+        if (!scanned and roots_bundle.map.count() == 0) return error.NoRoots;
         roots_loaded = true;
     }
     return &roots_bundle;
+}
+
+const bundled_roots = if (builtin.os.tag == .windows) @embedFile("roots.pem") else "";
+
+/// Certificates from PEM text into `cb`, as `Bundle.addCertsFromFile` reads
+/// them from a file (expired ones and duplicates of a subject are left out).
+fn addPem(cb: *crypto.Certificate.Bundle, gpa: std.mem.Allocator, pem: []const u8, now_sec: i64) !void {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, pem, at, begin)) |b| {
+        const start = b + begin.len;
+        const stop = std.mem.indexOfPos(u8, pem, start, end) orelse return error.MissingEndCertificateMarker;
+        at = stop + end.len;
+        const encoded = std.mem.trim(u8, pem[start..stop], " \t\r\n");
+        try cb.bytes.ensureUnusedCapacity(gpa, base64.calcSizeUpperBound(encoded.len));
+        const first: u32 = @intCast(cb.bytes.items.len);
+        cb.bytes.items.len += try base64.decode(cb.bytes.unusedCapacitySlice(), encoded);
+        try cb.parseCert(gpa, first, now_sec);
+    }
+}
+
+test "the bundled roots parse, Let's Encrypt's among them" {
+    const gpa = std.testing.allocator;
+    var cb: crypto.Certificate.Bundle = .empty;
+    defer cb.deinit(gpa);
+    try addPem(&cb, gpa, @embedFile("roots.pem"), Io.Clock.real.now(std.testing.io).toSeconds());
+    try std.testing.expect(cb.map.count() > 100);
+    var it = cb.map.valueIterator();
+    var isrg = false;
+    while (it.next()) |start| {
+        const parsed = try crypto.Certificate.parse(.{ .buffer = cb.bytes.items, .index = start.* });
+        if (std.mem.eql(u8, parsed.commonName(), "ISRG Root X1")) isrg = true;
+    }
+    try std.testing.expect(isrg);
 }
 
 /// Tests only: trust an extra certificate authority (PEM file).
