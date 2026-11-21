@@ -587,7 +587,6 @@ const t_data = 0x0;
 const t_headers = 0x1;
 const t_rst_stream = 0x3;
 const t_settings = 0x4;
-const t_ping = 0x6;
 const t_goaway = 0x7;
 const t_window_update = 0x8;
 const end_stream = 0x1;

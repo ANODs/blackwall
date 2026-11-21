@@ -24,8 +24,8 @@ pub var win: *dvui.Window = undefined;
 pub var state: model.State = undefined;
 pub var engine: core.engine.Engine = .{};
 /// The background service (TUN or SOCKS5) and the window's link to it;
-/// null where the service is not built (Windows) or not shipped next to
-/// the app. Then the in-window SOCKS5 proxy below carries the traffic.
+/// null in screenshot mode and where no service is shipped next to the
+/// app. Then the in-window SOCKS5 proxy below carries the traffic.
 pub var link: ?*link_mod.Link = null;
 /// What the running service reported (set from link events).
 pub var service_on: bool = false;

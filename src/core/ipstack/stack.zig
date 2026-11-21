@@ -764,16 +764,6 @@ pub const Stack = struct {
         if (c.state != .closed) c.abortLocked(error.ConnectionReset, true);
     }
 
-    /// Connections still held by a worker.
-    pub fn attachedCount(s: *Stack) usize {
-        s.lock();
-        defer s.unlock();
-        var n: usize = 0;
-        var it = s.conns.valueIterator();
-        while (it.next()) |c| n += @intFromBool(c.*.attached);
-        return n;
-    }
-
     /// Free the stack. Call `abortAll` first and wait until no worker holds
     /// a connection (`attachedCount() == 0`).
     pub fn destroy(s: *Stack) void {

@@ -22,9 +22,6 @@
 //! traffic of applications routed into the TUN and/or the SOCKS port, and
 //! answers the app on DIR/service.sock (see core/ipc.zig). Closing the window
 //! does not touch it; it stops only when asked or killed.
-//!
-//! The TUN's addresses and routes are set up by whoever starts the service:
-//! the root helper on macOS, a script or systemd on Linux.
 
 const std = @import("std");
 const builtin = @import("builtin");

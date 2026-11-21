@@ -1,9 +1,9 @@
-//! Connection state and traffic counters consumed by the UI.
+//! Connection state and traffic counters as the window shows them: the
+//! status, the rates and the history graph.
 //!
-//! IMPORTANT: this is a simulator. It models the state machine the real
-//! engine will expose (status, per-app rates, history) so the interface and
-//! the rules logic can be built and measured, but it moves no packets. The
-//! real data plane (TUN, protocol modules, kill switch) replaces `tick`.
+//! It moves no packets. The numbers come from the service's status reports
+//! (or the in-window proxy's meter) through `real_totals`; only the sample
+//! data (`simulate_traffic`) is made up here.
 
 const std = @import("std");
 const model = @import("model.zig");

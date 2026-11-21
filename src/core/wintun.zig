@@ -22,8 +22,6 @@ extern "kernel32" fn CreateEventW(attrs: ?*anyopaque, manual: i32, initial: i32,
 extern "kernel32" fn SetEvent(ev: w.HANDLE) callconv(W) i32;
 extern "kernel32" fn WaitForMultipleObjects(count: u32, handles: [*]const w.HANDLE, all: i32, ms: u32) callconv(W) u32;
 
-const ERROR_NO_MORE_ITEMS = 259;
-const ERROR_HANDLE_EOF = 38;
 const LOAD_WITH_ALTERED_SEARCH_PATH = 0x8;
 
 /// The functions of wintun.dll.

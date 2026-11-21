@@ -3,10 +3,11 @@
 //! Applications resolve names through us. An A query gets an address from
 //! 198.18.0.0/15 that stands for the name ("fake IP"), so the connection that
 //! follows carries the domain to the outbound: the server resolves it, rules
-//! can match it, and no query leaves the machine in clear text. AAAA and
-//! HTTPS/SVCB get empty answers so clients settle on the IPv4 fake address.
-//! Everything else, and names on the exclusion list, is forwarded to a real
-//! resolver through the physical interface.
+//! can match it, and no address lookup leaves the machine in clear text. AAAA
+//! and HTTPS/SVCB get empty answers so clients settle on the IPv4 fake
+//! address. Everything else (other record types, names on the exclusion
+//! list, new names while every fake address is in use) is forwarded as it
+//! is to a real resolver through the physical interface.
 
 const std = @import("std");
 const Io = std.Io;

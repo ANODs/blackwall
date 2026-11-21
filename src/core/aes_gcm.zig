@@ -1,5 +1,5 @@
-//! AES-GCM for streams of many messages under one key, without associated
-//! data: what Shadowsocks seals each chunk with.
+//! AES-GCM for streams of many messages under one key: what Shadowsocks
+//! seals each chunk with, and (with associated data) TLS its records.
 //!
 //! The key schedule and the powers of H are made once, in `init`, not for
 //! every message as std.crypto's AesGcm does; with Shadowsocks' chunks of 8

@@ -27,7 +27,6 @@ const IFF_TUN: u16 = 0x0001;
 const IFF_NO_PI: u16 = 0x1000;
 
 const SIOCADDRT: u32 = 0x890b;
-const SIOCDELRT: u32 = 0x890c;
 const SIOCGIFFLAGS: u32 = 0x8913;
 const SIOCSIFFLAGS: u32 = 0x8914;
 const SIOCSIFADDR: u32 = 0x8916;
@@ -198,12 +197,6 @@ pub fn remove() void {
 pub fn release(fd: c.fd_t) void {
     if (comptime builtin.os.tag != .linux) return;
     _ = c.ioctl(fd, @bitCast(TUNSETPERSIST), @as(c_ulong, 0));
-}
-
-/// Whether the device exists (held by a service, or left behind by one).
-pub fn exists(io: std.Io) bool {
-    std.Io.Dir.cwd().access(io, "/sys/class/net/" ++ device, .{}) catch return false;
-    return true;
 }
 
 /// With the strict reverse-path filter (the default on many systems) the

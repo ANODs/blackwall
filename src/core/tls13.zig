@@ -438,7 +438,7 @@ pub const HandshakeError = error{
     TlsBadSignature,
     TlsCertificateCompressed,
     TlsClientAuthUnsupported,
-    /// Plain TLS needs a certificate chain check that is not built yet.
+    /// Plain TLS was asked for without a trust store to check the chain against.
     TlsCertificateUnsupported,
     RealityBadKey,
     /// The server did not recognise us and handed the connection to its

@@ -1,18 +1,13 @@
 //! Service <-> root helper protocol (macOS).
 //!
-//! One JSON request line per connection over a Unix socket that only the
-//! user who installed the helper (and root) may open. The reply to "up" is a
+//! One JSON request line per connection over a Unix socket. Anyone may
+//! connect; the helper answers only the user who installed it (and root),
+//! told by the peer's uid. The reply to "up" is a
 //! JSON line sent together with the utun descriptor (SCM_RIGHTS).
 //!
 //!   {"cmd":"up", ...UpRequest}   -> Reply + utun fd (when already up: the
 //!                                   settings are applied again, same utun)
 //!   {"cmd":"servers", ...}       -> Reply   (new VPN server addresses for the kill switch)
-//!   {"cmd":"refresh"}            -> Reply   (the network changed, e.g. Wi-Fi <-> Ethernet:
-//!                                   bind_index, bind_name and dns found again as "up"
-//!                                   finds them, and the strict kill switch's DNS table
-//!                                   follows; the utun and its routes stay. Nothing up:
-//!                                   up=false and nothing changes. On an error nothing
-//!                                   changes either)
 //!   {"cmd":"down"}               -> Reply   (routes, DNS and kill switch removed, utun closed)
 //!   {"cmd":"upgrade","path":P,"sig":S} -> Reply   (a newer helper signed by the release key
 //!                                   replaces this one; no administrator needed)

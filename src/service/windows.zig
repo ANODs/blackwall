@@ -139,7 +139,6 @@ extern "iphlpapi" fn GetBestInterfaceEx(dest: *const SockaddrInet, index: *u32) 
 extern "iphlpapi" fn GetAdaptersAddresses(family: u32, flags: u32, reserved: ?*anyopaque, out: ?[*]u8, size: *u32) callconv(W) u32;
 
 const ERROR_OBJECT_ALREADY_EXISTS = 5010;
-const ERROR_BUFFER_OVERFLOW = 111;
 const NO_ERROR = 0;
 
 pub const Options = struct {
