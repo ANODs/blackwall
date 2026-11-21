@@ -1,0 +1,1 @@
+A server's real country: once it is in use, BLACKWALL shows where it really exits to the internet, also where the provider named another country.
