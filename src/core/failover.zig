@@ -379,8 +379,14 @@ pub const Group = struct {
         const i = g.activeIndex();
         const m = g.member(i) orelse return;
         const ob = m.get();
-        if (g.learn(i, &ob, g.probe(g, &ob))) return;
+        const r = g.probe(g, &ob);
+        if (g.learn(i, &ob, r)) return;
         if (g.stopping.load(.acquire)) return;
+        // The request did not get through at all: the server just taken
+        // into use carries nothing (a provider that cuts it, say). The
+        // recovery starts now (`start` sees the score when this returns),
+        // not after enough of the applications' connections have failed.
+        if (!r.carries) g.score.store(threshold, .monotonic);
         // no answer, or no country in it: a little later, a couple of times
         if (g.exit_tries.fetchAdd(1, .monotonic) < exit_retries)
             g.exit_ms.store(g.nowMs() + exit_retry_ms, .monotonic);
@@ -1116,4 +1122,15 @@ test "failures while the exit is being asked start a recovery right after" {
     Fake.settle(&g);
     try testing.expectEqual(1, g.activeIndex());
     try testing.expectEqualStrings("DE", &g.inUse().exit);
+}
+
+test "a server taken into use that carries nothing is given up at once, before any flow failed" {
+    var g = Fake.group();
+    g.check_exit = true;
+    Fake.alive = .{ false, true, false, false };
+    Fake.accepts = .{ 3, 5, null, null };
+    g.set(&.{ Fake.server("a.example"), Fake.server("b.example") });
+    Fake.settle(&g);
+    Fake.settle(&g);
+    try testing.expectEqual(1, g.activeIndex());
 }
