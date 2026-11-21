@@ -123,6 +123,9 @@ pub const Group = struct {
     /// when to ask again after a request that got no country; 0: not due
     exit_ms: std.atomic.Value(i64) = .init(0),
     exit_tries: std.atomic.Value(u8) = .init(0),
+    /// the check just made found that the server in use carries nothing:
+    /// the recovery it starts does not ask that server once more
+    dead: std.atomic.Value(bool) = .init(false),
 
     /// called after the member in use changed
     on_switch: ?Hook = null,
@@ -148,6 +151,8 @@ pub const Group = struct {
     /// later, twice at most
     const exit_retry_ms = 60_000;
     const exit_retries = 2;
+    /// reserve servers asked at once during a recovery
+    const abreast = 3;
 
     /// Replace the members: `list[0]` is the main server, the rest the
     /// reserve in the user's order. The member in use stays in use when it
@@ -386,7 +391,10 @@ pub const Group = struct {
         // into use carries nothing (a provider that cuts it, say). The
         // recovery starts now (`start` sees the score when this returns),
         // not after enough of the applications' connections have failed.
-        if (!r.carries) g.score.store(threshold, .monotonic);
+        if (!r.carries) {
+            g.dead.store(true, .release);
+            g.score.store(threshold, .monotonic);
+        }
         // no answer, or no country in it: a little later, a couple of times
         if (g.exit_tries.fetchAdd(1, .monotonic) < exit_retries)
             g.exit_ms.store(g.nowMs() + exit_retry_ms, .monotonic);
@@ -422,19 +430,22 @@ pub const Group = struct {
         // whatever happens, a new recovery needs new failures
         defer g.score.store(0, .monotonic);
 
-        // 1. the same server once more, from scratch
+        // 1. the same server once more, from scratch; not when the check
+        // that sent us here was that very request
         const cur = g.member(active) orelse return;
         const cur_ob = cur.get();
-        if (cur_ob.host()) |h| if (g.dialer.resolver) |r| r.forget(h);
-        const again = g.probe(g, &cur_ob);
-        if (again.carries) {
-            _ = g.learn(active, &cur_ob, again);
-            log.info("{s} answers again after a fresh connection", .{name(&cur_ob)});
-            g.rounds = 0;
-            g.next_ms.store(g.nowMs() + settle_ms, .monotonic);
-            return;
+        if (!g.dead.swap(false, .acq_rel)) {
+            if (cur_ob.host()) |h| if (g.dialer.resolver) |r| r.forget(h);
+            const again = g.probe(g, &cur_ob);
+            if (again.carries) {
+                _ = g.learn(active, &cur_ob, again);
+                log.info("{s} answers again after a fresh connection", .{name(&cur_ob)});
+                g.rounds = 0;
+                g.next_ms.store(g.nowMs() + settle_ms, .monotonic);
+                return;
+            }
+            if (g.stopping.load(.acquire)) return;
         }
-        if (g.stopping.load(.acquire)) return;
         log.warn("{s} does not carry traffic", .{name(&cur_ob)});
 
         // 2. the reserve: who accepts a connection at all, fastest first
@@ -452,14 +463,14 @@ pub const Group = struct {
         const marks = g.marks;
         g.mutex.unlock(g.io);
         while (!g.stopping.load(.acquire)) {
-            const i = pickBest(n, &times, &marks) orelse break;
-            times[i] = null;
-            const cand = g.member(i) orelse continue;
-            const ob = cand.get();
-            const r = g.probe(g, &ob);
-            if (!r.carries) continue;
-            _ = g.learn(i, &ob, r);
-            return g.switchTo(i, &ob);
+            var batch: [abreast]usize = undefined;
+            var k: usize = 0;
+            while (k < abreast) : (k += 1) {
+                batch[k] = pickBest(n, &times, &marks) orelse break;
+                times[batch[k]] = null;
+            }
+            if (k == 0) break;
+            if (g.probeSome(batch[0..k])) return;
         }
         if (n > 1) log.warn("no reserve server carries traffic either", .{});
         g.wait();
@@ -502,6 +513,56 @@ pub const Group = struct {
             g.exit_ms.store(now + settle_ms, .monotonic);
         }
         if (g.on_switch) |h| h.call(h.ctx);
+    }
+
+    /// Ask the candidates `order` (best first) all at once and take into
+    /// use the best one that carries traffic, as soon as every better one
+    /// has said no: a provider that cuts servers makes each dead one cost
+    /// a full wait, and one after another that is the user's minute.
+    fn probeSome(g: *Group, order: []const usize) bool {
+        const Job = struct {
+            g: *Group,
+            /// the server's own copy: `ob` points into it
+            snap: proxy.Snapshot,
+            ob: proxy.Outbound = undefined,
+            res: Probe = .{},
+            done: std.atomic.Value(bool) = .init(false),
+            fn run(j: *@This()) void {
+                j.res = j.g.probe(j.g, &j.ob);
+                j.done.store(true, .release);
+            }
+        };
+        var jobs: [abreast]Job = undefined;
+        var threads: [abreast]?std.Thread = @splat(null);
+        var live: [abreast]bool = @splat(false);
+        for (order, 0..) |i, k| {
+            jobs[k] = .{ .g = g, .snap = g.member(i) orelse continue };
+            jobs[k].ob = jobs[k].snap.get();
+            live[k] = true;
+            threads[k] = std.Thread.spawn(.{ .stack_size = sys.stackSize(256 * 1024) }, Job.run, .{&jobs[k]}) catch blk: {
+                jobs[k].run();
+                break :blk null;
+            };
+        }
+        defer for (threads[0..order.len]) |t| if (t) |th| th.join();
+        var k: usize = 0;
+        while (k < order.len) {
+            if (!live[k]) {
+                k += 1;
+                continue;
+            }
+            if (!jobs[k].done.load(.acquire)) {
+                g.io.sleep(.fromMilliseconds(20), .awake) catch {};
+                continue;
+            }
+            if (jobs[k].res.carries) {
+                _ = g.learn(order[k], &jobs[k].ob, jobs[k].res);
+                g.switchTo(order[k], &jobs[k].ob);
+                return true;
+            }
+            k += 1;
+        }
+        return false;
     }
 
     fn wait(g: *Group) void {
@@ -601,7 +662,9 @@ pub fn check(io: Io, dialer: proxy.Dialer, ob: *const proxy.Outbound) struct { p
 }
 
 const ping_timeout_ms = 2500;
-const probe_wait_ms = 8000;
+/// A server that carries traffic answers within a second or two; one a
+/// provider cuts never does, and this is how long the user waits for it.
+const probe_wait_ms = 5000;
 /// Cloudflare's trace page, over plain HTTP: any HTTP answer through the
 /// server proves it carries traffic, and the page's "loc=" line is the
 /// country Cloudflare places the server's exit address in. Nothing about
@@ -1023,9 +1086,23 @@ test "the recovery tries the reserve in the measured order, dead and unmeasured 
     Fake.alive = .{ false, true, true, false };
     Fake.accepts = .{ null, 5, 30, 60 };
     Fake.fail(&g, 3);
-    // a (again), d (measured), c (unmeasured) took it; b never asked
+    // d (measured) said no, c (unmeasured) took it, though b, asked along
+    // with them, carries traffic too: the order decides, not who is first
     try testing.expectEqual(2, g.activeIndex());
-    try testing.expectEqual(3, Fake.probes.load(.monotonic));
+    try testing.expectEqual(4, Fake.probes.load(.monotonic));
+}
+
+test "a check that found the server dead is not repeated by the recovery it starts" {
+    var g = Fake.group();
+    g.check_exit = true;
+    Fake.alive = .{ false, true, false, false };
+    Fake.accepts = .{ 3, 5, null, null };
+    g.set(&.{ Fake.server("a.example"), Fake.server("b.example") });
+    while (Fake.switched.load(.monotonic) == 0) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    Fake.settle(&g);
+    try testing.expectEqual(1, g.activeIndex());
+    // a once (the check), b once
+    try testing.expectEqual(2, Fake.probes.load(.monotonic));
 }
 
 test "the cost of a server: response time plus a megabyte's transfer" {
