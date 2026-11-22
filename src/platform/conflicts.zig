@@ -1,6 +1,7 @@
 //! Programs in the way of the connection (product concept 7.1), macOS:
 //! another VPN whose tunnel captures the traffic, or DPI circumvention
-//! beside us. Windows: DPI circumvention (zapret, GoodbyeDPI, see
+//! beside us. Windows: another VPN (core/win_net.zig), named for the user
+//! to turn off, and DPI circumvention (zapret, GoodbyeDPI, see
 //! core/win_dpi.zig), stopped by the BLACKWALL service.
 //!
 //! A conflict is what is observed: routes that send the address space into
@@ -54,7 +55,8 @@ pub const Kind = enum {
 
 pub const Conflict = struct {
     kind: Kind = .vpn,
-    ifname_buf: [16]u8 = undefined,
+    /// the tunnel interface (macOS "utun5"; Windows the adapter, "TAP-Windows Adapter V9")
+    ifname_buf: [64]u8 = undefined,
     ifname_len: u8 = 0,
     /// the process holding the tunnel, when one is known
     owner: ?Identity = null,
@@ -161,10 +163,21 @@ pub fn detect(gpa: std.mem.Allocator, io: Io) ![]Conflict {
 /// the SCM start it again). Confirmed when the WinDivert driver they divert
 /// packets through is loaded.
 fn detectWindows(gpa: std.mem.Allocator) ![]Conflict {
-    const s = try win_dpi.scan(gpa);
-    defer gpa.free(s.found);
     var out: std.ArrayList(Conflict) = .empty;
     errdefer out.deinit(gpa);
+    // another VPN that takes the traffic (core/win_net.zig): named, to be
+    // turned off in its own window; nothing is stopped for the user
+    var caps: [4]core.win_net.Capture = undefined;
+    for (caps[0..core.win_net.foreign(&caps)]) |*cap| {
+        var c: Conflict = .{ .kind = .vpn, .confirmed = cap.program };
+        c.name_len = @intCast(@min(cap.name().len, c.name_buf.len));
+        @memcpy(c.name_buf[0..c.name_len], cap.name()[0..c.name_len]);
+        c.ifname_len = @intCast(@min(cap.adapter().len, c.ifname_buf.len));
+        @memcpy(c.ifname_buf[0..c.ifname_len], cap.adapter()[0..c.ifname_len]);
+        try out.append(gpa, c);
+    }
+    const s = try win_dpi.scan(gpa);
+    defer gpa.free(s.found);
     for (s.found) |*f| {
         const name = win_dpi.tools[f.tool].name;
         const at = for (out.items, 0..) |c, i| {

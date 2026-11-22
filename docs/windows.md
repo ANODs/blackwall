@@ -63,6 +63,19 @@ service dies.
 A clean stop removes the filters; "suspend" (a restart by the window) keeps them.
 Disconnect after a crash starts the service with `--release`, which only removes them.
 
+## Another VPN
+
+Two VPNs cannot both carry the traffic: our kill switch would cut the other one's own
+connection to its server, and the routes of one of them win by metric. Before it
+captures anything the service reads the route table
+([src/core/win_net.zig](../src/core/win_net.zig)): an adapter other than ours with both
+halves (0.0.0.0/1 and 128.0.0.0/1, as OpenVPN and hidemy.name set them) or with a default
+route cheaper than the network's takes the traffic. Then the service refuses with
+`Conflict <program>` and the window says which VPN to turn off (the program is named
+when a known VPN client runs, else the adapter). A default route that waits behind the
+network's (Radmin VPN, Hamachi) is not in the way. Our own sockets always stay on the
+network's interface, a hardware one (or PPP, mobile broadband) before any other.
+
 ## Quit, a second start, a newer release
 
 Nothing of the app stays behind a Quit: the window disconnects, the service ends and

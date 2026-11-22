@@ -22,6 +22,7 @@ pub const sys = @import("sys.zig");
 pub const wintun = @import("wintun.zig");
 pub const win_scm = @import("win_scm.zig");
 pub const win_dpi = @import("win_dpi.zig");
+pub const win_net = @import("win_net.zig");
 pub const udp_out = @import("udp_out.zig");
 pub const dpi = @import("dpi.zig");
 pub const sni = @import("sni.zig");
@@ -71,6 +72,7 @@ test {
     _ = sni;
     _ = dpi;
     _ = win_dpi;
+    _ = win_net;
     _ = qr;
     _ = diag;
     _ = xrayjson;

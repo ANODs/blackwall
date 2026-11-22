@@ -118,17 +118,6 @@ const MIB_IPINTERFACE_ROW = extern struct {
     DisableDefaultRoutes: u8,
 };
 
-const MIB_IPFORWARD_TABLE2 = extern struct {
-    NumEntries: u32,
-    /// the first of `NumEntries` rows
-    Table: [1]MIB_IPFORWARD_ROW2,
-};
-
-/// MIB_IF_ROW2, of which we set the LUID (at 0) and read one bit: its
-/// InterfaceAndOperStatusFlags, whose lowest bit is HardwareInterface.
-const if_row_size = 1352;
-const if_row_flags = 1152;
-
 comptime {
     if (builtin.os.tag == .windows and builtin.cpu.arch == .x86_64) {
         std.debug.assert(@sizeOf(SockaddrInet) == 28);
@@ -147,9 +136,6 @@ extern "iphlpapi" fn GetIpInterfaceEntry(row: *MIB_IPINTERFACE_ROW) callconv(W) 
 extern "iphlpapi" fn SetIpInterfaceEntry(row: *MIB_IPINTERFACE_ROW) callconv(W) u32;
 extern "iphlpapi" fn ConvertInterfaceLuidToIndex(luid: *const NET_LUID, index: *u32) callconv(W) u32;
 extern "iphlpapi" fn GetBestInterfaceEx(dest: *const SockaddrInet, index: *u32) callconv(W) u32;
-extern "iphlpapi" fn GetIpForwardTable2(family: u16, table: *?*MIB_IPFORWARD_TABLE2) callconv(W) u32;
-extern "iphlpapi" fn FreeMibTable(memory: *anyopaque) callconv(W) void;
-extern "iphlpapi" fn GetIfEntry2(row: *[if_row_size]u8) callconv(W) u32;
 extern "iphlpapi" fn GetAdaptersAddresses(family: u32, flags: u32, reserved: ?*anyopaque, out: ?[*]u8, size: *u32) callconv(W) u32;
 
 const ERROR_OBJECT_ALREADY_EXISTS = 5010;
@@ -162,6 +148,10 @@ pub const Options = struct {
     /// wintun.dll
     dll: []const u8,
 };
+
+/// The other VPNs `up` found in the way (error.Conflict).
+pub var conflicts: [4]core.win_net.Capture = undefined;
+pub var conflict_count: usize = 0;
 
 /// What `up` set up, for the service to run on.
 pub const Lease = struct {
@@ -186,7 +176,14 @@ pub fn up(o: Options) !Lease {
     var dest = SockaddrInet.v4(.{ 1, 1, 1, 1 });
     var best_index: u32 = 0;
     if (GetBestInterfaceEx(&dest, &best_index) != NO_ERROR or best_index == 0) return error.NoNetwork;
-    const bind_index = physical() orelse best_index;
+    // another VPN that takes the traffic: the two cannot both work (its
+    // own connection to its server would be cut by our kill switch)
+    conflict_count = core.win_net.foreign(&conflicts);
+    if (conflict_count > 0) {
+        for (conflicts[0..conflict_count]) |*c| log.err("another VPN takes the traffic: {s} ({s}, interface {d})", .{ c.name(), c.adapter(), c.index });
+        return error.Conflict;
+    }
+    const bind_index = core.win_net.physical() orelse best_index;
     if (bind_index != best_index)
         log.warn("interface {d} takes the traffic now (another VPN?); own traffic stays on the network's interface {d}", .{ best_index, bind_index });
 
@@ -224,42 +221,6 @@ pub fn up(o: Options) !Lease {
     }
     lease.device = try wintun.Device.init(api, a);
     return lease;
-}
-
-/// The interface the network itself is reached through: the one with the
-/// default route (0.0.0.0/0), a hardware interface before any other, the
-/// lowest metric first. Another VPN that is connected takes the traffic
-/// with routes of its own (OpenVPN: two halves, as ours) on an adapter of
-/// its own; `GetBestInterfaceEx` then names that adapter, and our sockets
-/// bound to it would go through that VPN, which our kill switch stops,
-/// and would be left on nothing once it is gone. Null: no default route.
-fn physical() ?u32 {
-    var table: ?*MIB_IPFORWARD_TABLE2 = null;
-    if (GetIpForwardTable2(2, &table) != NO_ERROR) return null;
-    const t = table orelse return null;
-    defer FreeMibTable(t);
-    const rows = @as([*]const MIB_IPFORWARD_ROW2, @ptrCast(&t.Table))[0..t.NumEntries];
-    var found: ?u32 = null;
-    var found_hw = false;
-    var found_cost: u64 = 0;
-    for (rows) |*r| {
-        if (r.DestinationPrefix.PrefixLength != 0 or r.Loopback != 0) continue;
-        var itf: MIB_IPINTERFACE_ROW = undefined;
-        InitializeIpInterfaceEntry(&itf);
-        itf.Family = 2;
-        itf.InterfaceLuid = r.InterfaceLuid;
-        if (GetIpInterfaceEntry(&itf) != NO_ERROR or itf.Connected == 0) continue;
-        var row: [if_row_size]u8 align(8) = @splat(0);
-        @memcpy(row[0..8], std.mem.asBytes(&r.InterfaceLuid));
-        const hw = GetIfEntry2(&row) == NO_ERROR and row[if_row_flags] & 1 != 0;
-        const cost = @as(u64, r.Metric) + itf.Metric;
-        if (found != null and (found_hw and !hw)) continue;
-        if (found != null and found_hw == hw and found_cost <= cost) continue;
-        found = r.InterfaceIndex;
-        found_hw = hw;
-        found_cost = cost;
-    }
-    return found;
 }
 
 /// Let the traffic go: the adapter and its routes disappear.

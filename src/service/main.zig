@@ -525,6 +525,10 @@ const Service = struct {
         if (builtin.os.tag.isDarwin() and err == error.Conflict) {
             for (darwin.helper.conflict_names[0..darwin.helper.conflict_count]) |n| w.print(" {s}", .{std.mem.sliceTo(&n, 0)}) catch {};
         }
+        // Windows: the programs by name ("Conflict hidemy.name VPN")
+        if (comptime on_windows) if (err == error.Conflict) {
+            for (win.conflicts[0..win.conflict_count], 0..) |*cf, i| w.print("{s}{s}", .{ if (i == 0) " " else ", ", cf.name() }) catch {};
+        };
         std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = path, .data = w.buffered() }) catch {};
     }
 
