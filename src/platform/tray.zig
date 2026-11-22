@@ -176,10 +176,24 @@ fn update() void {
 }
 
 fn show() void {
-    const w = window orelse return;
+    const w = window orelse first() orelse return;
     hidden = false;
     _ = c.SDL_ShowWindow(w);
     _ = c.SDL_RaiseWindow(w);
+}
+
+/// The app's window, before it was ever hidden (when `window` is learned).
+fn first() ?*c.SDL_Window {
+    var n: c_int = 0;
+    const list = c.SDL_GetWindows(&n) orelse return null;
+    defer c.SDL_free(@ptrCast(list));
+    return if (n > 0) list[0] else null;
+}
+
+/// Show the window (another start of the app asked for it).
+pub fn reveal() void {
+    want_open.store(true, .release);
+    wake();
 }
 
 /// Wake the frame loop: it sleeps until an event or a timer.

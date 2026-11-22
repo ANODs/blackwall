@@ -257,6 +257,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "core", .module = core }},
     }) })).step);
+    // one window per user (std only, so it runs on every system)
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/app/instance.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = os != .windows,
+    }) })).step);
     // the window's link to the service (no UI inside, so it tests without DVUI)
     if (os != .windows) test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/link.zig"),

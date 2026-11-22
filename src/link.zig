@@ -125,6 +125,8 @@ pub const Link = struct {
     cond: Io.Condition = .init,
     queue: [8]Request = undefined,
     queued: usize = 0,
+    /// the link thread is carrying a request out (under `mutex`)
+    working: bool = false,
 
     // link thread only
     /// the service when this window started it (reaped here)
@@ -199,7 +201,22 @@ pub const Link = struct {
         const r = l.queue[0];
         std.mem.copyForwards(Request, l.queue[0 .. l.queued - 1], l.queue[1..l.queued]);
         l.queued -= 1;
+        l.working = true;
         return r;
+    }
+
+    /// Wait until every request posted so far is carried out, `ms` at
+    /// most: the window is quitting, and what it asked for last (the stop)
+    /// must have happened before the process ends.
+    pub fn drain(l: *Link, ms: i64) void {
+        const begin = Io.Clock.awake.now(l.io);
+        while (begin.untilNow(l.io, .awake).toMilliseconds() < ms) {
+            l.mutex.lockUncancelable(l.io);
+            const idle = l.queued == 0 and !l.working;
+            l.mutex.unlock(l.io);
+            if (idle) return;
+            l.io.sleep(.fromMilliseconds(20), .awake) catch return;
+        }
     }
 
     fn run(l: *Link) void {
@@ -230,6 +247,11 @@ pub const Link = struct {
                     if (line) |s| l.gpa.free(s);
                 },
             };
+            if (req != null) {
+                l.mutex.lockUncancelable(l.io);
+                l.working = false;
+                l.mutex.unlock(l.io);
+            }
             // counters once a second, however often requests arrive
             if (l.running and last_poll.untilNow(l.io, .awake).toMilliseconds() >= 900) {
                 last_poll = Io.Clock.awake.now(l.io);

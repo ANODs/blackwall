@@ -16,6 +16,7 @@ const settings = @import("ui/screens/settings.zig");
 const conflicts = @import("ui/conflicts.zig");
 const shots = @import("shots.zig");
 const tray = @import("platform/tray.zig");
+const instance = @import("app/instance.zig");
 const tr = @import("i18n.zig").t;
 
 pub const dvui_app: dvui.App = .{
@@ -28,6 +29,12 @@ pub const dvui_app: dvui.App = .{
 /// The window's log goes to a file before anything opens (report.zig).
 pub fn main(main_init: std.process.Init) !u8 {
     report.start(main_init);
+    // one window per user; screenshot mode touches nothing of the user's
+    if (main_init.environ_map.get("BLACKWALL_SHOTS") == null) {
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (app.settingsDir(&dir_buf, main_init.environ_map)) |dir|
+            if (instance.claim(main_init.gpa, main_init.io, dir, build_options.version) == .second) return 0;
+    }
     return dvui.App.main(main_init);
 }
 /// Written to the log and, on Windows, told to the user (report.zig).

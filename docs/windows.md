@@ -63,6 +63,23 @@ service dies.
 A clean stop removes the filters; "suspend" (a restart by the window) keeps them.
 Disconnect after a crash starts the service with `--release`, which only removes them.
 
+## Quit, a second start, a newer release
+
+Nothing of the app stays behind a Quit: the window disconnects, the service ends and
+removes its filters, and the window waits for that before its process ends
+(`quitService` in [src/app.zig](../src/app.zig)). One exception, on every system: with
+"Protect when the VPN is off" on and applications held to the VPN, the service keeps
+holding those, as it does after Disconnect.
+
+One window runs per user ([src/app/instance.zig](../src/app/instance.zig)): it holds a
+lock on `window.lock` in the settings folder and writes its release, process and
+executable to `window.info`. A second start of the same or an older release asks the
+running window to show itself and leaves. A newer release asks it to leave, takes the
+lock, and removes the older file (a release here is a single file wherever the user
+keeps it); the service is handed over as it runs, as after an update. Windows of
+releases before 0.2.20, which hold no lock, are found by their executable's name, ended
+and removed.
+
 ## DPI circumvention beside it
 
 zapret (`winws.exe`, also in the zapret-discord-youtube bundle) and GoodbyeDPI

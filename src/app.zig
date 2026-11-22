@@ -12,6 +12,8 @@ const conflicts_mod = @import("platform/conflicts.zig");
 pub const Conflict = conflicts_mod.Conflict;
 const link_mod = @import("link.zig");
 const updater = @import("app/updater.zig");
+const instance = @import("app/instance.zig");
+const tray = @import("platform/tray.zig");
 const build_options = @import("build_options");
 const tr = @import("i18n.zig").t;
 
@@ -80,6 +82,9 @@ pub const Result = union(enum) {
     link: link_mod.Event,
     conflicts: []Conflict,
     conflict_stop: ?conflicts_mod.StopError,
+    /// another start of the app asks this window to show itself, or to
+    /// leave for a newer release (app/instance.zig)
+    instance: instance.Signal,
 };
 
 var results: std.ArrayList(Result) = .empty;
@@ -131,6 +136,7 @@ pub fn init(w: *dvui.Window) !void {
     updater.start();
     if (persist and config_dir.len > 0)
         link = link_mod.Link.init(gpa, io, config_dir, build_options.version, tr.admin_prompt, onLinkEvent);
+    if (persist) instance.watch(io, onInstance);
     // follows the app if it was moved or updated in place
     if (persist and state.settings.launch_at_login) autostart.apply(gpa, io, env_paths, true);
     // an update restarted the window while its proxy was on
@@ -160,10 +166,40 @@ pub fn settingsDir(buf: []u8, env: *std.process.Environ.Map) ?[]const u8 {
     } catch null;
 }
 
+/// Another start asks this window something (on the watcher's thread).
+fn onInstance(what: instance.Signal) void {
+    pushResult(.{ .instance = what });
+}
+
+/// A newer release takes over: leave, and leave the service as it is. The
+/// new window adopts it and restarts it from its own binary, as after an
+/// update, so the traffic is carried all the while.
+fn handOver() void {
+    std.log.info("a newer release takes over: leaving", .{});
+    if (dirty) _ = writeConfig();
+    std.process.exit(0);
+}
+
+/// Quit: nothing of the app stays behind. The VPN is disconnected, the
+/// service ends and lets the traffic go, and this waits until it has. The
+/// one thing that stays is what the user asked to stay: with "protect
+/// when the VPN is off" and applications held to the VPN, the service
+/// keeps holding those (as after Disconnect), or quitting the app would
+/// send them out with the real address.
+fn quitService() void {
+    const l = link orelse return;
+    if (!persist) return;
+    if (canGuard()) {
+        if (!guarding()) disconnect();
+    } else release();
+    l.drain(15_000);
+}
+
 pub fn deinit() void {
     // a clean quit also counts as a successful first start
     if (updater.verifying) updater.confirm();
     proxy.stop();
+    quitService();
     save();
     state.deinit();
     gpa.free(config_dir);
@@ -333,6 +369,10 @@ fn drainResults() void {
         .link => |ev| onLink(ev),
         .conflicts => |list| onConflicts(list),
         .conflict_stop => |err| onConflictStop(err),
+        .instance => |what| switch (what) {
+            .show => tray.reveal(),
+            .quit => handOver(),
+        },
     };
 }
 
