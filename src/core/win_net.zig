@@ -323,9 +323,6 @@ pub fn foreign(out: []Capture) usize {
 
 /// VPN programs of Windows by their executables, and the names users know.
 const programs = [_]struct { exe: []const u8, name: []const u8 }{
-    .{ .exe = "hidemy.name vpn.exe", .name = "hidemy.name VPN" },
-    .{ .exe = "hidemyname.exe", .name = "hidemy.name VPN" },
-    .{ .exe = "hmnvpn.exe", .name = "hidemy.name VPN" },
     .{ .exe = "openvpn-gui.exe", .name = "OpenVPN" },
     .{ .exe = "openvpnconnect.exe", .name = "OpenVPN Connect" },
     .{ .exe = "openvpn.exe", .name = "OpenVPN" },
@@ -351,8 +348,17 @@ const programs = [_]struct { exe: []const u8, name: []const u8 }{
     .{ .exe = "psiphon3.exe", .name = "Psiphon" },
 };
 
-/// The name of a known VPN program by its executable.
+/// Programs known by their folder: their executables have plain names
+/// (hidemy.name VPN 2.0 runs "app.exe" and its own "openvpn.exe").
+const folders = [_]struct { part: []const u8, name: []const u8 }{
+    .{ .part = "\\hidemy.name", .name = "hidemy.name VPN" },
+    .{ .part = "\\Kaspersky VPN", .name = "Kaspersky VPN" },
+    .{ .part = "\\AdGuard VPN", .name = "AdGuard VPN" },
+};
+
+/// The name of a known VPN program by its executable's path (or name).
 pub fn programOf(exe: []const u8) ?[]const u8 {
+    for (folders) |f| if (std.ascii.findIgnoreCase(exe, f.part) != null) return f.name;
     const at = std.mem.lastIndexOfAny(u8, exe, "\\/");
     const base = if (at) |i| exe[i + 1 ..] else exe;
     for (programs) |p| if (std.ascii.eqlIgnoreCase(base, p.exe)) return p.name;
@@ -374,8 +380,22 @@ const PROCESSENTRY32W = extern struct {
 extern "kernel32" fn CreateToolhelp32Snapshot(flags: u32, pid: u32) callconv(W) w.HANDLE;
 extern "kernel32" fn Process32FirstW(snap: w.HANDLE, entry: *PROCESSENTRY32W) callconv(W) i32;
 extern "kernel32" fn Process32NextW(snap: w.HANDLE, entry: *PROCESSENTRY32W) callconv(W) i32;
+extern "kernel32" fn OpenProcess(access: u32, inherit: i32, pid: u32) callconv(W) ?w.HANDLE;
+extern "kernel32" fn QueryFullProcessImageNameW(h: w.HANDLE, flags: u32, name: [*]u16, size: *u32) callconv(W) i32;
 
-/// The first known VPN program that runs (in the order of `programs`: a
+/// The executable of process `pid` as UTF-8 in `buf`, or null.
+fn imagePath(pid: u32, buf: []u8) ?[]const u8 {
+    const h = OpenProcess(0x1000, 0, pid) orelse return null; // PROCESS_QUERY_LIMITED_INFORMATION
+    defer w.CloseHandle(h);
+    var pw: [1024]u16 = undefined;
+    var size: u32 = pw.len;
+    if (QueryFullProcessImageNameW(h, 0, &pw, &size) == 0) return null;
+    if (buf.len < 3 * @as(usize, size)) return null;
+    return buf[0..std.unicode.wtf16LeToWtf8(buf, pw[0..size])];
+}
+
+/// The known VPN program that runs: one known by its folder first (its
+/// engine may be a plain openvpn.exe), then in the order of `programs` (a
 /// client before the engine it starts).
 fn vpnProgram() ?[]const u8 {
     if (comptime !on_windows) return null;
@@ -388,6 +408,13 @@ fn vpnProgram() ?[]const u8 {
     while (ok) : (ok = Process32NextW(snap, &e) != 0) {
         var buf: [3 * 260]u8 = undefined;
         const exe = buf[0..std.unicode.wtf16LeToWtf8(&buf, std.mem.sliceTo(&e.szExeFile, 0))];
+        // plain names are looked at by their folder
+        if (std.ascii.eqlIgnoreCase(exe, "app.exe") or std.ascii.eqlIgnoreCase(exe, "openvpn.exe")) {
+            var pbuf: [3 * 1024]u8 = undefined;
+            if (imagePath(e.th32ProcessID, &pbuf)) |path| for (folders) |f| {
+                if (std.ascii.findIgnoreCase(path, f.part) != null) return f.name;
+            };
+        }
         for (programs, 0..) |p, i| {
             if (!std.ascii.eqlIgnoreCase(exe, p.exe)) continue;
             if (best == null or i < best.?) best = i;
@@ -442,4 +469,7 @@ test "a VPN program is known by its executable" {
     try testing.expectEqualStrings("OpenVPN", programOf("C:\\Program Files\\OpenVPN\\bin\\openvpn.exe").?);
     try testing.expectEqualStrings("WireGuard", programOf("WireGuard.exe").?);
     try testing.expect(programOf("C:\\Windows\\System32\\svchost.exe") == null);
+    // the user's PC: hidemy.name runs app.exe and its own openvpn.exe
+    try testing.expectEqualStrings("hidemy.name VPN", programOf("C:\\Program Files\\hidemy.name VPN 2.0\\app.exe").?);
+    try testing.expectEqualStrings("hidemy.name VPN", programOf("C:\\Program Files\\hidemy.name VPN 2.0\\ovpn\\x64\\openvpn.exe").?);
 }
