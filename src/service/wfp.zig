@@ -249,13 +249,25 @@ const Builder = struct {
         return b.add(layer, FWP_ACTION_PERMIT, 10, conds);
     }
 
+    /// A permit that the block of name lookups on the local network does
+    /// not reach. That block is for lookups that would leave past the VPN;
+    /// what goes into the adapter is the VPN, and there the network's own
+    /// resolver, most often the router at a local address, is the very
+    /// address the system asks for every name. Under the block's weight
+    /// the adapter's permit lost to it, and with the local network allowed
+    /// no name resolved at all: applications that ask the system (every
+    /// browser) had no network, those with addresses of their own did.
+    fn permitFirst(b: *Builder, layer: GUID, conds: []const FWPM_FILTER_CONDITION0) !void {
+        return b.add(layer, FWP_ACTION_PERMIT, 14, conds);
+    }
+
     fn rules(b: *Builder, o: Options) !void {
         var luid = o.luid;
         const loopback = [_]FWPM_FILTER_CONDITION0{.{ .field = cond_flags, .match = FWP_MATCH_FLAGS_ANY_SET, .value = .{ .type = FWP_UINT32, .value = FWP_CONDITION_FLAG_IS_LOOPBACK } }};
         const adapter = [_]FWPM_FILTER_CONDITION0{.{ .field = cond_local_interface, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT64, .value = @intFromPtr(&luid) } }};
         for ([_]GUID{ layer_connect_v4, layer_connect_v6 }) |layer| {
-            try b.permit(layer, &loopback);
-            try b.permit(layer, &adapter);
+            try b.permitFirst(layer, &loopback);
+            try b.permitFirst(layer, &adapter);
         }
 
         // DHCP keeps the network itself working
@@ -277,8 +289,9 @@ const Builder = struct {
             wide[n] = 0;
             if (FwpmGetAppIdFromFileName0(wide[0..n :0], &app_blob) != 0) return error.WfpFailed;
             const me = [_]FWPM_FILTER_CONDITION0{.{ .field = cond_app_id, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_BYTE_BLOB_TYPE, .value = @intFromPtr(app_blob.?) } }};
-            try b.permit(layer_connect_v4, &me);
-            try b.permit(layer_connect_v6, &me);
+            // its own lookups go to the network's resolver past the adapter
+            try b.permitFirst(layer_connect_v4, &me);
+            try b.permitFirst(layer_connect_v6, &me);
         } else {
             // One filter for all the servers, one for all the resolvers:
             // conditions on the same field are OR'ed, on different ones AND'ed.
@@ -292,7 +305,8 @@ const Builder = struct {
                 const n = @min(o.dns4.len, max_servers);
                 for (o.dns4[0..n], 0..) |ip, i| conds[i] = remoteV4(ip);
                 conds[n] = .{ .field = cond_remote_port, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT16, .value = 53 } };
-                try b.permit(layer_connect_v4, conds[0 .. n + 1]);
+                // the resolvers the service asks, the router's among them
+                try b.permitFirst(layer_connect_v4, conds[0 .. n + 1]);
             }
         }
 
@@ -310,7 +324,8 @@ const Builder = struct {
             for (&lan4, 0..) |*m, i| there[i] = .{ .field = cond_remote_address, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_V4_ADDR_MASK, .value = @intFromPtr(m) } };
             there[lan4.len] = .{ .field = cond_remote_port, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT16, .value = 53 } };
             there[lan4.len + 1] = .{ .field = cond_remote_port, .match = FWP_MATCH_EQUAL, .value = .{ .type = FWP_UINT16, .value = 853 } };
-            // name lookups to any of them: a block that weighs more than the permit
+            // name lookups to any of them past the adapter: a block that
+            // weighs more than the permit below, less than `permitFirst`
             try b.add(layer_connect_v4, FWP_ACTION_BLOCK, 12, &there);
             try b.permit(layer_connect_v4, there[0..lan4.len]);
             if (!o.ipv6_block) {

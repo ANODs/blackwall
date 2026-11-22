@@ -10,8 +10,8 @@ $cfg = Join-Path $env:RUNNER_TEMP 'bwcfg'
 New-Item -ItemType Directory -Force $cfg | Out-Null
 $failed = $false
 
-function Config([string]$route, [string]$rules = '', [string]$kill = 'off') {
-    $json = '{"version":1,"next_id":1,"settings":{"default_route":{"' + $route + '":{}},"kill_switch":"' + $kill + '","ipv6":"block","allow_lan":false},"subs":[],"servers":[],"rules":[' + $rules + ']}'
+function Config([string]$route, [string]$rules = '', [string]$kill = 'off', [string]$lan = 'false') {
+    $json = '{"version":1,"next_id":1,"settings":{"default_route":{"' + $route + '":{}},"kill_switch":"' + $kill + '","ipv6":"block","allow_lan":' + $lan + '},"subs":[],"servers":[],"rules":[' + $rules + ']}'
     Set-Content -Path (Join-Path $cfg 'config.json') -Value $json -Encoding ascii
 }
 
@@ -168,6 +168,17 @@ Check "nothing goes out directly ($code)" ($code -ne '200')
 Start-Sleep -Seconds 4
 $code = Fetch
 Check "released: the network is back ($code)" ($code -eq '200')
+
+# A home network's resolver is the router, at a local address. With the
+# local network allowed, lookups there past the VPN are blocked; the same
+# lookup into the adapter is the VPN's and must be answered.
+Config 'direct' '' 'selective' 'true'
+& sc.exe start BLACKWALL --tun wintun | Out-Null
+Start-Sleep -Seconds 6
+$answer = Resolve-DnsName example.com -Type A -DnsOnly -Server 10.255.255.53 -ErrorAction SilentlyContinue
+Check "selective, local network allowed: a lookup at a local address is answered in the tunnel ($(@($answer).Count))" ($null -ne $answer)
+& sc.exe stop BLACKWALL | Out-Null
+Start-Sleep -Seconds 5
 
 Config 'direct' '' 'strict'
 & sc.exe start BLACKWALL --tun wintun | Out-Null
