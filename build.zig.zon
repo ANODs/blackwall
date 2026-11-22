@@ -1,6 +1,6 @@
 .{
     .name = .VPN,
-    .version = "0.2.21",
+    .version = "0.2.22",
     .dependencies = .{
         .dvui = .{
             .url = "git+https://github.com/david-vanderson/dvui?ref=main#2efa35ee6459ca61b8e92787db4f1616d532f9b9",

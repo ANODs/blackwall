@@ -58,6 +58,12 @@ Check 'the service runs' (-not $p.HasExited)
 Check 'the adapter is there' ($null -ne (Get-NetAdapter -Name 'BLACKWALL' -ErrorAction SilentlyContinue))
 $code = Fetch
 Check "curl through the tunnel ($code)" ($code -eq '200')
+# names are asked of the tunnel's own resolver on the adapter, not of the
+# network's (a home router's lookups are blocked by the kill switch)
+$dns = (Get-DnsClientServerAddress -InterfaceAlias 'BLACKWALL' -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses -join ','
+Check "the adapter's resolver is the tunnel's ($dns)" ($dns -match '198\.18\.0\.2')
+$name = (Resolve-DnsName example.com -Type A -DnsOnly -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
+Check "the system resolves names through the tunnel ($name)" ($name -match '^198\.(18|19)\.')
 # what a video is: one long download, and several at once (a page, a player)
 $big = 32000000
 $r = & curl.exe -s -m 90 -o NUL -w "%{http_code} %{size_download} %{speed_download}" "https://speed.cloudflare.com/__down?bytes=$big" 2>$null

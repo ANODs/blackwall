@@ -205,6 +205,7 @@ pub fn up(o: Options) !Lease {
     if (o.ipv6) addAddress(luid, SockaddrInet.v6(tun_addr6), 64) catch |err| log.warn("IPv6 address: {t}", .{err});
     setInterface(luid, 2, o.mtu);
     if (o.ipv6) setInterface(luid, 23, o.mtu);
+    setDns();
 
     // everything, in two halves
     try addRoute(luid, SockaddrInet.v4(.{ 0, 0, 0, 0 }), 1);
@@ -256,6 +257,46 @@ fn addRoute(luid: NET_LUID, dest: SockaddrInet, prefix: u8) !void {
         log.err("route: error {d}", .{rc});
         return error.RouteFailed;
     }
+}
+
+const DNS_INTERFACE_SETTINGS = extern struct {
+    Version: u32 = 1,
+    Flags: u64 = 0,
+    Domain: ?[*:0]const u16 = null,
+    NameServer: ?[*:0]const u16 = null,
+    SearchList: ?[*:0]const u16 = null,
+    RegistrationEnabled: u32 = 0,
+    RegisterAdapterName: u32 = 0,
+    EnableLLMNR: u32 = 0,
+    QueryAdapterName: u32 = 0,
+    ProfileNameServer: ?[*:0]const u16 = null,
+};
+const DNS_SETTING_NAMESERVER = 0x0002;
+
+extern "kernel32" fn GetModuleHandleW(name: [*:0]const u16) callconv(W) ?w.HMODULE;
+extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(W) ?w.HMODULE;
+extern "kernel32" fn GetProcAddress(module: w.HMODULE, name: [*:0]const u8) callconv(W) ?*const anyopaque;
+
+/// The adapter's own resolver: the tunnel answers there (dns.server). Our
+/// adapter has the lowest metric, so Windows asks it first. Without one,
+/// Windows asks the network's resolver out of the network's own interface
+/// (it binds each query to the interface that names the server), past our
+/// routes: on a home network that is the router at a local address, whose
+/// name lookups the kill switch blocks, and no name resolved at all while
+/// applications that need none (Telegram) worked. SetInterfaceDnsSettings
+/// is Windows 10 2004 and later; looked up at run time, so the service
+/// still starts on an older one (with that problem).
+fn setDns() void {
+    const L16 = std.unicode.utf8ToUtf16LeStringLiteral;
+    const m = GetModuleHandleW(L16("iphlpapi.dll")) orelse LoadLibraryW(L16("iphlpapi.dll")) orelse return;
+    const f = GetProcAddress(m, "SetInterfaceDnsSettings") orelse {
+        log.warn("DNS on the adapter: this Windows cannot set it", .{});
+        return;
+    };
+    const set: *const fn (w.GUID, *const DNS_INTERFACE_SETTINGS) callconv(W) u32 = @ptrCast(@alignCast(f));
+    const settings: DNS_INTERFACE_SETTINGS = .{ .Flags = DNS_SETTING_NAMESERVER, .NameServer = L16("198.18.0.2") };
+    const rc = set(adapter_guid, &settings);
+    if (rc != NO_ERROR) log.warn("DNS on the adapter: error {d}", .{rc});
 }
 
 /// The lowest metric (its DNS servers are asked first) and the MTU.
