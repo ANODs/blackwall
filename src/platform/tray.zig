@@ -105,8 +105,9 @@ pub fn deinit() void {
 
 /// Once per frame: act on clicks, and keep the item's texts current.
 pub fn frame() void {
-    if (tray == null) return;
+    // also without an item: another start, or a link, asks for the window
     if (want_open.swap(false, .acq_rel)) show();
+    if (tray == null) return;
     if (want_toggle.swap(false, .acq_rel)) {
         if (app.state.servers.items.len == 0) {
             app.go(.servers);

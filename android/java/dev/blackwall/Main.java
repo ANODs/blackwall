@@ -107,6 +107,32 @@ public class Main extends Activity implements Core.Listener {
         }
         setContentView(root);
         show(saved == null ? CONNECT : saved.getInt("screen", CONNECT));
+        // not again when the system rebuilds the screen with the same intent
+        if (saved == null) open(getIntent());
+    }
+
+    /** The app is on screen already and a link is opened (the activity is singleTask). */
+    @Override
+    protected void onNewIntent(Intent in) {
+        super.onNewIntent(in);
+        setIntent(in);
+        open(in);
+    }
+
+    /**
+     * A blackwall:// link the app was opened with: the subscription in it
+     * is added the way a typed address is (an address that is already
+     * there is downloaded again), and the servers are shown. Anything else
+     * is ignored.
+     */
+    private void open(Intent in) {
+        if (in == null || !Intent.ACTION_VIEW.equals(in.getAction()) || in.getData() == null) return;
+        // taken from the recent apps list: the link was opened the first time
+        if ((in.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) return;
+        String url = Core.subscriptionOf(in.getDataString());
+        if (url == null) return;
+        core.send("add", "text", url);
+        show(SERVERS);
     }
 
     @Override

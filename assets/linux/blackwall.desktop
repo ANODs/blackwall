@@ -2,7 +2,8 @@
 Type=Application
 Name=BLACKWALL
 Comment=VPN client with a route for every app
-Exec=@BIN@/blackwall
+Exec=@BIN@/blackwall %u
+MimeType=x-scheme-handler/blackwall;
 Icon=@BIN@/blackwall.png
 Categories=Network;Security;
 StartupWMClass=blackwall

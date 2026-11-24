@@ -78,6 +78,9 @@ release is a single file of 3 to 14 MB.
   (`profile-update-interval`), announcement and support link are read from the headers.
 - A QR code instead of typing: from the camera or a picture on Android, from the clipboard
   or the screen on a computer, read by a decoder in this repository.
+- A provider's "add to app" button: a link `blackwall://add/<subscription address>` opens
+  the app, started or not, and adds that subscription (an address that is already there
+  is downloaded again); `import/` means the same. Only `http(s)` addresses are taken.
 - Latency for every server; "Fastest" picks one for you.
 - The country a server really exits in, found with one request through it, shown when it
   differs from what the provider says.
@@ -433,6 +436,7 @@ src/
     failover.zig           the main server and its reserve
     model.zig, store.zig   the configuration and its file
     sublink.zig, xrayjson.zig   subscriptions and links, in and out
+    applink.zig            blackwall:// links that open the app
     qr.zig                 the QR decoder
     ipc.zig, helper_ipc.zig     window, service and helper talking to each other
     update.zig             the updater

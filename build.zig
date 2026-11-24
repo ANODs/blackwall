@@ -264,6 +264,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = os != .windows,
     }) })).step);
+    // who opens blackwall:// links (the menu entry on Linux, as it is shipped)
+    const scheme_tests = b.createModule(.{
+        .root_source_file = b.path("src/platform/scheme.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scheme_tests.addAnonymousImport("blackwall_desktop", .{ .root_source_file = b.path("assets/linux/blackwall.desktop") });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = scheme_tests })).step);
     // the window's link to the service (no UI inside, so it tests without DVUI)
     if (os != .windows) test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/link.zig"),
@@ -440,6 +448,12 @@ fn package(
                 \\  <key>CFBundleVersion</key><string>{s}</string>
                 \\  <key>CFBundleDevelopmentRegion</key><string>{s}</string>
                 \\  <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+                \\  <key>CFBundleURLTypes</key>
+                \\  <array><dict>
+                \\    <key>CFBundleURLName</key><string>dev.blackwall.link</string>
+                \\    <key>CFBundleTypeRole</key><string>Viewer</string>
+                \\    <key>CFBundleURLSchemes</key><array><string>blackwall</string></array>
+                \\  </dict></array>
                 \\  <key>NSHighResolutionCapable</key><true/>
                 \\</dict>
                 \\</plist>

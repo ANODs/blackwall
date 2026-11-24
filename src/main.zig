@@ -17,6 +17,7 @@ const conflicts = @import("ui/conflicts.zig");
 const shots = @import("shots.zig");
 const tray = @import("platform/tray.zig");
 const instance = @import("app/instance.zig");
+const links = @import("platform/links.zig");
 const tr = @import("i18n.zig").t;
 
 pub const dvui_app: dvui.App = .{
@@ -31,9 +32,14 @@ pub fn main(main_init: std.process.Init) !u8 {
     report.start(main_init);
     // one window per user; screenshot mode touches nothing of the user's
     if (main_init.environ_map.get("BLACKWALL_SHOTS") == null) {
+        // a link the system started us with (Windows, Linux; macOS hands
+        // it over as an event, platform/links.zig)
+        const link = links.fromArgs(main_init.minimal.args.toSlice(main_init.arena.allocator()) catch &.{});
         var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (app.settingsDir(&dir_buf, main_init.environ_map)) |dir|
-            if (instance.claim(main_init.gpa, main_init.io, dir, build_options.version) == .second) return 0;
+            if (instance.claim(main_init.gpa, main_init.io, dir, build_options.version, link) == .second) return 0;
+        // this start is the window: it opens the link itself, once it is up
+        links.at_start = link;
     }
     return dvui.App.main(main_init);
 }
@@ -67,6 +73,7 @@ fn init(win: *dvui.Window) !void {
     try app.init(win);
     shots.init();
     tray.init();
+    links.init();
 }
 
 fn deinit(_: *dvui.Window) void {

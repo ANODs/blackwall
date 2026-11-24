@@ -67,6 +67,23 @@ final class Core {
     /** `in` (n bytes of UTF-8) without secrets into `out`: its length, or -1 (src/core/diag.zig). */
     private static native int scrub(java.nio.ByteBuffer in, int n, java.nio.ByteBuffer out);
 
+    /** The subscription address in a blackwall:// link (n bytes of UTF-8) into `out`: its length, or -1 (src/core/applink.zig). */
+    private static native int link(java.nio.ByteBuffer in, int n, java.nio.ByteBuffer out);
+
+    /** The http(s) address a blackwall://add/... link carries; null when it is not such a link. */
+    static String subscriptionOf(String link) {
+        if (link == null || link.length() > 8192) return null;
+        byte[] b = link.getBytes(StandardCharsets.UTF_8);
+        java.nio.ByteBuffer in = java.nio.ByteBuffer.allocateDirect(Math.max(1, b.length));
+        in.put(b);
+        java.nio.ByteBuffer out = java.nio.ByteBuffer.allocateDirect(4096);
+        int n = link(in, b.length, out);
+        if (n <= 0) return null;
+        byte[] r = new byte[n];
+        out.get(r, 0, n);
+        return new String(r, StandardCharsets.UTF_8);
+    }
+
     /** The text without links, keys, or the names and addresses of servers and sites; null if it fails. */
     static String scrubbed(String text) {
         byte[] b = text.getBytes(StandardCharsets.UTF_8);

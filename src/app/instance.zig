@@ -15,6 +15,11 @@
 //!
 //! Releases before this one hold no lock. On Windows their windows are
 //! found by their executable's name, ended, and their files removed.
+//!
+//! A start that carries a link (`blackwall://...`, core/applink.zig: the
+//! system starts the app with it as an argument) and finds a window
+//! running leaves the link for it in `window.open`, a line of text, before
+//! it asks that window to show itself.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,13 +32,24 @@ const lock_name = "window.lock";
 const info_name = "window.info";
 const show_name = "window.show";
 const quit_name = "window.quit";
+const open_name = "window.open";
+/// the running window's own copy of `window.open` while it reads it
+const taken_name = "window.open.taken";
+/// The longest link handed over; longer ones are no links (core/applink.zig).
+pub const max_link = 8 * 1024;
 
 /// the lock, for as long as this process lives
 var held: ?Io.File = null;
 var show_buf: [std.fs.max_path_bytes]u8 = undefined;
 var quit_buf: [std.fs.max_path_bytes]u8 = undefined;
+var open_buf: [std.fs.max_path_bytes]u8 = undefined;
+var taken_buf: [std.fs.max_path_bytes]u8 = undefined;
 var show_path: []const u8 = "";
 var quit_path: []const u8 = "";
+var open_path: []const u8 = "";
+var taken_path: []const u8 = "";
+/// the links being handed over (the watcher's thread only)
+var links_buf: [4 * max_link]u8 = undefined;
 
 pub const Claim = enum {
     /// this process is the window
@@ -43,7 +59,13 @@ pub const Claim = enum {
 };
 
 /// What another start asks of the running window.
-pub const Signal = enum { show, quit };
+pub const Signal = union(enum) {
+    show,
+    quit,
+    /// a link it was started with; the text is the watcher's, good for the
+    /// length of the call
+    open: []const u8,
+};
 
 /// The window that runs, as it wrote itself down.
 const Info = struct {
@@ -73,8 +95,9 @@ fn replaces(mine: []const u8, other: ?Info) bool {
 
 /// Become the window, or learn that another one stays. Nothing here may
 /// keep the app from starting: a folder that cannot be locked means no
-/// guard, not no window.
-pub fn claim(gpa: std.mem.Allocator, io: Io, config_dir: []const u8, version: []const u8) Claim {
+/// guard, not no window. `link` is what this start was given to open: the
+/// window that stays gets it.
+pub fn claim(gpa: std.mem.Allocator, io: Io, config_dir: []const u8, version: []const u8, link: ?[]const u8) Claim {
     if (config_dir.len == 0) return .first;
     const cwd = Io.Dir.cwd();
     cwd.createDirPath(io, config_dir) catch return .first;
@@ -82,16 +105,28 @@ pub fn claim(gpa: std.mem.Allocator, io: Io, config_dir: []const u8, version: []
     defer dir.close(io);
     show_path = std.fmt.bufPrint(&show_buf, "{s}{c}" ++ show_name, .{ config_dir, std.fs.path.sep }) catch return .first;
     quit_path = std.fmt.bufPrint(&quit_buf, "{s}{c}" ++ quit_name, .{ config_dir, std.fs.path.sep }) catch return .first;
+    open_path = std.fmt.bufPrint(&open_buf, "{s}{c}" ++ open_name, .{ config_dir, std.fs.path.sep }) catch return .first;
+    taken_path = std.fmt.bufPrint(&taken_buf, "{s}{c}" ++ taken_name, .{ config_dir, std.fs.path.sep }) catch return .first;
     const own = std.process.executablePathAlloc(io, gpa) catch return .first;
     defer gpa.free(own);
     if (on_windows) win.announce();
 
+    var text_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+    // a link goes to the window that runs at once, not after the wait
+    // below: whoever clicked it is looking at the screen. Should that
+    // window be leaving, this start becomes the window and opens the link
+    // itself; an address opened twice is one subscription all the same.
+    var left = false;
+    if (link) |l| if (!take(dir, io, 0)) {
+        if (on_windows) if (current(dir, io, &text_buf)) |o| win.allowFront(o.pid);
+        leave(dir, io, l);
+        left = true;
+    };
     // a window that is leaving (an update relaunched us) is gone in a moment
-    if (!take(dir, io, 2000)) {
-        var text_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
-        const other: ?Info = if (dir.readFile(io, info_name, &text_buf)) |t| Info.parse(t) else |_| null;
+    if (held == null and !take(dir, io, 2000)) {
+        const other = current(dir, io, &text_buf);
         if (!replaces(version, other)) {
-            touch(dir, io, show_name);
+            ask(dir, io, other, if (left) null else link);
             return .second;
         }
         log.info("release {s} runs; this one ({s}) takes over", .{ other.?.version, version });
@@ -101,7 +136,7 @@ pub fn claim(gpa: std.mem.Allocator, io: Io, config_dir: []const u8, version: []
             if (on_windows) win.end(other.?.pid, other.?.exe);
             if (!take(dir, io, 3000)) {
                 dir.deleteFile(io, quit_name) catch {};
-                touch(dir, io, show_name);
+                ask(dir, io, other, if (left) null else link);
                 return .second;
             }
         }
@@ -109,12 +144,20 @@ pub fn claim(gpa: std.mem.Allocator, io: Io, config_dir: []const u8, version: []
     }
     dir.deleteFile(io, show_name) catch {};
     dir.deleteFile(io, quit_name) catch {};
+    // a link nobody took is not opened by a later window
+    dir.deleteFile(io, open_name) catch {};
+    dir.deleteFile(io, taken_name) catch {};
     var info_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
     if (std.fmt.bufPrint(&info_buf, "{s}\n{d}\n{s}\n", .{ version, ownPid(), own })) |text|
         dir.writeFile(io, .{ .sub_path = info_name, .data = text }) catch {}
     else |_| {}
     if (on_windows) win.sweep(io, own);
     return .first;
+}
+
+/// The window that runs, as `window.info` has it.
+fn current(dir: Io.Dir, io: Io, buf: []u8) ?Info {
+    return Info.parse(dir.readFile(io, info_name, buf) catch return null);
 }
 
 /// The lock, tried for `wait_ms`. True also when the folder cannot hold a
@@ -132,6 +175,31 @@ fn take(dir: Io.Dir, io: Io, wait_ms: i64) bool {
         if (begin.untilNow(io, .awake).toMilliseconds() >= wait_ms) return false;
         io.sleep(.fromMilliseconds(100), .awake) catch return false;
     }
+}
+
+/// Ask the window that runs to show itself, and to open `link` first when
+/// there is one.
+fn ask(dir: Io.Dir, io: Io, other: ?Info, link: ?[]const u8) void {
+    if (link) |l| leave(dir, io, l);
+    // Windows lets only the process the user just started bring a window
+    // to the front: it passes that right on
+    if (on_windows) if (other) |o| win.allowFront(o.pid);
+    touch(dir, io, show_name);
+}
+
+/// Add `link` to `window.open`, a line of its own (two starts at once each
+/// leave theirs).
+fn leave(dir: Io.Dir, io: Io, link: []const u8) void {
+    const text = std.mem.trim(u8, link, " \t\r\n");
+    if (text.len == 0 or text.len > max_link or std.mem.indexOfAny(u8, text, "\r\n") != null) return;
+    const f = dir.createFile(io, open_name, .{ .truncate = false }) catch return;
+    defer f.close(io);
+    const end = f.length(io) catch return;
+    if (end > links_buf.len) return;
+    var line_buf: [max_link + 1]u8 = undefined;
+    @memcpy(line_buf[0..text.len], text);
+    line_buf[text.len] = '\n';
+    f.writePositionalAll(io, line_buf[0 .. text.len + 1], end) catch {};
 }
 
 fn touch(dir: Io.Dir, io: Io, name: []const u8) void {
@@ -159,11 +227,26 @@ fn watcher(io: Io, tell: *const fn (Signal) void) void {
             cwd.deleteFile(io, quit_path) catch {};
             return tell(.quit);
         } else |_| {}
+        // before the show that follows it, so the window comes forward
+        // with the link already taken
+        taken(io, tell);
         if (cwd.access(io, show_path, .{})) |_| {
             cwd.deleteFile(io, show_path) catch {};
             tell(.show);
         } else |_| {}
     }
+}
+
+/// The links other starts left, one call each. The file is made ours
+/// first, so a start that writes at this moment loses nothing: its line
+/// goes to a new file, for the next look.
+fn taken(io: Io, tell: *const fn (Signal) void) void {
+    const cwd = Io.Dir.cwd();
+    cwd.rename(open_path, cwd, taken_path, io) catch return;
+    defer cwd.deleteFile(io, taken_path) catch {};
+    const text = cwd.readFile(io, taken_path, &links_buf) catch return;
+    var it = std.mem.tokenizeAny(u8, text, "\r\n");
+    while (it.next()) |line| tell(.{ .open = line });
 }
 
 /// A window's executable by its name, not the service's: "BLACKWALL.exe",
@@ -209,6 +292,13 @@ const win = struct {
     extern "kernel32" fn GetCurrentProcessId() callconv(W) u32;
     extern "kernel32" fn CreateEventW(attrs: ?*anyopaque, manual: i32, initial: i32, name: [*:0]const u16) callconv(W) ?w.HANDLE;
     extern "kernel32" fn OpenEventW(access: u32, inherit: i32, name: [*:0]const u16) callconv(W) ?w.HANDLE;
+    extern "user32" fn AllowSetForegroundWindow(pid: u32) callconv(W) i32;
+
+    /// Let process `id` bring its window to the front.
+    fn allowFront(id: u32) void {
+        if (comptime !on_windows) return;
+        _ = AllowSetForegroundWindow(id);
+    }
 
     /// "Local\BLACKWALL-window-<pid>": an event every window of a release
     /// that knows the lock holds for its lifetime. A window without one is
@@ -370,7 +460,7 @@ test "a second start of the same release asks the running window to show itself 
     var buf: [128]u8 = undefined;
     const dir = tmpPath(&buf, &tmp);
 
-    try testing.expectEqual(.first, claim(testing.allocator, testing.io, dir, "0.2.20"));
+    try testing.expectEqual(.first, claim(testing.allocator, testing.io, dir, "0.2.20", null));
     const running = held.?;
     defer running.close(testing.io);
     var text: [std.fs.max_path_bytes + 64]u8 = undefined;
@@ -379,12 +469,12 @@ test "a second start of the same release asks the running window to show itself 
     try testing.expectEqual(ownPid(), info.pid);
 
     held = null;
-    try testing.expectEqual(.second, claim(testing.allocator, testing.io, dir, "0.2.20"));
+    try testing.expectEqual(.second, claim(testing.allocator, testing.io, dir, "0.2.20", null));
     try testing.expect(held == null);
     try tmp.dir.access(testing.io, show_name, .{});
     // an older release leaves too
     try tmp.dir.deleteFile(testing.io, show_name);
-    try testing.expectEqual(.second, claim(testing.allocator, testing.io, dir, "0.2.19"));
+    try testing.expectEqual(.second, claim(testing.allocator, testing.io, dir, "0.2.19", null));
     try tmp.dir.access(testing.io, show_name, .{});
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, quit_name, .{}));
 }
@@ -398,7 +488,7 @@ test "a newer release asks the running window to leave and takes its place" {
     var buf: [128]u8 = undefined;
     const dir = tmpPath(&buf, &tmp);
 
-    try testing.expectEqual(.first, claim(testing.allocator, testing.io, dir, "0.2.20"));
+    try testing.expectEqual(.first, claim(testing.allocator, testing.io, dir, "0.2.20", null));
     const Old = struct {
         file: Io.File,
         dir: Io.Dir,
@@ -418,7 +508,7 @@ test "a newer release asks the running window to leave and takes its place" {
     var old: Old = .{ .file = held.?, .dir = tmp.dir };
     held = null;
     const th = try std.Thread.spawn(.{}, Old.run, .{&old});
-    const got = claim(testing.allocator, testing.io, dir, "0.2.21");
+    const got = claim(testing.allocator, testing.io, dir, "0.2.21", null);
     th.join();
     try testing.expectEqual(.first, got);
     try testing.expect(old.asked);
@@ -427,4 +517,66 @@ test "a newer release asks the running window to leave and takes its place" {
     try testing.expectEqualStrings("0.2.21", Info.parse(try tmp.dir.readFile(testing.io, info_name, &text)).?.version);
     // nothing is left to ask the new window anything
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, quit_name, .{}));
+}
+
+test "a second start with a link leaves it for the running window, which takes it once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const saved = held;
+    defer held = saved;
+    held = null;
+    var buf: [128]u8 = undefined;
+    const dir = tmpPath(&buf, &tmp);
+
+    try testing.expectEqual(.first, claim(testing.allocator, testing.io, dir, "0.2.23", null));
+    const running = held.?;
+    defer running.close(testing.io);
+
+    held = null;
+    try testing.expectEqual(.second, claim(testing.allocator, testing.io, dir, "0.2.23", "blackwall://add/https://example.invalid/s/one\n"));
+    try testing.expectEqual(.second, claim(testing.allocator, testing.io, dir, "0.2.22", "blackwall://add/https://example.invalid/s/two"));
+    // nothing that is not one line of a sane length
+    try testing.expectEqual(.second, claim(testing.allocator, testing.io, dir, "0.2.23", "blackwall://add/https://example.invalid/a\nblackwall://add/https://example.invalid/b"));
+    try testing.expectEqual(.second, claim(testing.allocator, testing.io, dir, "0.2.23", &@as([max_link + 1]u8, @splat('a'))));
+    try testing.expect(held == null);
+    try tmp.dir.access(testing.io, show_name, .{});
+
+    const Got = struct {
+        var n: usize = 0;
+        var text: [2][64]u8 = undefined;
+        var len: [2]usize = undefined;
+        fn tell(what: Signal) void {
+            const link = what.open;
+            if (n < 2) {
+                @memcpy(text[n][0..link.len], link);
+                len[n] = link.len;
+            }
+            n += 1;
+        }
+    };
+    Got.n = 0;
+    taken(testing.io, Got.tell);
+    try testing.expectEqual(2, Got.n);
+    try testing.expectEqualStrings("blackwall://add/https://example.invalid/s/one", Got.text[0][0..Got.len[0]]);
+    try testing.expectEqualStrings("blackwall://add/https://example.invalid/s/two", Got.text[1][0..Got.len[1]]);
+    // taken once
+    taken(testing.io, Got.tell);
+    try testing.expectEqual(2, Got.n);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, open_name, .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, taken_name, .{}));
+}
+
+test "a link nobody took is gone when the next window starts" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const saved = held;
+    defer held = saved;
+    held = null;
+    var buf: [128]u8 = undefined;
+    const dir = tmpPath(&buf, &tmp);
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = open_name, .data = "blackwall://add/https://example.invalid/s/old\n" });
+    try testing.expectEqual(.first, claim(testing.allocator, testing.io, dir, "0.2.23", null));
+    defer held.?.close(testing.io);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, open_name, .{}));
 }

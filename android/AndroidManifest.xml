@@ -41,6 +41,14 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- blackwall://add/<subscription address>: a provider's "add to
+                 app" button, from a browser or another application -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="blackwall" />
+            </intent-filter>
         </activity>
 
         <!-- started by the app, and by the system for "Always-on VPN" -->

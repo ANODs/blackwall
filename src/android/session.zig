@@ -391,6 +391,10 @@ pub const Session = struct {
         if (input.len == 0) return s.note("empty", 0, 0);
         const is_url = std.ascii.startsWithIgnoreCase(input, "https://") or std.ascii.startsWithIgnoreCase(input, "http://");
         if (is_url) {
+            // an address that is already there is downloaded again, not added twice
+            for (s.state.subs.items) |old| {
+                if (std.mem.eql(u8, old.url, input)) return s.emit(.{ .ev = "fetch", .id = old.id, .url = old.url });
+            }
             const sub = s.state.addSubscription(hostOf(input), input) catch return;
             const id = sub.id;
             s.save();
@@ -1197,6 +1201,61 @@ test "the shell's side of a session: keys, rules, plans" {
     try std.testing.expectEqual(1, again.servers.items.len);
     try std.testing.expectEqual(3, again.apps.items.len); // the one back on "default" is no rule
     try std.testing.expect(!again.settings.protect_when_off);
+}
+
+test "an address added twice is one subscription, downloaded again" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    var fds: [2]c.fd_t = undefined;
+    try std.testing.expectEqual(0, c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds));
+    var s: Session = .init(gpa, io, fds[0]);
+    defer s.deinit();
+    const th = try std.Thread.spawn(.{}, Session.run, .{&s});
+    defer {
+        _ = c.close(fds[1]);
+        th.join();
+        _ = c.close(fds[0]);
+    }
+    var sh: Shell = .{ .fd = fds[1], .gpa = gpa };
+    defer sh.buf.deinit(gpa);
+    var line: [1024]u8 = undefined;
+
+    sh.say(try std.fmt.bufPrint(&line, "{{\"cmd\":\"init\",\"dir\":\"{s}\"}}", .{dir}));
+    (try sh.expect("state")).deinit();
+
+    // typed, or from a blackwall:// link (the shell takes the address out of it)
+    sh.say("{\"cmd\":\"add\",\"text\":\"https://example.invalid/s/token\"}");
+    const first = try sh.expect("fetch");
+    defer first.deinit();
+    const id = first.value.object.get("id").?.integer;
+    try std.testing.expectEqualStrings("https://example.invalid/s/token", first.value.object.get("url").?.string);
+
+    sh.say("{\"cmd\":\"add\",\"text\":\" https://example.invalid/s/token\\n\"}");
+    const second = try sh.expect("fetch");
+    defer second.deinit();
+    try std.testing.expectEqual(id, second.value.object.get("id").?.integer);
+
+    // another address is another subscription
+    sh.say("{\"cmd\":\"add\",\"text\":\"https://example.invalid/s/other\"}");
+    const third = try sh.expect("fetch");
+    defer third.deinit();
+    try std.testing.expect(third.value.object.get("id").?.integer != id);
+
+    sh.say("{\"cmd\":\"state\"}");
+    while (true) {
+        const st = try sh.expect("state");
+        defer st.deinit();
+        const subs = st.value.object.get("subs").?.array.items;
+        if (subs.len < 2) continue;
+        try std.testing.expectEqual(2, subs.len);
+        break;
+    }
 }
 
 test "an owner's answer reaches the flow that asked; no answer is no owner" {

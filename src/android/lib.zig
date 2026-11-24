@@ -2,6 +2,8 @@
 //!
 //!   dev.blackwall.Core.start(int fd)
 //!   dev.blackwall.Core.qr(ByteBuffer gray, int w, int h, ByteBuffer out)
+//!   dev.blackwall.Core.scrub(ByteBuffer in, int n, ByteBuffer out)
+//!   dev.blackwall.Core.link(ByteBuffer in, int n, ByteBuffer out)
 //!
 //! `fd` is one end of a socket pair; the session (session.zig) serves it on
 //! its own thread until the shell closes the other end. `qr` reads a QR
@@ -81,6 +83,27 @@ export fn Java_dev_blackwall_Core_scrub(env: JniEnv, class: ?*anyopaque, in: ?*a
     const s: core.diag.Scrub = .{ .key = std.mem.readInt(u64, &key, .little) };
     s.write(&w, in_ptr[0..len]) catch return -1;
     return @intCast(w.buffered().len);
+}
+
+/// The subscription address in a `blackwall://` link (core/applink.zig):
+/// `in` holds `n` bytes of UTF-8, the address goes to `out`. Its length, or
+/// -1 when the text is not a link that adds a subscription.
+export fn Java_dev_blackwall_Core_link(env: JniEnv, class: ?*anyopaque, in: ?*anyopaque, n: c_int, out: ?*anyopaque) callconv(.c) c_int {
+    _ = class;
+    const fns = env.*;
+    const address: GetDirectBufferAddress = @ptrCast(@alignCast(fns[230] orelse return -1));
+    const capacity: GetDirectBufferCapacity = @ptrCast(@alignCast(fns[231] orelse return -1));
+    if (n < 0) return -1;
+    const len: usize = @intCast(n);
+    const in_ptr = address(env, in) orelse return -1;
+    if (capacity(env, in) < len) return -1;
+    const out_ptr = address(env, out) orelse return -1;
+    const out_len: usize = @intCast(@max(0, capacity(env, out)));
+    var buf: [core.applink.max_url]u8 = undefined;
+    const url = core.applink.subscriptionUrl(&buf, in_ptr[0..len]) orelse return -1;
+    if (url.len > out_len) return -1;
+    @memcpy(out_ptr[0..url.len], url);
+    return @intCast(url.len);
 }
 
 export fn Java_dev_blackwall_Core_qr(env: JniEnv, class: ?*anyopaque, gray: ?*anyopaque, w: c_int, h: c_int, out: ?*anyopaque) callconv(.c) c_int {

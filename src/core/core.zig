@@ -1,5 +1,6 @@
 pub const model = @import("model.zig");
 pub const sublink = @import("sublink.zig");
+pub const applink = @import("applink.zig");
 pub const engine = @import("engine.zig");
 pub const store = @import("store.zig");
 pub const demo = @import("demo.zig");
@@ -42,6 +43,7 @@ pub const ipstack = struct {
 test {
     _ = model;
     _ = sublink;
+    _ = applink;
     _ = engine;
     _ = store;
     _ = fmt;

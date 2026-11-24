@@ -26,4 +26,6 @@ chmod 755 "$dest/blackwall" "$dest/blackwall-service" "$dest/blackwall-tun"
 mkdir -p "$apps"
 sed "s|@BIN@|$dest|g" "$here/blackwall.desktop" > "$apps/blackwall.desktop"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps" 2>/dev/null || true
+# blackwall:// links (a provider's "add to app" button) open in the app
+command -v xdg-mime >/dev/null 2>&1 && xdg-mime default blackwall.desktop x-scheme-handler/blackwall 2>/dev/null || true
 echo "BLACKWALL installed in $dest; it is in the applications menu"

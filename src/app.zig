@@ -84,7 +84,10 @@ pub const Result = union(enum) {
     conflict_stop: ?conflicts_mod.StopError,
     /// another start of the app asks this window to show itself, or to
     /// leave for a newer release (app/instance.zig)
-    instance: instance.Signal,
+    instance: enum { show, quit },
+    /// a `blackwall://` link to open (ours to free): the system gave it to
+    /// this window, or to another start of the app that passed it on
+    open_link: []u8,
 };
 
 var results: std.ArrayList(Result) = .empty;
@@ -168,7 +171,30 @@ pub fn settingsDir(buf: []u8, env: *std.process.Environ.Map) ?[]const u8 {
 
 /// Another start asks this window something (on the watcher's thread).
 fn onInstance(what: instance.Signal) void {
-    pushResult(.{ .instance = what });
+    switch (what) {
+        .show => pushResult(.{ .instance = .show }),
+        .quit => pushResult(.{ .instance = .quit }),
+        .open => |text| queueLink(text),
+    }
+}
+
+/// A `blackwall://` link to open, from any thread; opened on the UI thread.
+pub fn queueLink(text: []const u8) void {
+    if (text.len == 0 or text.len > instance.max_link) return;
+    const copy = gpa.dupe(u8, text) catch return;
+    pushResult(.{ .open_link = copy });
+}
+
+/// Open a link the app was handed (core/applink.zig). One that adds a
+/// subscription goes the way a pasted address goes, and the window comes
+/// forward on the servers; anything else is ignored without a word.
+fn openLink(text: []const u8) void {
+    var buf: [core.applink.max_url]u8 = undefined;
+    const url = core.applink.subscriptionUrl(&buf, text) orelse return std.log.info("a link that adds nothing was ignored", .{});
+    if (!persist) return;
+    addFromText(url) catch return;
+    go(.servers);
+    tray.reveal();
 }
 
 /// A newer release takes over: leave, and leave the service as it is. The
@@ -373,6 +399,10 @@ fn drainResults() void {
             .show => tray.reveal(),
             .quit => handOver(),
         },
+        .open_link => |text| {
+            defer gpa.free(text);
+            openLink(text);
+        },
     };
 }
 
@@ -419,6 +449,8 @@ pub fn addFromText(raw: []const u8) AddError!void {
 
     const is_url = std.ascii.startsWithIgnoreCase(input, "https://") or std.ascii.startsWithIgnoreCase(input, "http://");
     if (is_url) {
+        // an address that is already there is downloaded again, not added twice
+        for (state.subs.items) |s| if (std.mem.eql(u8, s.url, input)) return fetch(s.id);
         leaveDemo();
         const sub = try state.addSubscription(hostOf(input), input);
         markDirty();
