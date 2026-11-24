@@ -141,8 +141,17 @@ const testing = std.testing;
 
 test "the shipped menu entry opens links" {
     const shipped = @embedFile("blackwall_desktop");
-    try testing.expect(std.mem.indexOf(u8, shipped, "MimeType=" ++ mime ++ ";\n") != null);
-    try testing.expect(std.mem.indexOf(u8, shipped, "Exec=@BIN@/blackwall %u\n") != null);
+    // a Windows checkout may hand the file over with \r\n line ends
+    var lines = std.mem.splitScalar(u8, shipped, '\n');
+    var has_type = false;
+    var has_exec = false;
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (std.mem.eql(u8, line, "MimeType=" ++ mime ++ ";")) has_type = true;
+        if (std.mem.eql(u8, line, "Exec=@BIN@/blackwall %u")) has_exec = true;
+    }
+    try testing.expect(has_type);
+    try testing.expect(has_exec);
     // so there is nothing to bring up to date
     try testing.expect(try withLinks(testing.allocator, shipped) == null);
 }
