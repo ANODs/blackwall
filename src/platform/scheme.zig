@@ -70,7 +70,7 @@ fn refreshEntry(gpa: std.mem.Allocator, io: Io, apps: []const u8) !bool {
     defer gpa.free(old);
     const new = try withLinks(gpa, old) orelse return false;
     defer gpa.free(new);
-    try dir.writeFile(io, .{ .sub_path = path, .data = new, .flags = .{ .permissions = .fromMode(0o644) } });
+    try dir.writeFile(io, .{ .sub_path = path, .data = new });
     return true;
 }
 
