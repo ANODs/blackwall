@@ -6,6 +6,7 @@ const core = @import("core");
 const model = core.model;
 const tunnel = core.tunnel;
 const proxy = core.proxy;
+const rulist = core.rulist;
 
 pub const Built = struct {
     arena: std.heap.ArenaAllocator,
@@ -22,7 +23,8 @@ pub const Built = struct {
     }
 };
 
-pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
+/// `ru`: the Russian list's text (rulist.load), used while the setting is on.
+pub fn build(gpa: std.mem.Allocator, state: *const model.State, ru: []const u8) !Built {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -93,6 +95,14 @@ pub fn build(gpa: std.mem.Allocator, state: *const model.State) !Built {
         else => |r| choiceOf(r, ids.items, pings.items, has_main),
     };
     var cfg: tunnel.Config = .{ .default = default, .rules = rules.items, .domains = domains.items, .outbounds = obs.items, .main = main.items, .check_exit = state.settings.check_exit };
+    // the Russian list: what would go through a server goes direct (in
+    // standby nothing does, and the held applications stay held)
+    if (state.settings.ru_direct and !standby) {
+        var names: std.ArrayList([]const u8) = .empty;
+        var it: rulist.Names = .init(ru);
+        while (it.next()) |n| try names.append(a, try a.dupe(u8, n));
+        cfg.direct_names = names.items;
+    }
     // A flow whose application cannot be told (its owner is gone, belongs to
     // another user, or the lookup timed out) might be one of the held
     // applications': where everything without a rule goes direct (and in
@@ -218,7 +228,7 @@ test "routes: rules, default, unusable servers block" {
     _ = try s.addApp("/Applications/Safari.app", "Safari", "");
     s.settings.default_route = .auto;
 
-    var b = try build(gpa, &s);
+    var b = try build(gpa, &s, "");
     defer b.deinit();
     try std.testing.expectEqual(1, b.skipped);
     try std.testing.expectEqual(1, b.cfg.outbounds.len);
@@ -243,7 +253,7 @@ test "routes: Fastest follows the server the window measured" {
     _ = try s.addServer(sub.id, .{ .name = "US", .host = "us.example", .port = 443, .protocol = .vless, .link = try std.fmt.bufPrint(&buf, link, .{"us.example"}) });
     const nl = try s.addServer(sub.id, .{ .name = "NL", .host = "nl.example", .port = 443, .protocol = .vless, .link = try std.fmt.bufPrint(&buf, link, .{"nl.example"}) });
     s.settings.auto_server = nl.id;
-    var b = try build(gpa, &s);
+    var b = try build(gpa, &s, "");
     defer b.deinit();
     try std.testing.expectEqual(tunnel.Choice.main, b.cfg.default);
     try std.testing.expectEqualSlices(u16, &.{1}, b.cfg.main);
@@ -269,7 +279,7 @@ test "routes: the starred servers are the main server's reserve, in list order" 
     s.settings.selected_server = sv[2].id;
     (try s.addApp("/Applications/Pinned.app", "Pinned", "")).route = .{ .server = sv[1].id };
     {
-        var b = try build(gpa, &s);
+        var b = try build(gpa, &s, "");
         defer b.deinit();
         try std.testing.expectEqualSlices(u16, &.{ 2, 0, 3 }, b.cfg.main);
         try std.testing.expect(uses(b.cfg, 0) and uses(b.cfg, 1) and uses(b.cfg, 2) and uses(b.cfg, 3));
@@ -277,7 +287,7 @@ test "routes: the starred servers are the main server's reserve, in list order" 
         try std.testing.expectEqual(tunnel.Choice{ .outbound = 1 }, b.cfg.rules[0].choice);
     }
     s.settings.failover = false;
-    var b = try build(gpa, &s);
+    var b = try build(gpa, &s, "");
     defer b.deinit();
     try std.testing.expectEqualSlices(u16, &.{2}, b.cfg.main);
     try std.testing.expect(!uses(b.cfg, 0));
@@ -297,7 +307,7 @@ test "routes: in standby the applications with a rule are held, the rest goes di
     _ = try s.addDomain("unset.example");
     s.settings.default_route = .auto;
     s.settings.standby = true;
-    var b = try build(gpa, &s);
+    var b = try build(gpa, &s, "");
     defer b.deinit();
     try std.testing.expectEqual(tunnel.Choice.direct, b.cfg.default);
     try std.testing.expectEqual(@as(?tunnel.Choice, .block), b.cfg.unknown);
@@ -331,7 +341,7 @@ test "routes: a group is its servers, fastest first, before the starred ones" {
     s.servers.items[0].favorite = true;
     s.settings.selected_server = gid;
     (try s.addApp("/Applications/Pinned.app", "Pinned", "")).route = .{ .server = gid };
-    var b = try build(gpa, &s);
+    var b = try build(gpa, &s, "");
     defer b.deinit();
     // outbounds: 0 single, 1 g1, 2 g2, 3 g3
     try std.testing.expectEqual(4, b.cfg.outbounds.len);
@@ -351,19 +361,45 @@ test "routes: flows of unknown origin are refused while the default leaves the V
     s.settings.default_route = .direct;
     {
         // nothing held: an unknown flow goes where everything goes
-        var b = try build(gpa, &s);
+        var b = try build(gpa, &s, "");
         defer b.deinit();
         try std.testing.expectEqual(@as(?tunnel.Choice, null), b.cfg.unknown);
     }
     (try s.addApp("/Applications/Claude.app", "Claude", "")).route = .auto;
     {
-        var b = try build(gpa, &s);
+        var b = try build(gpa, &s, "");
         defer b.deinit();
         try std.testing.expectEqual(@as(?tunnel.Choice, .block), b.cfg.unknown);
     }
     // a default through the VPN already keeps them in it
     s.settings.default_route = .auto;
-    var b = try build(gpa, &s);
+    var b = try build(gpa, &s, "");
     defer b.deinit();
     try std.testing.expectEqual(@as(?tunnel.Choice, null), b.cfg.unknown);
+}
+
+test "routes: the Russian list while connected and switched on, never in standby" {
+    const gpa = std.testing.allocator;
+    var s: model.State = .init(gpa);
+    defer s.deinit();
+    const text = "# BLACKWALL\nru\n# a comment\n\nVK.com\nnot a name!\n";
+    {
+        var b = try build(gpa, &s, text);
+        defer b.deinit();
+        try std.testing.expectEqual(2, b.cfg.direct_names.len);
+        try std.testing.expectEqualStrings("vk.com", b.cfg.direct_names[1]);
+    }
+    s.settings.ru_direct = false;
+    {
+        var b = try build(gpa, &s, text);
+        defer b.deinit();
+        try std.testing.expectEqual(0, b.cfg.direct_names.len);
+    }
+    s.settings.ru_direct = true;
+    s.settings.standby = true;
+    {
+        var b = try build(gpa, &s, text);
+        defer b.deinit();
+        try std.testing.expectEqual(0, b.cfg.direct_names.len);
+    }
 }

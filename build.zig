@@ -49,6 +49,8 @@ pub fn build(b: *std.Build) void {
         // sockets bound to an interface and the TUN device use the C API
         .link_libc = true,
     });
+    // the bundled copy of the Russian list (core/rulist.zig)
+    core.addAnonymousImport("ru_direct", .{ .root_source_file = b.path("lists/ru-direct.txt") });
 
     // Its own module: the app and the signing tool share it.
     const update = b.createModule(.{
@@ -148,6 +150,7 @@ pub fn build(b: *std.Build) void {
         if (update_pubkey.len > 0 and b.graph.environ_map.get("BLACKWALL_UPDATE_KEY") != null) {
             // the signing tool runs here, on the build machine
             const host_core = b.createModule(.{ .root_source_file = b.path("src/core/core.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
+            host_core.addAnonymousImport("ru_direct", .{ .root_source_file = b.path("lists/ru-direct.txt") });
             const host_update = b.createModule(.{ .root_source_file = b.path("src/core/update.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
             const host_sign = b.addExecutable(.{ .name = "blackwall-sign-host", .root_module = b.createModule(.{
                 .root_source_file = b.path("src/tools/sign.zig"),
@@ -364,6 +367,7 @@ fn android(b: *std.Build, optimize: std.builtin.OptimizeMode, strip: bool, versi
             .optimize = optimize,
             .link_libc = true,
         });
+        core.addAnonymousImport("ru_direct", .{ .root_source_file = b.path("lists/ru-direct.txt") });
         const routes = b.createModule(.{
             .root_source_file = b.path("src/service/routes.zig"),
             .target = target,

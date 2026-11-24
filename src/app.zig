@@ -77,6 +77,8 @@ pub const Result = union(enum) {
     ping: struct { id: u32, member: ?u8, ms: ?u16 },
     ping_done,
     sub: struct { sub_id: u32, body: ?[]u8, meta: ?Meta = null },
+    /// the Russian list, downloaded (null: it failed)
+    ru_list: ?[]u8,
     update_staged: std.SemanticVersion,
     update_failed: std.SemanticVersion,
     link: link_mod.Event,
@@ -225,6 +227,7 @@ pub fn deinit() void {
     // a clean quit also counts as a successful first start
     if (updater.verifying) updater.confirm();
     proxy.stop();
+    dropProxyList();
     quitService();
     save();
     state.deinit();
@@ -339,6 +342,7 @@ pub fn frame() void {
         last_tick_ns = now;
         // the provider's refresh period (profile-update-interval)
         if (!state.demo and persist) if (state.dueForRefresh(Io.Clock.real.now(io).toSeconds())) |sub| fetch(sub.id);
+        if (!state.demo and persist) fetchListIfDue(Io.Clock.real.now(io).toSeconds());
         // while the service runs, its status reports drive the counters
         if (!service_on) {
             reportFault(now);
@@ -390,6 +394,10 @@ fn drainResults() void {
             defer if (meta) |*m| m.deinit();
             applyFetched(s.sub_id, s.body, if (meta) |m| m.value else null);
         },
+        .ru_list => |body| {
+            defer if (body) |b| gpa.free(b);
+            if (body) |b| applyList(b);
+        },
         .update_staged => |v| updater.staged = v,
         .update_failed => |v| updater.failed(v),
         .link => |ev| onLink(ev),
@@ -436,6 +444,100 @@ fn applyFetched(sub_id: u32, body: ?[]u8, headers: ?model.SubMeta) void {
         notify(false, tr.servers_n, .{parsed.servers.len});
     markDirty();
     probeAll();
+}
+
+// ---------------------------------------------------------------- the Russian list
+
+var ru_tried: i64 = 0;
+var ru_fetching = false;
+
+/// Once a day while the setting is on; a failed try waits an hour.
+fn fetchListIfDue(now: i64) void {
+    const st = &state.settings;
+    if (!st.ru_direct or ru_fetching or config_dir.len == 0) return;
+    if (now - st.ru_list_unix < core.rulist.refresh_s or now - ru_tried < 3600) return;
+    ru_tried = now;
+    const t = std.Thread.spawn(.{}, listThread, .{}) catch return;
+    t.detach();
+    ru_fetching = true;
+}
+
+fn listThread() void {
+    var meta: ?Meta = null;
+    const body = download(core.rulist.url, &meta) catch null;
+    if (meta) |*m| m.deinit();
+    pushResult(.{ .ru_list = body });
+}
+
+/// A downloaded list goes beside config.json, where the service reads it;
+/// the save that follows makes the service reload.
+fn applyList(body: []const u8) void {
+    ru_fetching = false;
+    if (!core.rulist.valid(body)) return;
+    var dir = Io.Dir.cwd().createDirPathOpen(io, config_dir, .{}) catch return;
+    defer dir.close(io);
+    dir.writeFile(io, .{ .sub_path = core.rulist.file_name, .data = body }) catch |err| {
+        std.log.err("list not saved: {t}", .{err});
+        return;
+    };
+    state.settings.ru_list_unix = Io.Clock.real.now(io).toSeconds();
+    // the in-window proxy reads it again when it starts next
+    if (!proxy.running.load(.acquire)) dropProxyList();
+    markDirty();
+}
+
+fn dropProxyList() void {
+    if (proxy_list) |*l| l.arena.deinit();
+    proxy_list = null;
+}
+
+/// The list for the in-window proxy (it lives as long as the window).
+var proxy_list: ?struct { arena: std.heap.ArenaAllocator, set: core.rulist.Set } = null;
+
+fn proxyList() ?*const core.rulist.Set {
+    if (!state.settings.ru_direct) return null;
+    if (proxy_list) |*l| return &l.set;
+    const text = core.rulist.load(gpa, io, config_dir) catch return null;
+    defer gpa.free(text);
+    proxy_list = .{ .arena = .init(gpa), .set = .{} };
+    const l = &proxy_list.?;
+    l.set = core.rulist.Set.fromText(l.arena.allocator(), text) catch return null;
+    return &l.set;
+}
+
+// ---------------------------------------------------------------- routing profile
+
+/// Settings "Routing": the profile as JSON on the clipboard.
+pub fn exportProfile() void {
+    const json = core.profile.exportJson(gpa, &state) catch return;
+    defer gpa.free(json);
+    dvui.clipboardTextSet(json);
+    notify(false, tr.copied, .{});
+}
+
+/// A profile from the clipboard replaces the routing.
+pub fn importProfile() void {
+    const text = dvui.clipboardText();
+    if (state.demo) {
+        // tried on a copy first: the sample data stays if it is no profile
+        var trial: model.State = .init(gpa);
+        defer trial.deinit();
+        _ = core.profile.importJson(gpa, &trial, text) catch return notify(true, tr.profile_bad, .{});
+        leaveDemo();
+    }
+    const n = core.profile.importJson(gpa, &state, text) catch |err| return switch (err) {
+        error.NewerVersion => notify(true, tr.profile_newer, .{}),
+        else => notify(true, tr.profile_bad, .{}),
+    };
+    notify(false, tr.profile_loaded, .{ n.sites, n.apps });
+    markDirty();
+}
+
+pub fn resetProfile() void {
+    if (state.demo) leaveDemo();
+    core.profile.reset(&state);
+    notify(false, tr.profile_reset_done, .{});
+    markDirty();
 }
 
 // ---------------------------------------------------------------- subscriptions
@@ -759,6 +861,7 @@ pub fn connect() void {
     if (proxy.running.load(.acquire)) return;
     const outbound = defaultOutbound() orelse return;
     proxy.setOutbound(outbound);
+    proxy.direct = proxyList();
     proxy.start(preferred_proxy_port) catch proxy.start(0) catch |err| {
         notify(true, tr.proxy_failed, .{err});
         return;

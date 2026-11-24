@@ -72,6 +72,8 @@ pub fn show() void {
             app.markDirty();
         }
     }
+    _ = switchRow(@src(), tr.ru_direct, tr.ru_direct_desc, &s.ru_direct);
+    routing();
 
     section(@src(), tr.sec_launch);
     {
@@ -112,6 +114,39 @@ pub fn show() void {
         }
     }
     w.gap(@src(), 0, 24);
+}
+
+/// until when "Default" asks again before it resets (0: it does not ask)
+var reset_ask_until: i128 = 0;
+
+/// The routing profile: export, import, back to default (a second press
+/// within a few seconds confirms, the rules are gone after it).
+fn routing() void {
+    var r = row(@src(), tr.routing, tr.routing_desc);
+    defer r.deinit();
+    var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_y = 0.5 });
+    defer bar.deinit();
+    // narrower than the usual buttons: three fit beside the text
+    const pad: dvui.Rect = .{ .x = 12, .y = 9, .w = 12, .h = 9 };
+    if (w.quietButton(@src(), tr.profile_export, .{ .padding = pad })) app.exportProfile();
+    w.gap(@src(), 6, 0);
+    if (w.quietButton(@src(), tr.profile_import, .{ .padding = pad })) app.importProfile();
+    w.gap(@src(), 6, 0);
+    const now = dvui.frameTimeNS();
+    const asking = now < reset_ask_until;
+    if (w.quietButton(@src(), if (asking) tr.profile_confirm else tr.profile_default, if (asking) .{ .padding = pad, .color_text = w.col(th.warn), .color_text_hover = w.col(th.warn) } else .{ .padding = pad })) {
+        if (asking) {
+            reset_ask_until = 0;
+            app.resetProfile();
+        } else {
+            reset_ask_until = now + 4 * std.time.ns_per_s;
+        }
+    }
+    // the question goes away by itself
+    if (asking) {
+        const id = bar.data().id;
+        if (dvui.timerDoneOrNone(id)) dvui.timer(id, @intCast(@divTrunc(reset_ask_until - now, std.time.ns_per_us) + 1));
+    }
 }
 
 fn section(src: Src, title: []const u8) void {

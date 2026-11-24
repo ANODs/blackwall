@@ -31,6 +31,8 @@ pub const qr = @import("qr.zig");
 pub const diag = @import("diag.zig");
 pub const xrayjson = @import("xrayjson.zig");
 pub const tunnel = @import("tunnel.zig");
+pub const rulist = @import("rulist.zig");
+pub const profile = @import("profile.zig");
 pub const failover = @import("failover.zig");
 pub const ipc = @import("ipc.zig");
 pub const helper_ipc = @import("helper_ipc.zig");
@@ -42,6 +44,8 @@ pub const ipstack = struct {
 
 test {
     _ = model;
+    _ = rulist;
+    _ = profile;
     _ = sublink;
     _ = applink;
     _ = engine;

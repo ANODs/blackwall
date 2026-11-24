@@ -7,6 +7,7 @@ const net = Io.net;
 const proxy = @import("proxy.zig");
 const tls13 = @import("tls13.zig");
 const sys = @import("sys.zig");
+const rulist = @import("rulist.zig");
 
 const Outbound = proxy.Outbound;
 const Snapshot = proxy.Snapshot;
@@ -24,6 +25,9 @@ pub const Proxy = struct {
     meter: Meter = .{},
     /// a second meter fed by every flow (for example the service totals)
     extra: ?*Meter = null,
+    /// names that go direct whatever the outbound (the Russian list); the
+    /// owner keeps it alive while the proxy runs
+    direct: ?*const rulist.Set = null,
 
     server: ?net.Server = null,
     running: std.atomic.Value(bool) = .init(false),
@@ -115,7 +119,13 @@ pub const Proxy = struct {
         var local: Local = .{ .r = &cr.interface, .w = &cw.interface, .end = .{ .socks = client } };
         const target = try socksRequest(local.r, local.w);
         const flow: Flow = .{ .io = io, .dialer = p.dialer, .meters = .{ &p.meter, p.extra, null }, .stop = &p.stopping };
-        const ob = snap.get();
+        // through a server, except the listed sites (blocked stays blocked)
+        const via_server = switch (snap.outbound) {
+            .direct, .block, .dpi => false,
+            else => true,
+        };
+        const to_direct = if (p.direct) |set| via_server and target.kind == .domain and set.contains(target.addr()) else false;
+        const ob = if (to_direct) Outbound.direct else snap.get();
         try flow.run(&local, &target, &ob);
     }
 };

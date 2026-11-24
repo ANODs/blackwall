@@ -205,6 +205,11 @@ pub const Settings = struct {
     mtu: u16 = 0, // 0 = auto
     /// Route for apps without a rule.
     default_route: Route = .auto,
+    /// The sites of Russia and the CIS (core/rulist.zig) go direct, never
+    /// through a VPN server, whatever the route says (block and DPI stay).
+    ru_direct: bool = true,
+    /// When the list was last fetched (0: the bundled copy is used).
+    ru_list_unix: i64 = 0,
     selected_server: ?u32 = null,
     /// The server "Fastest" resolved to by the latest latency probes, so the
     /// background service (which never probes) uses the one the window shows.

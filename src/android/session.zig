@@ -25,7 +25,7 @@
 //!   site {name, route, id}        a site's rule (made when new; route as
 //!                                 for "rule"); answered with the state
 //!   unsite {name}                 forget a site's rule
-//!   set {key, on | value}         failover, guard, exitcheck, ipv6
+//!   set {key, on | value}         failover, guard, exitcheck, rudirect, ipv6
 //!   ping                          measure every server
 //!   connect / disconnect          the user's switch; answered with a plan
 //!   up {fd, mtu}                  the TUN the shell established for the plan
@@ -65,6 +65,10 @@ const tunnel = core.tunnel;
 const proxy = core.proxy;
 const packet = core.ipstack.packet;
 const dns = core.ipstack.dns;
+const rulist = core.rulist;
+
+/// The id of the shell's "fetch" for the Russian list, not a subscription's.
+const ru_fetch_id = 2_000_000_000;
 
 const log = std.log.scoped(.android);
 
@@ -148,6 +152,8 @@ pub const Session = struct {
     /// the state and the tunnel
     mutex: Io.Mutex = .init,
     dir: []u8 = &.{},
+    /// the last try to fetch the Russian list
+    ru_tried: i64 = 0,
     state: model.State,
     /// the user wants the VPN (or its guard) up; plans follow the changes
     active: bool = false,
@@ -276,6 +282,7 @@ pub const Session = struct {
         } else if (is(m.cmd, "add")) {
             s.add(m.text orelse "");
         } else if (is(m.cmd, "body")) {
+            if (m.id == ru_fetch_id) return s.applyList(m.text);
             var arena: std.heap.ArenaAllocator = .init(s.gpa);
             defer arena.deinit();
             const headers = core.sublink.metaFromHeaders(arena.allocator(), m.title, m.interval, m.announce, m.support) catch null;
@@ -362,6 +369,18 @@ pub const Session = struct {
         if (s.active and !s.sendPlan(false)) s.applyRoutes();
         // last: what the shell shows is already in force
         s.sendState();
+    }
+
+    /// A downloaded Russian list: kept beside the configuration when it is
+    /// one, and in force at once.
+    fn applyList(s: *Session, body: ?[]const u8) void {
+        const text = body orelse return;
+        if (!rulist.valid(text) or s.dir.len == 0) return;
+        var d = std.Io.Dir.cwd().openDir(s.io, s.dir, .{}) catch return;
+        defer d.close(s.io);
+        d.writeFile(s.io, .{ .sub_path = rulist.file_name, .data = text }) catch |err| return log.warn("list not saved: {t}", .{err});
+        s.state.settings.ru_list_unix = Io.Clock.real.now(s.io).toSeconds();
+        s.changed();
     }
 
     fn save(s: *Session) void {
@@ -508,6 +527,8 @@ pub const Session = struct {
             st.check_exit = m.on;
         } else if (std.mem.eql(u8, m.key, "ipv6")) {
             st.ipv6 = std.meta.stringToEnum(model.Ipv6Mode, m.value) orelse return;
+        } else if (std.mem.eql(u8, m.key, "rudirect")) {
+            st.ru_direct = m.on;
         } else if (std.mem.eql(u8, m.key, "default")) {
             st.default_route = if (std.mem.eql(u8, m.value, "direct")) .direct else .auto;
         } else return;
@@ -580,6 +601,7 @@ pub const Session = struct {
             .failover = st.failover,
             .guard = st.protect_when_off,
             .exitcheck = st.check_exit,
+            .rudirect = st.ru_direct,
             .ipv6 = @tagName(st.ipv6),
             .direct = st.default_route == .direct,
             .standby = st.standby,
@@ -675,7 +697,9 @@ pub const Session = struct {
     }
 
     fn start(s: *Session, fd: c.fd_t, mtu: u16) !void {
-        var b = try routes.build(s.gpa, &s.state);
+        const ru = try rulist.load(s.gpa, s.io, s.dir);
+        defer s.gpa.free(ru);
+        var b = try routes.build(s.gpa, &s.state, ru);
         errdefer b.deinit();
         s.ask_owners.store(s.needsOwners(), .release);
         const t = try tunnel.Tunnel.create(s.gpa, s.io, .{
@@ -725,7 +749,9 @@ pub const Session = struct {
     /// New routes for a tunnel that stays up.
     fn applyRoutes(s: *Session) void {
         const t = s.t orelse return;
-        var b = routes.build(s.gpa, &s.state) catch return;
+        const ru = rulist.load(s.gpa, s.io, s.dir) catch return;
+        defer s.gpa.free(ru);
+        var b = routes.build(s.gpa, &s.state, ru) catch return;
         // before the routes: a rule that needs the owner must find it asked for
         if (s.needsOwners()) s.ask_owners.store(true, .release);
         t.setConfig(b.cfg) catch {
@@ -751,7 +777,13 @@ pub const Session = struct {
             s.mutex.lockUncancelable(s.io);
             defer s.mutex.unlock(s.io);
             // the provider's refresh period (profile-update-interval)
-            if (s.state.dueForRefresh(Io.Clock.real.now(s.io).toSeconds())) |sub| s.emit(.{ .ev = "fetch", .id = sub.id, .url = sub.url });
+            const now_s = Io.Clock.real.now(s.io).toSeconds();
+            if (s.state.dueForRefresh(now_s)) |sub| s.emit(.{ .ev = "fetch", .id = sub.id, .url = sub.url });
+            // the Russian list, once a day (a failed try waits an hour)
+            if (s.state.settings.ru_direct and now_s - s.state.settings.ru_list_unix >= rulist.refresh_s and now_s - s.ru_tried >= 3600) {
+                s.ru_tried = now_s;
+                s.emit(.{ .ev = "fetch", .id = ru_fetch_id, .url = rulist.url });
+            }
             const t = s.t orelse continue;
             const b = s.built orelse continue;
             const in_use = routes.inUse(&b, t);

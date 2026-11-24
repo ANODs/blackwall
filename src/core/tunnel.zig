@@ -25,6 +25,7 @@ const xudp = @import("xudp.zig");
 const udp_out = @import("udp_out.zig");
 const sni = @import("sni.zig");
 const failover = @import("failover.zig");
+const rulist = @import("rulist.zig");
 pub const wintun = @import("wintun.zig");
 const windows = builtin.os.tag == .windows;
 
@@ -67,6 +68,10 @@ pub const Config = struct {
     /// in the order to prefer them. Empty: `Choice.main` blocks.
     main: []const u16 = &.{},
     dns_exclusions: []const []const u8 = &.{},
+    /// Sites (and everything under them) that go direct where the route
+    /// would take them through a VPN server: the Russian list
+    /// (rulist.zig). A site's own rule comes first; block and DPI stay.
+    direct_names: []const []const u8 = &.{},
     /// QUIC (UDP 443) of proxied applications is dropped so they fall back
     /// to TCP, which the outbound carries
     drop_quic: bool = true,
@@ -117,6 +122,8 @@ pub const Tunnel = struct {
     cfg: Config = .{},
     /// `cfg.domains` by suffix, in `cfg_arena`
     domain_map: std.StringHashMapUnmanaged(Choice) = .empty,
+    /// `cfg.direct_names`, in `cfg_arena`
+    direct_set: rulist.Set = .{},
 
     apps_mutex: Io.Mutex = .init,
     apps: std.StringHashMapUnmanaged(*AppStats) = .empty,
@@ -202,6 +209,7 @@ pub const Tunnel = struct {
         const copy = try deepCopy(arena.allocator(), cfg);
         var map: std.StringHashMapUnmanaged(Choice) = .empty;
         for (copy.domains) |d| try map.put(arena.allocator(), d.suffix, d.choice);
+        const direct_set: rulist.Set = try .fromNames(arena.allocator(), copy.direct_names);
         var members: [failover.max_members]proxy.Outbound = undefined;
         var n: usize = 0;
         for (copy.main) |i| {
@@ -218,6 +226,7 @@ pub const Tunnel = struct {
         t.cfg_arena = arena;
         t.cfg = copy;
         t.domain_map = map;
+        t.direct_set = direct_set;
     }
 
     /// Index into the configuration's `main` list of the server in use.
@@ -295,6 +304,9 @@ pub const Tunnel = struct {
         for (cfg.outbounds, obs) |src, *dst| dst.* = try src.dupe(a);
         const ex = try a.alloc([]const u8, cfg.dns_exclusions.len);
         for (cfg.dns_exclusions, ex) |src, *dst| dst.* = try a.dupe(u8, src);
+        const direct = try a.alloc([]const u8, cfg.direct_names.len);
+        // lower case already (rulist.Names)
+        for (cfg.direct_names, direct) |src, *dst| dst.* = try a.dupe(u8, src);
         const doms = try a.alloc(DomainRule, cfg.domains.len);
         for (cfg.domains, doms) |src, *dst| {
             const suffix = try a.dupe(u8, src.suffix);
@@ -309,6 +321,7 @@ pub const Tunnel = struct {
         copy.outbounds = obs;
         copy.main = try a.dupe(u16, cfg.main);
         copy.dns_exclusions = ex;
+        copy.direct_names = direct;
         return copy;
     }
 
@@ -350,9 +363,15 @@ pub const Tunnel = struct {
         // a flow of unknown origin where those are held back (standby) may
         // be a held application's: a site may only block it further
         const held_unknown = app == null and t.cfg.unknown != null;
-        if (!ruled) if (name) |n| if (t.domainChoice(n)) |site| {
-            if (!held_unknown or site == .block) choice = site;
-        };
+        if (name) |n| {
+            if (t.domainChoice(n)) |site| {
+                if (!ruled and (!held_unknown or site == .block)) choice = site;
+            } else if (!held_unknown and throughVpn(choice) and t.direct_set.contains(n)) {
+                // the Russian list: even an application held to the VPN,
+                // so that no server's address is seen there
+                choice = .direct;
+            }
+        }
         return switch (choice) {
             .direct => .{ .snap = .of(.direct) },
             .dpi => .{ .snap = .of(.dpi) },
@@ -362,13 +381,19 @@ pub const Tunnel = struct {
         };
     }
 
+    fn throughVpn(ch: Choice) bool {
+        return ch == .main or ch == .outbound;
+    }
+
     /// Whether a site's rule could decide where a flow of `app` goes: there
-    /// are such rules, and the application has none of its own.
+    /// are such rules, and the application has none of its own (the
+    /// Russian list takes applications with a rule too).
     fn sitesMayDecide(t: *Tunnel, app: ?[]const u8) bool {
         t.cfg_mutex.lockUncancelable(t.io);
         defer t.cfg_mutex.unlock(t.io);
-        if (t.domain_map.count() == 0) return false;
+        if (t.domain_map.count() == 0 and t.direct_set.count() == 0) return false;
         const chain = app orelse return t.cfg.unknown == null;
+        if (t.direct_set.count() > 0) return true;
         var ids = std.mem.splitScalar(u8, chain, 0);
         while (ids.next()) |id| {
             for (t.cfg.rules) |rule| if (std.mem.eql(u8, rule.app, id)) return false;
@@ -1209,6 +1234,50 @@ test "tunnel: sites take the applications without a rule, never the others" {
     try std.testing.expect(t.decide(browser, "youtube.com").snap.outbound == .direct);
     try std.testing.expect(t.decide(browser, "work.example").snap.outbound == .block);
     try std.testing.expect(t.decide("/Applications/Bank.app", "youtube.com").snap.outbound == .block);
+}
+
+test "tunnel: the Russian list sends VPN routes direct, keeps blocks and the sites' own rules" {
+    const t = try Tunnel.create(std.testing.allocator, std.testing.io, .{});
+    defer t.destroy();
+    const obs = [_]proxy.Outbound{.{ .vless = .{ .host = "nl.example", .port = 443, .uuid = @splat(1) } }};
+    try t.setConfig(.{
+        .default = .main,
+        .main = &.{0},
+        .rules = &.{
+            .{ .app = "/Applications/Claude.app", .choice = .{ .outbound = 0 } },
+            .{ .app = "/Applications/Game.app", .choice = .block },
+            .{ .app = "/Applications/Discord.app", .choice = .dpi },
+        },
+        .domains = &.{.{ .suffix = "kinopoisk.ru", .choice = .{ .outbound = 0 } }},
+        .direct_names = &.{ "ru", "xn--p1ai", "vk.com" },
+        .outbounds = &obs,
+    });
+    const browser = "/Applications/Browser.app";
+    try std.testing.expect(t.sitesMayDecide("/Applications/Claude.app"));
+    try std.testing.expect(t.decide(browser, "www.gosuslugi.ru").snap.outbound == .direct);
+    try std.testing.expect(t.decide(browser, "xn--80aswg.xn--p1ai").snap.outbound == .direct);
+    try std.testing.expect(t.decide(browser, "m.VK.com.").snap.outbound == .direct);
+    try std.testing.expect(t.decide(browser, "vk.company").snap.outbound == .vless);
+    try std.testing.expect(t.decide(browser, "youtube.com").snap.outbound == .vless);
+    // an application held to a server still goes direct there
+    try std.testing.expect(t.decide("/Applications/Claude.app", "yandex.ru").snap.outbound == .direct);
+    try std.testing.expect(t.decide("/Applications/Claude.app", "claude.ai").snap.outbound == .vless);
+    // blocked stays blocked, DPI stays DPI, a site's own rule wins
+    try std.testing.expect(t.decide("/Applications/Game.app", "mail.ru").snap.outbound == .block);
+    try std.testing.expect(t.decide("/Applications/Discord.app", "mail.ru").snap.outbound == .dpi);
+    try std.testing.expect(t.decide(browser, "hd.kinopoisk.ru").snap.outbound == .vless);
+    try std.testing.expect(t.decide(null, "ya.ru").snap.outbound == .direct);
+
+    // standby: what is held stays held
+    try t.setConfig(.{
+        .default = .direct,
+        .unknown = .block,
+        .rules = &.{.{ .app = "/Applications/Claude.app", .choice = .block }},
+        .direct_names = &.{"ru"},
+    });
+    try std.testing.expect(t.decide(null, "ya.ru").snap.outbound == .block);
+    try std.testing.expect(t.decide("/Applications/Claude.app", "ya.ru").snap.outbound == .block);
+    try std.testing.expect(t.decide(browser, "ya.ru").snap.outbound == .direct);
 }
 
 test "tunnel: the name a flow asks for, from its first bytes, as they come" {

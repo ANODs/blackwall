@@ -1,0 +1,37 @@
+name: Lists
+
+# Rebuilds lists/ru-direct.txt and lists/ru-block.xray.json (tools/ru_list.py) from
+# v2fly's category-ru and lists/extra.txt, and commits them when they change. The
+# client fetches lists/ru-direct.txt from main once a day.
+
+on:
+  push:
+    branches: [main]
+    paths: ['lists/extra.txt', 'tools/ru_list.py', '.github/workflows/lists.yml']
+  schedule:
+    - cron: '41 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lists
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: python3 tools/ru_list.py
+      - name: Commit
+        run: |
+          git diff --quiet lists/ && exit 0
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add lists/ru-direct.txt lists/ru-block.xray.json
+          git commit -m 'Lists: the Russian list follows its sources'
+          git push

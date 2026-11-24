@@ -1,0 +1,106 @@
+# Sites of Russia and the CIS outside the Russian zones that refuse VPN
+# addresses or should not see them, added to v2fly's category-ru by
+# tools/ru_list.py. One name per line covers everything under it.
+# Picked by hand; some come from Flowseal/zapret-discord-youtube
+# lists/list-exclude.txt (MIT) and itdoginfo/allow-domains Russia/outside.
+
+# Yandex
+yandex.com
+yandex.net
+yandex.org
+yandex.kz
+yandex.by
+yandex.uz
+yandex.md
+yandexcloud.net
+yandexmetrica.com
+yandexwebcache.net
+yandexwebcache.org
+yastat.net
+yastatic.net
+naydex.net
+turbopages.org
+webvisor.com
+webvisor.org
+
+# VK, Mail.ru, Odnoklassniki
+vk.com
+vk.me
+vkuser.net
+userapi.com
+vk-cdn.net
+vkuseraudio.net
+vkuservideo.net
+mycdn.me
+donationalerts.com
+boosty.to
+
+# shops and marketplaces
+ozon.com
+ozon.kz
+ozon.by
+ozon.com.kz
+ozon.com.by
+ozon.tm
+ozonru.me
+ozonusercontent.com
+paywb.com
+wildberries.kz
+wildberries.by
+wildberries.uz
+avito.st
+
+# banks and payments
+sberbank.com
+tbank-online.com
+tochka.com
+tochka-tech.com
+dbo-dengi.online
+bitrix.info
+
+# media, maps, services
+habr.com
+2gis.com
+2gis.kz
+2gis.by
+2gis.uz
+ivi.tv
+okko.tv
+lesta.pw
+rostaxi.org
+
+# Kazakhstan
+kaspi.kz
+egov.kz
+gov.kz
+kgd.gov.kz
+halykbank.kz
+homebank.kz
+bcc.kz
+forte.kz
+jusan.kz
+kolesa.kz
+krisha.kz
+olx.kz
+hh.kz
+kcell.kz
+beeline.kz
+
+# Belarus
+gov.by
+nalog.gov.by
+belarusbank.by
+priorbank.by
+onliner.by
+kufar.by
+a1.by
+mts.by
+
+# Uzbekistan
+gov.uz
+my.gov.uz
+uzum.uz
+payme.uz
+click.uz
+olx.uz
+hh.uz

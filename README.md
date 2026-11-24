@@ -66,6 +66,17 @@ release is a single file of 3 to 14 MB.
 - DPI bypass: a direct route whose TLS ClientHello leaves in a shape that filters
   matching the site's name do not recognise, picked per host from three ways.
 - A default route for everything without a rule.
+- Russia and the CIS direct (on by default): the Russian zones (.ru, .su, .рф, .рус,
+  .москва and the rest) and popular sites of Russia and the CIS elsewhere (Yandex, VK,
+  Ozon, banks, Kaspi and others) never go through a VPN server, also for applications
+  held to the VPN, so those sites never see a server's address. A site's own rule comes
+  first; block and DPI bypass stay. The list is [lists/ru-direct.txt](lists/ru-direct.txt),
+  built by `tools/ru_list.py` from v2fly's `category-ru` and
+  [lists/extra.txt](lists/extra.txt), rebuilt weekly by CI; the app fetches it once a day
+  and carries a copy of its own. The same names (and `geoip:ru`) are refused on a server
+  with [lists/ru-block.xray.json](lists/ru-block.xray.json), merged into its Xray config.
+- Routing profiles: the default route, that switch and every rule by application and site
+  exported to the clipboard as JSON, imported from it, or reset to the default.
 - Live traffic per application, and a history graph.
 
 **Servers**

@@ -932,6 +932,7 @@ public class Main extends Activity implements Core.Listener {
         col.addView(toggle(R.string.s_failover, R.string.s_failover_d, s.optBoolean("failover", true), "failover"));
         col.addView(toggle(R.string.s_guard, R.string.s_guard_d, s.optBoolean("guard", true), "guard"));
         col.addView(toggle(R.string.s_exit, R.string.s_exit_d, s.optBoolean("exitcheck", true), "exitcheck"));
+        col.addView(toggle(R.string.s_rudirect, R.string.s_rudirect_d, s.optBoolean("rudirect", true), "rudirect"));
 
         final String[] modes = {"block", "tunnel", "system"};
         final int[] labels = {R.string.ipv6_block, R.string.ipv6_tunnel, R.string.ipv6_system};

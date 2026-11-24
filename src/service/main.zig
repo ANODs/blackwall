@@ -137,6 +137,8 @@ const Service = struct {
     device: tunnel.Device = undefined,
     device_thread: ?std.Thread = null,
     socks: ?*proxy.Proxy = null,
+    /// the Russian list the SOCKS port was started with (it follows no reload)
+    socks_direct: ?struct { arena: std.heap.ArenaAllocator, set: core.rulist.Set } = null,
     built: ?routes.Built = null,
     settings: core.model.Settings = .{},
     /// VPN server addresses, for the strict kill switch
@@ -183,7 +185,9 @@ const Service = struct {
         _ = core.store.load(s.gpa, s.io, s.config_dir, &state) catch |err| {
             log.warn("config not readable ({t}); everything is blocked", .{err});
         };
-        var b = try routes.build(s.gpa, &state);
+        const ru = try core.rulist.load(s.gpa, s.io, s.config_dir);
+        defer s.gpa.free(ru);
+        var b = try routes.build(s.gpa, &state, ru);
         errdefer b.deinit();
         s.settings = state.settings;
         for (s.server_ips.items) |ip| s.gpa.free(ip);
@@ -324,6 +328,12 @@ const Service = struct {
                 p.extra = &t.meter;
                 p.dialer = t.dialer;
             }
+            if (cfg.direct_names.len > 0) {
+                s.socks_direct = .{ .arena = .init(s.gpa), .set = .{} };
+                const d = &s.socks_direct.?;
+                d.set = try .fromNames(d.arena.allocator(), cfg.direct_names);
+                p.direct = &d.set;
+            }
             try p.start(port);
             s.socks = p;
             log.info("socks5 on 127.0.0.1:{d}", .{p.port});
@@ -376,6 +386,8 @@ const Service = struct {
             s.gpa.destroy(p);
             s.socks = null;
         }
+        if (s.socks_direct) |*d| d.arena.deinit();
+        s.socks_direct = null;
         if (s.t) |t| {
             t.stop();
             if (s.device_thread) |th| th.join();
