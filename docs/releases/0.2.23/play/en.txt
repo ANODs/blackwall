@@ -1,0 +1,1 @@
+A provider's "add to app" button now works: a blackwall://add/... link opens the app and adds the subscription. An address that is already there is downloaded again instead of being added twice.
