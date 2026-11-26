@@ -26,7 +26,7 @@ no advertising, no crash reporting and no tracking in it, on any platform.
   sees the server's address, never yours, and answers with the country it places that
   address in; the app shows that country next to the server and keeps it with the
   server on the device. The request carries no cookies, no user agent and nothing about
-  you, and it never leaves without the VPN server. **Settings → Real server country**
+  you, and it never leaves without the VPN server. **Settings → Check the server's country**
   turns it off.
 - **A connectivity check**: when the server stops answering, the same request through it
   (and through the reserve servers, one at a time) shows whether it still carries
@@ -36,7 +36,7 @@ no advertising, no crash reporting and no tracking in it, on any platform.
 
 ## A report for a bug
 
-**Settings → Report for GitHub** saves a text file with the app's recent log to your
+**Settings → Report a problem** saves a text file with the app's recent log to your
 Downloads folder and opens a new issue on GitHub; the app itself sends nothing. Before the
 file is written, the app takes out subscription and server links, keys, user ids, e-mail
 addresses, your user name in folder paths, and the names and public addresses of servers

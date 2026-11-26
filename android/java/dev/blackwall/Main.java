@@ -61,6 +61,8 @@ public class Main extends Activity implements Core.Listener {
     private FrameLayout content;
     private final ImageView[] tabs = new ImageView[4];
     private int screen = -1;
+    /** the settings' "Advanced" unfolded */
+    private boolean advanced;
     private float density;
 
     private PowerButton power;
@@ -929,9 +931,27 @@ public class Main extends Activity implements Core.Listener {
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(dp(20), dp(16), dp(20), dp(16));
 
+        col.addView(caption(R.string.sec_connection, true));
         col.addView(toggle(R.string.s_failover, R.string.s_failover_d, s.optBoolean("failover", true), "failover"));
-        col.addView(toggle(R.string.s_guard, R.string.s_guard_d, s.optBoolean("guard", true), "guard"));
         col.addView(toggle(R.string.s_exit, R.string.s_exit_d, s.optBoolean("exitcheck", true), "exitcheck"));
+
+        // what is blocked while the VPN is not working: Android's own
+        // lockdown, and the apps held after Disconnect
+        col.addView(caption(R.string.sec_protection, false));
+        ImageView go = new ImageView(this);
+        go.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));
+        View always = setting(R.string.s_always, R.string.s_always_d, go);
+        always.setOnClickListener(v -> {
+            try {
+                startActivity(new Intent(Settings.ACTION_VPN_SETTINGS));
+            } catch (Exception e) {
+                // a system without that screen
+            }
+        });
+        col.addView(always);
+        col.addView(toggle(R.string.s_guard, R.string.s_guard_d, s.optBoolean("guard", true), "guard"));
+
+        col.addView(caption(R.string.sec_routes, false));
         col.addView(toggle(R.string.s_rudirect, R.string.s_rudirect_d, s.optBoolean("rudirect", true), "rudirect"));
 
         final String[] modes = {"block", "tunnel", "system"};
@@ -950,20 +970,15 @@ public class Main extends Activity implements Core.Listener {
             });
             m.show();
         });
-        col.addView(ipv6);
+        // rare: folded away until asked for
+        final LinearLayout more = new LinearLayout(this);
+        more.setOrientation(LinearLayout.VERTICAL);
+        more.addView(ipv6);
+        more.setVisibility(advanced ? View.VISIBLE : View.GONE);
+        col.addView(fold(R.string.sec_advanced, more));
+        col.addView(more);
 
-        ImageView go = new ImageView(this);
-        go.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));
-        View always = setting(R.string.s_always, R.string.s_always_d, go);
-        always.setOnClickListener(v -> {
-            try {
-                startActivity(new Intent(Settings.ACTION_VPN_SETTINGS));
-            } catch (Exception e) {
-                // a system without that screen
-            }
-        });
-        col.addView(always);
-
+        col.addView(caption(R.string.sec_about, false));
         ImageView send = new ImageView(this);
         send.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 18));
         View report = setting(R.string.s_report, R.string.s_report_d, send);
@@ -1006,6 +1021,34 @@ public class Main extends Activity implements Core.Listener {
         ScrollView scroll = new ScrollView(this);
         scroll.addView(col);
         return scroll;
+    }
+
+    /** A section's title in small capitals. */
+    private TextView caption(int text, boolean first) {
+        TextView t = label(getString(text), 12, DIM);
+        t.setLetterSpacing(0.06f);
+        t.setPadding(0, first ? dp(4) : dp(24), 0, dp(2));
+        return t;
+    }
+
+    /** A section title that shows or hides `body` (kept while the app runs). */
+    private View fold(int text, final View body) {
+        LinearLayout head = new LinearLayout(this);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView t = caption(text, false);
+        t.setPadding(0, 0, dp(4), 0);
+        head.addView(t);
+        final ImageView mark = new ImageView(this);
+        mark.setImageDrawable(glyph(Glyph.CHEVRON, DIM, 14));
+        mark.setRotation(advanced ? 90 : 0);
+        head.addView(mark);
+        head.setPadding(0, dp(24), 0, dp(10));
+        head.setOnClickListener(v -> {
+            advanced = !advanced;
+            body.setVisibility(advanced ? View.VISIBLE : View.GONE);
+            mark.setRotation(advanced ? 90 : 0);
+        });
+        return head;
     }
 
     private View toggle(int title, int text, boolean on, final String key) {

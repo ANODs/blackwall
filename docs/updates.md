@@ -2,7 +2,7 @@
 
 BLACKWALL updates itself from this repository's GitHub Releases. New versions download,
 check out and install on their own; the user's settings, subscriptions and rules are kept.
-**Settings → About → Auto-update** turns it off (on by default).
+**Settings → App → Auto-update** turns it off (on by default).
 
 Code: `src/core/update.zig` (selection, signatures, install steps), `src/app.zig` (when it
 runs), `src/tools/sign.zig` (the signing tool), `.github/workflows/release.yml` (signing in CI).

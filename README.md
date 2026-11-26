@@ -102,7 +102,7 @@ release is a single file of 3 to 14 MB.
 
 **Protection**
 
-- Kill switch, selective or strict.
+- Kill switch ("When the VPN drops, block"): the VPN's traffic only, or all of it.
 - An application that cannot be identified is never let out past the VPN: while any
   application or site is held to the VPN and the default route is direct, a connection
   whose owner is unknown is refused.
@@ -224,7 +224,7 @@ purpose.
 
 | Route | Where the application's traffic goes |
 |---|---|
-| Default | Wherever "Default route" in Settings says: the VPN or direct |
+| Default | Wherever "Other apps" in Settings says: the VPN or direct |
 | Auto | Through the VPN, on the main server (or its reserve) |
 | A server from the list | Through that server and no other. If it cannot be used, the application is blocked, never sent direct |
 | Direct | The normal internet, with your real address |
@@ -239,14 +239,16 @@ reserve, or no connection. There is no path from a VPN route to a direct connect
 
 ## Protection
 
-**Kill switch.** *Selective* stops the applications that are routed through the VPN when
-it drops; direct ones keep working. *Strict* stops everything except the connections to
-the VPN servers themselves, using the system firewall (pf on macOS, nftables on Linux,
-WFP on Windows). If the firewall rules cannot be set, the connection does not start.
+**Kill switch** (Settings, "When the VPN drops, block"). *VPN traffic* stops the
+applications that are routed through the VPN when it drops; direct ones keep working.
+*All* stops everything except the connections to the VPN servers themselves, using the
+system firewall (pf on macOS, nftables on Linux, WFP on Windows). If the firewall rules
+cannot be set, the connection does not start.
 
-**Protection after Disconnect.** Turning the VPN off is not the same as lifting the
-protection. Applications with their own VPN rule, and blocked ones, stay offline while the
-VPN is off; everything else uses the normal internet.
+**Protection after Disconnect** (Settings, "No network after disconnecting"). Turning the
+VPN off is not the same as lifting the protection. Applications with their own VPN rule,
+and blocked ones, stay offline while the VPN is off; everything else uses the normal
+internet.
 
 **Hold from boot** (macOS). With "Launch at login" on, TUN mode, a kill switch that is not
 off, and either "Connect automatically" or applications held after Disconnect, the network
