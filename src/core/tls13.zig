@@ -1008,6 +1008,7 @@ const Ext = enum(u16) {
     psk_key_exchange_modes = 45,
     key_share = 51,
     application_settings = 0x44cd,
+    trust_anchors = 0xca34,
     encrypted_client_hello = 0xfe0d,
     renegotiation_info = 0xff01,
 };
@@ -1024,8 +1025,20 @@ const HelloShape = struct {
     cert_compression: enum(u8) { zlib = 1, brotli = 2 } = .brotli,
 };
 
-/// A ClientHello shaped like current Chrome: GREASE, post-quantum key
-/// share, permuted extensions, GREASE ECH. The session id is left zeroed.
+/// The Trust Anchor IDs Chrome 155 lists in every ClientHello (extension
+/// 0xca34): its root store's ids, each one length-prefixed. Taken from the
+/// hello of Xray 26.11.9's chrome fingerprint; on some Russian networks a
+/// hello without it is dropped after its first segment.
+const chrome_trust_anchors = blk: {
+    const hex = "00b80582df1302010582df1302060582df13020d0582df13020e0582df13020f0582df1302120582df1302130582df13021408839a648c9b2d010708839a648c9b2d010808839a648c9b2d010908839a648c9b2d010a08839a648c9b2d010b08839a648c9b2d010c08839a648c9b2d010d08839a648c9b2d011208839a648c9b2d011304d679090104d679090404d679090504d679090604d679090704d679090804d679090a04d679090b04d679090c04d679090d04d679090f";
+    var out: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    break :blk out;
+};
+
+/// A ClientHello shaped like Chrome 155: GREASE, post-quantum key share,
+/// ML-DSA signature schemes, trust anchor ids, permuted extensions, GREASE
+/// ECH. The session id is left zeroed.
 fn buildClientHello(
     buf: []u8,
     io: Io,
@@ -1043,6 +1056,7 @@ fn buildClientHello(
     if (g_ext2 == g_ext1) g_ext2 ^= 0x1010;
     const g_group = grease(seed[3]);
     const g_version = grease(seed[4]);
+    const g_sig = grease(seed[7]);
 
     var b: Builder = .{ .buf = buf };
     b.byte(1);
@@ -1096,7 +1110,8 @@ fn buildClientHello(
             .ec_point_formats => b.bytes(&.{ 1, 0 }),
             .signature_algorithms => {
                 const list = b.open(2);
-                for ([_]u16{ 0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601 }) |s| b.int16(s);
+                // GREASE, then ML-DSA-44/65/87, then the classic ones
+                for ([_]u16{ g_sig, 0x0904, 0x0905, 0x0906, 0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601 }) |s| b.int16(s);
                 b.close(list, 2);
             },
             .alpn => b.bytes(switch (shape.alpn) {
@@ -1129,6 +1144,7 @@ fn buildClientHello(
             },
             // ALPS goes with h2 only, as Chrome does
             .application_settings => b.bytes(&.{ 0, 3, 2, 'h', '2' }),
+            .trust_anchors => b.bytes(&chrome_trust_anchors),
             .encrypted_client_hello => {
                 b.bytes(&.{ 0, 0, 1, 0, 1 }); // outer, HKDF-SHA256, AES-128-GCM
                 b.byte(seed[5]); // config id
@@ -1241,11 +1257,19 @@ test "ClientHello structure" {
     var exts: Cursor = .{ .b = try c.vec(u16) };
     try std.testing.expectEqual(c.b.len, c.i);
     var seen_sni = false;
+    var seen_anchors = false;
     var shares: usize = 0;
     while (exts.i < exts.b.len) {
         const kind = try exts.int(u16);
         var body: Cursor = .{ .b = try exts.vec(u16) };
         if (kind == 0) seen_sni = std.mem.endsWith(u8, body.b, "example.com");
+        if (kind == 0xca34) seen_anchors = std.mem.eql(u8, body.b, &chrome_trust_anchors);
+        if (kind == 13) {
+            // Chrome 155: GREASE first, then ML-DSA
+            try std.testing.expectEqual(24, std.mem.readInt(u16, body.b[0..2], .big));
+            try std.testing.expectEqual(0x0a0a, std.mem.readInt(u16, body.b[2..4], .big) & 0x0f0f);
+            try std.testing.expectEqual(0x0904, std.mem.readInt(u16, body.b[4..6], .big));
+        }
         if (kind == 51) {
             var list: Cursor = .{ .b = try body.vec(u16) };
             while (list.i < list.b.len) {
@@ -1256,7 +1280,15 @@ test "ClientHello structure" {
         }
     }
     try std.testing.expect(seen_sni);
+    try std.testing.expect(seen_anchors);
     try std.testing.expectEqual(3, shares);
+    try std.testing.expectEqual(186, chrome_trust_anchors.len);
+
+    // the longest name and the longest GREASE ECH still fit the buffer
+    const long: [253]u8 = @splat('a');
+    var most: usize = 0;
+    for (0..64) |_| most = @max(most, buildClientHello(&buf, io, &random, &x, &kem, &long, .{}).len);
+    try std.testing.expect(most + 5 <= buf.len);
 }
 
 test "every handshake path compiles" {
