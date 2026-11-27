@@ -1,0 +1,1 @@
+Stability fixes. On computers the app now checks for updates again soon when a check gets no answer.
