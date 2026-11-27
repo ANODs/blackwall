@@ -33,6 +33,11 @@ const update_first_check_s = 15;
 /// One small request to GitHub: an hour keeps a fix from waiting half a day
 /// for a window that is never closed.
 const update_interval_s = 60 * 60;
+/// A check that got no answer (the tunnel still coming up, GitHub refusing)
+/// is tried again soon, sooner first: 30 s, 1 min, 2 min, then every 5 min
+/// until GitHub answers.
+const update_retry_first_s = 30;
+const update_retry_max_s = 5 * 60;
 /// How long a freshly installed version runs before its old copy is removed.
 const update_confirm_ns = 3 * std.time.ns_per_s;
 
@@ -162,20 +167,32 @@ pub fn failed(v: std.SemanticVersion) void {
 
 fn updateThread(inst: update.Install, skip: ?std.SemanticVersion) void {
     app.io.sleep(.fromSeconds(update_first_check_s), .awake) catch return;
-    var last_check: ?i64 = null;
-    while (true) : (app.io.sleep(.fromSeconds(60), .awake) catch return) {
+    // boot time: wall-clock jumps must not stall or rush the checks
+    var next_check: i64 = 0;
+    var retry_s: i64 = update_retry_first_s;
+    while (true) : (app.io.sleep(.fromSeconds(15), .awake) catch return) {
         if (!update_enabled.load(.monotonic)) continue;
-        // boot time: wall-clock jumps must not stall or rush the checks
         const now = Io.Clock.boot.now(app.io).toSeconds();
-        if (last_check) |t| if (now - t < update_interval_s) continue;
-        last_check = now;
-        if (stageUpdate(inst, skip)) return;
+        if (now < next_check) continue;
+        switch (stageUpdate(inst, skip)) {
+            .staged => return,
+            .answered => {
+                next_check = now + update_interval_s;
+                retry_s = update_retry_first_s;
+            },
+            .no_answer => {
+                next_check = now + retry_s;
+                retry_s = @min(retry_s * 2, update_retry_max_s);
+            },
+        }
     }
 }
 
-/// Check, download, verify, unpack. Network trouble is only logged; true
-/// once a release waits to be swapped in.
-fn stageUpdate(inst: update.Install, skip: ?std.SemanticVersion) bool {
+const Outcome = enum { staged, answered, no_answer };
+
+/// Check, download, verify, unpack. Network trouble is only logged and
+/// reported as `no_answer`, so the thread asks again soon.
+fn stageUpdate(inst: update.Install, skip: ?std.SemanticVersion) Outcome {
     var arena: std.heap.ArenaAllocator = .init(app.gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -183,17 +200,18 @@ fn stageUpdate(inst: update.Install, skip: ?std.SemanticVersion) bool {
     defer client.deinit();
     const found = (update.check(a, &client, update_cfg, skip) catch |err| {
         std.log.info("update: check failed: {t}", .{err});
-        return false;
-    }) orelse return false;
+        return .no_answer;
+    }) orelse return .answered;
     const asset = update.download(a, &client, update_cfg, found) catch |err| {
         std.log.warn("update: {s} not downloaded: {t}", .{ found.asset, err });
-        return false;
+        return .no_answer;
     };
     inst.stage(a, app.io, update.native.package, asset, found.version_text) catch |err| {
         std.log.err("update: {s} not unpacked: {t}", .{ found.asset, err });
         app.pushResult(.{ .update_failed = found.version });
-        return false;
+        // a broken release is not fetched again every few minutes
+        return .answered;
     };
     app.pushResult(.{ .update_staged = found.version });
-    return true;
+    return .staged;
 }
