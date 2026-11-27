@@ -1,0 +1,1 @@
+Connections to servers now look like Chrome 155: on some Russian networks the older look got a server cut off for hours. Sites of Russia and the CIS go around the VPN and never see the server's address (on by default, Settings, Routes). Settings are grouped into Connection, Protection, Routes and App, with rare options under Advanced.
